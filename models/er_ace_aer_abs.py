@@ -134,7 +134,7 @@ class ErAceAerAbs(ContinualModel):
             # the epoch was a buffer fitting epoch, save the model checkpoint
             self.save_model_checkpoint()
 
-    def observe(self, inputs, labels, not_aug_inputs, epoch, true_labels):
+    def observe(self, inputs, labels, not_aug_inputs, epoch, true_labels=None):
 
         present = labels.unique()
 

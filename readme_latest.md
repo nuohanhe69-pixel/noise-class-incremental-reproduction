@@ -186,6 +186,82 @@ python main.py --dataset seq-cifar10 --model ogc-sap --noise_rate 0.4 --noise_ty
 
 
 
+## Food101N
+
+Food101N 使用真实 noisy train label，clean test 来自 Food-101。不要再设置 CIFAR 式合成噪声，正式命令保持 `--noise_rate 0`。
+
+### 数据目录检查
+
+先把 Food-101N noisy train 和 Food-101 clean test 解压到 `data/` 下。推荐先运行纯数据检查脚本：
+
+```bash
+python scripts/validate_food101n_dataset.py \
+  --root data/Food-101N_release \
+  --test-list ../food-101/meta/test.txt \
+  --test-images-dir ../food-101/images \
+  --classes-file ../food-101/meta/classes.txt \
+  --strict
+```
+
+如果本地文件名不同，把 `--test-list`、`--test-images-dir`、`--classes-file` 改成真实路径。若 train metadata 存在，也可以显式加：
+
+```bash
+--train-list meta/train.txt --train-images-dir train
+```
+
+项目环境中已安装 `torch`、`torchvision` 后，可以进一步检查 Mammoth 数据集类是否能构造 loader：
+
+```bash
+python scripts/validate_food101n_dataset.py \
+  --root data/Food-101N_release \
+  --test-list ../food-101/meta/test.txt \
+  --test-images-dir ../food-101/images \
+  --classes-file ../food-101/meta/classes.txt \
+  --strict \
+  --check-import
+```
+
+如果希望同时真实读取一个 train/test batch，再加 `--check-batch`。
+
+### Food101N Debug Smoke
+
+只用于验证数据、模型、loader、buffer、OGC/SAP 调用链是否能跑通，不作为论文结果：
+
+```bash
+python main.py --dataset seq-food101n --model ogc-sap --enable_sap 1 \
+  --food101n_root data/Food-101N_release \
+  --food101n_test_list ../food-101/meta/test.txt \
+  --food101n_test_images_dir ../food-101/images \
+  --food101n_classes_file ../food-101/meta/classes.txt \
+  --backbone resnet18 --n_epochs 1 --batch_size 8 --minibatch_size 8 \
+  --lr 0.03 --buffer_size 500 --num_workers 0 --debug_mode 1 \
+  --noise_rate 0 --seed 0
+```
+
+### Food101N 正式训练模板
+
+真实实验建议先从 OGC+SAP 主方法开始，确认显存后再调大 batch 或 backbone：
+
+```bash
+COMMON_ARGS="--dataset seq-food101n --food101n_root data/Food-101N_release --food101n_test_list ../food-101/meta/test.txt --food101n_test_images_dir ../food-101/images --food101n_classes_file ../food-101/meta/classes.txt --backbone resnet18 --n_epochs 50 --batch_size 32 --minibatch_size 32 --lr 0.03 --buffer_size 2000 --num_workers 4 --noise_rate 0"
+
+python main.py --model ogc-sap --enable_sap 1 \
+  --sap_scale_coff 5000 \
+  --ogc_loss_weight 0.3 \
+  --ogc_low_conf_weight 0.3 \
+  --ogc_buffer_penalty_coeff 2.0 \
+  --sap_retain_samples 2000 \
+  --savecheck last --seed 0 ${COMMON_ARGS}
+```
+
+可对照消融：
+
+```bash
+python main.py --model er-ace-aer-abs --savecheck last --seed 0 ${COMMON_ARGS}
+python main.py --model aer-sap --enable_sap 1 --sap_retain_samples 2000 --savecheck last --seed 0 ${COMMON_ARGS}
+python main.py --model ogc-sap --enable_sap 0 --ogc_loss_weight 0.3 --ogc_low_conf_weight 0.3 --ogc_buffer_penalty_coeff 2.0 --savecheck last --seed 0 ${COMMON_ARGS}
+```
+
 ## Ablation Commands
 
 以下命令用于保持同一组超参数，只切换模块组合。

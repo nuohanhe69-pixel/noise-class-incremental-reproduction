@@ -376,7 +376,14 @@ python scripts/prepare_ntu60_npz.py --source <skeleton_zip_or_dir> --output data
 | train label | Food-101N noisy class label |
 | test label | Food-101 clean class label |
 
-Food-101N 的训练标签已经是真实噪声标签，不应再设置 `--noise_rate` 触发 CIFAR 式合成噪声。若后续方法强制要求 `true_labels`，需要单独确认真实噪声协议下的处理方式，不得把 verification label 当成 clean class label。
+Food-101N 的训练标签已经是真实噪声标签，不应再设置 `--noise_rate` 触发 CIFAR 式合成噪声。当前 `er-ace-aer-abs` 已允许 `true_labels=None`，`aer-sap` 继承该兼容；`ogc-sap` 原本已支持可选 `true_labels`。不得把 verification label 当成 clean class label。
+
+本地数据检查入口：
+
+```bash
+python scripts/validate_food101n_dataset.py --root data/Food-101N_release --strict
+python scripts/validate_food101n_dataset.py --root data/Food-101N_release --strict --check-import --check-batch
+```
 
 不要随意删除 `data/`、`data/noisy_labels/`、`data/results*/` 或原始压缩包。删除或重新生成 noisy label cache 会影响复现实验可比性。
 
@@ -820,11 +827,12 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 | T9 | 多 seed 正式结果 | `readme_latest.md` 建议 seed 0/152，结果记录不完整 | 汇总 `logs.pyd` 和外层报告 | 待确认 |
 | T10 | `readme_latest.md` 是否需要同步修正 NTU60 命令 | 本次任务不允许修改 | 向用户建议单独授权更新 | 待确认 |
 | T11 | Food-101N 真实数据路径和 Kaggle 解压结构 | 当前仅完成代码接入，未发现本机数据 | 准备 Food-101N noisy train 与 Food-101 clean test 后运行数据完整性验证 | 待确认 |
-| T12 | Food-101N 与强制 `true_labels` 模型的协议兼容 | `er-ace-aer-abs.observe()` 要求 `true_labels`，但 Food-101N train 无完整 clean class label | 用户确认后决定修改模型签名、限制模型或设计显式兼容字段 | 待确认 |
+| T12 | Food-101N 与强制 `true_labels` 模型的协议兼容 | Food-101N train 无完整 clean class label | 已将 `er-ace-aer-abs.observe()` 改为 `true_labels=None`；不伪造 clean train label | 已处理 |
 
 ## 29. 变更记录
 
 | 日期 | 修改内容 | 修改原因 | 验证情况 |
 |---|---|---|---|
+| 2026-07-14 | 新增 Food-101N 数据检查脚本、训练命令模板，并放宽 `er-ace-aer-abs.observe()` 的 `true_labels` 参数 | 进入 Food-101N 训练接入阶段，真实 noisy train 数据不应要求 clean train label | 已完成 `py_compile` 级别验证；真实数据和 torch/torchvision 环境仍待验证 |
 | 2026-07-14 | 新增 `seq-food101n` 数据集接入说明、非均匀任务划分和待确认项 | Food-101N 数据集支持需要长期记录数据格式、真实噪声协议和 101 类 task split | 已完成 `py_compile`；当前 shell 缺 `torch`、`torchvision`、`yaml`，未完成 import/真实数据验证 |
 | 2026-07-14 | 新建项目级 `AGENTS.md` | 建立 `mammoth_code` 的 AI Agent 长期操作规范，并明确 `readme_latest.md` 为主要参考文档 | 部分验证：已只读检查代码、配置、数据、日志、checkpoint；当前 shell 缺依赖，未执行训练/评估入口 |
