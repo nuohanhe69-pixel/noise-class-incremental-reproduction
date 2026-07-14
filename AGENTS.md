@@ -83,7 +83,7 @@
 | CIFAR-10 数据 | 已准备 | `data/CIFAR10/cifar-10-batches-py` 存在 |
 | CIFAR-100 数据 | 未发现 | 未发现 `data/CIFAR100` |
 | NTU60 数据 | 未发现 | 未发现 `data/NTU60_CS.npz` |
-| Food-101N 数据 | 未发现 | 未发现 `data/Food-101N`、`data/Food-101N_release` 或 Food-101 clean test |
+| Food-101N 数据 | 未发现 | 未发现 `data/Food-101N`、`data/Food-101N_release`；当前正式协议需要 Food101N 图片目录 + NTD/PuriDivER `tasks/Food-101N` split |
 | CIFAR10 symmetric noisy label cache | 已存在部分 | `data/noisy_labels/seq-cifar10/symmetric/20/0/noisy_targets` 和 `40/0/noisy_targets` |
 | CIFAR10 训练日志 | 已存在 | `run_logs/` 下多份 CIFAR10 日志 |
 | checkpoint | 已存在 | `checkpoints/` 下有 CIFAR10 与 CIFAR100 `.pt` |
@@ -357,9 +357,9 @@ python scripts/prepare_ntu60_npz.py --source <skeleton_zip_or_dir> --output data
 
 ### Food-101N
 
-代码路径：`datasets/seq_food101n.py`，配置文件 `datasets/configs/seq-food101n/default.yaml`，研究与验证文档位于 `docs/food101n/`。
+代码路径：`datasets/seq_food101n.py`，配置文件 `datasets/configs/seq-food101n/default.yaml`，研究与验证文档位于 `docs/food101n/`。用户已要求后续 Food-101N/论文相关总结统一以 `.md` 文件交付。
 
-状态：当前未发现真实 Food-101N 或 Food-101 clean test 数据。本数据集不自动下载；应手动准备 Food-101N noisy train 和 Food-101 clean test。
+状态：当前未发现真实 Food-101N 图片数据；已只读扫描项目 `data/`、`Documents`、`Downloads`、`Desktop` 的常见路径，未发现 Food101N 图片目录。NTD/PuriDivER 仓库提供 `tasks/Food-101N` split JSON，可通过 `git clone --depth 1 https://github.com/wish44165/ntd.git external/ntd` 获取。用户已确认 Food101N 正式复现采用论文/AER/NTD 接近的 `52,867 train / 4,741 test` split，不直接扫描完整约 310k Food101N，也不使用完整 Food-101 官方 25,250 clean test 作为首轮正式复现。
 
 特点：
 
@@ -370,20 +370,34 @@ python scripts/prepare_ntu60_npz.py --source <skeleton_zip_or_dir> --output data
 | 类数 | 101 |
 | 任务数 | 5 |
 | 每任务类别数 | `[20, 20, 20, 20, 21]` |
-| 默认 backbone | `resnet18` |
-| 默认 epoch/batch | 50 / 32 |
+| 默认 backbone | `resnet34` |
+| 默认 epoch/batch | 20 / 32 |
 | 自动下载 | 否 |
 | train label | Food-101N noisy class label |
-| test label | Food-101 clean class label |
+| test label | NTD/PuriDivER Food-101N `4,741` test split label；不是完整 Food-101 25,250 clean test |
 
 Food-101N 的训练标签已经是真实噪声标签，不应再设置 `--noise_rate` 触发 CIFAR 式合成噪声。当前 `er-ace-aer-abs` 已允许 `true_labels=None`，`aer-sap` 继承该兼容；`ogc-sap` 原本已支持可选 `true_labels`。不得把 verification label 当成 clean class label。
 
 本地数据检查入口：
 
 ```bash
+python scripts/prepare_food101n_metadata.py --output-root data/Food-101N \
+  --train-list <source_train_split> --test-list <source_test_split> \
+  --train-images-dir <source_train_images> --test-images-dir <source_test_images> \
+  --classes-file <source_classes_file> --strict --overwrite
 python scripts/validate_food101n_dataset.py --root data/Food-101N_release --strict
 python scripts/validate_food101n_dataset.py --root data/Food-101N_release --strict --check-import --check-batch
 ```
+
+正式 split 验证优先使用显式 metadata：
+
+```bash
+python scripts/validate_food101n_dataset.py --root data/Food-101N \
+  --train-list meta/train.tsv --test-list meta/test.tsv \
+  --images-dir images --classes-file meta/classes.txt --strict
+```
+
+验证脚本默认要求 train/test 样本数为 `52,867` 和 `4,741`；如只是临时检查非正式 split，可显式传 `--expected-train-records 0 --expected-test-records 0` 关闭样本数检查。
 
 不要随意删除 `data/`、`data/noisy_labels/`、`data/results*/` 或原始压缩包。删除或重新生成 noisy label cache 会影响复现实验可比性。
 
@@ -826,13 +840,17 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 | T8 | CIFAR10 asymmetric noisy label cache | 当前只发现 symmetric 20/40 cache | 检查运行日志或重新生成前先备份/记录 seed | 待确认 |
 | T9 | 多 seed 正式结果 | `readme_latest.md` 建议 seed 0/152，结果记录不完整 | 汇总 `logs.pyd` 和外层报告 | 待确认 |
 | T10 | `readme_latest.md` 是否需要同步修正 NTU60 命令 | 本次任务不允许修改 | 向用户建议单独授权更新 | 待确认 |
-| T11 | Food-101N 真实数据路径和 Kaggle 解压结构 | 当前仅完成代码接入，未发现本机数据 | 准备 Food-101N noisy train 与 Food-101 clean test 后运行数据完整性验证 | 待确认 |
+| T11 | Food-101N 真实数据路径和 Kaggle 解压结构 | split 已确认采用 NTD/PuriDivER `52,867/4,741`；当前仍未发现本机真实图片数据 | 下载 Food101N 图片；clone NTD/PuriDivER task split；运行 `prepare_food101n_metadata.py` 和验证脚本 | split 获取方式已确认，图片数据路径待确认 |
 | T12 | Food-101N 与强制 `true_labels` 模型的协议兼容 | Food-101N train 无完整 clean class label | 已将 `er-ace-aer-abs.observe()` 改为 `true_labels=None`；不伪造 clean train label | 已处理 |
 
 ## 29. 变更记录
 
 | 日期 | 修改内容 | 修改原因 | 验证情况 |
 |---|---|---|---|
+| 2026-07-14 | 拉取 NTD `tasks/Food-101N`，生成本机 `data/Food-101N/meta/train.tsv/test.tsv/classes.txt`，并完成离线 metadata 验证 | 用户要求先解决除数据下载外的全部问题；split metadata 可由 NTD/PuriDivER 提供，图片本体仍需用户下载 | 已验证 records=52,867/4,741、classes=101、label range=0..100；图片路径检查因未下载图片仍待执行 |
+| 2026-07-14 | 新增 `scripts/prepare_food101n_metadata.py`，并记录本地 Food101N 数据只读扫描结果 | 下一步需要把 AER/NTD/Food101N 原始 split 转成项目标准 `train.tsv/test.tsv/classes.txt` | 已完成脚本语法检查；当前本机仍未发现真实 Food101N 数据 |
+| 2026-07-14 | 确认 Food101N 采用论文/AER/NTD 接近的 `52,867 train / 4,741 test` split，并同步默认配置和验证脚本 | 用户明确选择该 split；需要避免误扫完整约 310k Food101N，且默认配置应对齐 ResNet34/20 epochs | 已更新配置与验证逻辑；真实数据仍待准备后验证 |
+| 2026-07-14 | 新增原文 Food101N 协议与代码实现说明文档；后续 Food101N/论文相关总结统一输出为 `.md` 文件 | 用户要求所有相关总结以 Markdown 文件交付，并需要记录原文协议、参考论文源码和实现解释 | 已阅读用户提供 PDF，核对 Food101N 关键页和当前实现；真实数据仍待验证 |
 | 2026-07-14 | 新增 Food-101N 数据检查脚本、训练命令模板，并放宽 `er-ace-aer-abs.observe()` 的 `true_labels` 参数 | 进入 Food-101N 训练接入阶段，真实 noisy train 数据不应要求 clean train label | 已完成 `py_compile` 级别验证；真实数据和 torch/torchvision 环境仍待验证 |
 | 2026-07-14 | 新增 `seq-food101n` 数据集接入说明、非均匀任务划分和待确认项 | Food-101N 数据集支持需要长期记录数据格式、真实噪声协议和 101 类 task split | 已完成 `py_compile`；当前 shell 缺 `torch`、`torchvision`、`yaml`，未完成 import/真实数据验证 |
 | 2026-07-14 | 新建项目级 `AGENTS.md` | 建立 `mammoth_code` 的 AI Agent 长期操作规范，并明确 `readme_latest.md` 为主要参考文档 | 部分验证：已只读检查代码、配置、数据、日志、checkpoint；当前 shell 缺依赖，未执行训练/评估入口 |

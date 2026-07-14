@@ -172,7 +172,7 @@ test:  Resize(256) -> CenterCrop(224) -> ToTensor -> Normalize(ImageNet)
 2. Food-101/Food101N 图像不是 CIFAR 32x32。
 3. 当前项目已有 224 自然图像数据集使用 ImageNet normalization。
 
-默认 backbone 设为 `resnet18`，避免自动下载预训练权重；用户后续可显式指定其他 backbone。
+早期工程设计曾考虑默认使用 `resnet18` 以降低 smoke test 成本；用户确认采用论文/AER/NTD 接近的 Food101N 协议后，当前正式默认已改为 `resnet34`、20 epochs。临时 smoke test 如显存不足，仍可在命令行显式覆盖为较小 backbone。
 
 ## true_labels 与 verification label
 

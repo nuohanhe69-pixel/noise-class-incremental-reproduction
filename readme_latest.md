@@ -188,35 +188,66 @@ python main.py --dataset seq-cifar10 --model ogc-sap --noise_rate 0.4 --noise_ty
 
 ## Food101N
 
-Food101N 使用真实 noisy train label，clean test 来自 Food-101。不要再设置 CIFAR 式合成噪声，正式命令保持 `--noise_rate 0`。
+Food101N 使用真实 noisy train label。当前复现协议采用论文/AER/NTD 接近的 `52,867 train / 4,741 test` split，而不是直接扫描完整约 310k Food101N，也不是使用完整 Food-101 官方 25,250 clean test。不要再设置 CIFAR 式合成噪声，正式命令保持 `--noise_rate 0`。
 
 ### 数据目录检查
 
-先把 Food-101N noisy train 和 Food-101 clean test 解压到 `data/` 下。推荐先运行纯数据检查脚本：
+先准备两个来源：
+
+1. Food-101N 图片：从官方 Food-101N/Kaggle 下载并解压，得到本地 `images/` 目录。
+2. AER/NTD/PuriDivER 风格 split：可从 NTD 或 PuriDivER 仓库的 `tasks/Food-101N` 获取。
+
+推荐先获取 task split：
+
+```bash
+mkdir -p external
+git clone --depth 1 https://github.com/wish44165/ntd.git external/ntd
+```
+
+然后用 task JSON 转成项目标准 metadata：
+
+```bash
+python scripts/prepare_food101n_metadata.py \
+  --output-root data/Food-101N \
+  --task-dir external/ntd/tasks/Food-101N \
+  --task-rand 1 \
+  --train-images-dir <food101n_images_dir> \
+  --test-images-dir <food101n_images_dir> \
+  --strict \
+  --overwrite
+```
+
+默认会检查 train/test 样本数是否分别为 `52,867` 和 `4,741`。如果只是转换临时非正式 split，可加 `--allow-count-mismatch`。如果希望把选中的图片也整理到 `data/Food-101N/images/` 下，可加 `--link-images` 或 `--copy-images`。
+
+当前本机已经可以用 NTD task JSON 生成标准 metadata；图片未下载前，`data/Food-101N/images/` 仍为空，严格验证和训练需要等图片到位后再执行。
+
+转换完成后，运行纯数据检查脚本：
 
 ```bash
 python scripts/validate_food101n_dataset.py \
-  --root data/Food-101N_release \
-  --test-list ../food-101/meta/test.txt \
-  --test-images-dir ../food-101/images \
-  --classes-file ../food-101/meta/classes.txt \
+  --root data/Food-101N \
+  --train-list meta/train.tsv \
+  --test-list meta/test.tsv \
+  --images-dir images \
+  --classes-file meta/classes.txt \
   --strict
 ```
 
-如果本地文件名不同，把 `--test-list`、`--test-images-dir`、`--classes-file` 改成真实路径。若 train metadata 存在，也可以显式加：
+默认会检查 train/test 样本数是否分别为 `52,867` 和 `4,741`。如果本地文件名不同，把 `--train-list`、`--test-list`、`--images-dir`、`--classes-file` 改成真实路径。若 train/test 图片目录不同，也可以显式使用：
 
 ```bash
---train-list meta/train.txt --train-images-dir train
+--train-images-dir train --test-images-dir ../food-101/images
 ```
 
 项目环境中已安装 `torch`、`torchvision` 后，可以进一步检查 Mammoth 数据集类是否能构造 loader：
 
 ```bash
 python scripts/validate_food101n_dataset.py \
-  --root data/Food-101N_release \
-  --test-list ../food-101/meta/test.txt \
-  --test-images-dir ../food-101/images \
-  --classes-file ../food-101/meta/classes.txt \
+  --root data/Food-101N \
+  --train-list meta/train.tsv \
+  --test-list meta/test.tsv \
+  --images-dir images \
+  --classes-file meta/classes.txt \
   --strict \
   --check-import
 ```
@@ -229,21 +260,22 @@ python scripts/validate_food101n_dataset.py \
 
 ```bash
 python main.py --dataset seq-food101n --model ogc-sap --enable_sap 1 \
-  --food101n_root data/Food-101N_release \
-  --food101n_test_list ../food-101/meta/test.txt \
-  --food101n_test_images_dir ../food-101/images \
-  --food101n_classes_file ../food-101/meta/classes.txt \
-  --backbone resnet18 --n_epochs 1 --batch_size 8 --minibatch_size 8 \
+  --food101n_root data/Food-101N \
+  --food101n_train_list meta/train.tsv \
+  --food101n_test_list meta/test.tsv \
+  --food101n_images_dir images \
+  --food101n_classes_file meta/classes.txt \
+  --backbone resnet34 --n_epochs 1 --batch_size 8 --minibatch_size 8 \
   --lr 0.03 --buffer_size 500 --num_workers 0 --debug_mode 1 \
   --noise_rate 0 --seed 0
 ```
 
 ### Food101N 正式训练模板
 
-真实实验建议先从 OGC+SAP 主方法开始，确认显存后再调大 batch 或 backbone：
+真实实验建议先从 OGC+SAP 主方法开始，使用论文/AER/NTD 对齐设置：
 
 ```bash
-COMMON_ARGS="--dataset seq-food101n --food101n_root data/Food-101N_release --food101n_test_list ../food-101/meta/test.txt --food101n_test_images_dir ../food-101/images --food101n_classes_file ../food-101/meta/classes.txt --backbone resnet18 --n_epochs 50 --batch_size 32 --minibatch_size 32 --lr 0.03 --buffer_size 2000 --num_workers 4 --noise_rate 0"
+COMMON_ARGS="--dataset seq-food101n --food101n_root data/Food-101N --food101n_train_list meta/train.tsv --food101n_test_list meta/test.tsv --food101n_images_dir images --food101n_classes_file meta/classes.txt --backbone resnet34 --n_epochs 20 --batch_size 32 --minibatch_size 32 --lr 0.03 --buffer_size 2000 --num_workers 4 --noise_rate 0"
 
 python main.py --model ogc-sap --enable_sap 1 \
   --sap_scale_coff 5000 \

@@ -17,6 +17,8 @@ CLASS_KEYS = ("klass", "class", "class_name", "category", "category_name", "labe
 LABEL_KEYS = ("label", "target", "class_idx", "class_id", "category_id")
 VERIFICATION_KEYS = ("verification_label", "verified", "is_verified")
 TASK_SPLIT = [20, 20, 20, 20, 21]
+EXPECTED_TRAIN_RECORDS = 52867
+EXPECTED_TEST_RECORDS = 4741
 
 
 def clean_value(value: Any) -> Optional[str]:
@@ -370,7 +372,10 @@ def validate_split(
     print(f"[{split_name}] classes: {len(class_to_idx)}")
     print(f"[{split_name}] label range: {unique_labels[0]}..{unique_labels[-1]}")
     print(f"[{split_name}] verified flag records: {verified_count}")
-    print(f"[{split_name}] missing image paths: {len(missing)}")
+    if skip_image_path_check:
+        print(f"[{split_name}] missing image paths: <skipped>")
+    else:
+        print(f"[{split_name}] missing image paths: {len(missing)}")
     if missing and not strict:
         for path in missing[:max_missing_report]:
             print(f"[{split_name}] missing example: {path}")
@@ -438,6 +443,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-images-dir", default="", help="Test image directory override.")
     parser.add_argument("--classes-file", default="", help="Optional 101-class names file.")
     parser.add_argument("--expected-classes", type=int, default=101)
+    parser.add_argument(
+        "--expected-train-records",
+        type=int,
+        default=EXPECTED_TRAIN_RECORDS,
+        help="Expected Food-101N train records for the AER/NTD-style split. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--expected-test-records",
+        type=int,
+        default=EXPECTED_TEST_RECORDS,
+        help="Expected Food-101N test records for the AER/NTD-style split. Set 0 to disable.",
+    )
     parser.add_argument("--strict", action="store_true", help="Fail if any referenced image path is missing.")
     parser.add_argument("--skip-image-path-check", action="store_true", help="Only validate metadata and labels.")
     parser.add_argument("--max-missing-report", type=int, default=10)
@@ -467,6 +484,12 @@ def main() -> int:
 
     print(f"[food101n] root: {args.root}")
     print(f"[food101n] task split: {TASK_SPLIT} (sum={sum(TASK_SPLIT)})")
+    if args.expected_train_records > 0 or args.expected_test_records > 0:
+        print(
+            "[food101n] expected split records: "
+            f"train={args.expected_train_records or '<disabled>'}, "
+            f"test={args.expected_test_records or '<disabled>'}"
+        )
 
     class_to_idx, train_stats = validate_split(
         "train",
@@ -500,6 +523,17 @@ def main() -> int:
                 f"{split_name} label range is {stats['min_label']}..{stats['max_label']}, "
                 f"expected 0..{args.expected_classes - 1}"
             )
+
+    if args.expected_train_records > 0 and train_stats["records"] != args.expected_train_records:
+        errors.append(
+            f"train has {train_stats['records']} records, expected {args.expected_train_records} "
+            "for the selected AER/NTD-style Food101N split"
+        )
+    if args.expected_test_records > 0 and test_stats["records"] != args.expected_test_records:
+        errors.append(
+            f"test has {test_stats['records']} records, expected {args.expected_test_records} "
+            "for the selected AER/NTD-style Food101N split"
+        )
 
     if sum(TASK_SPLIT) != args.expected_classes:
         errors.append(f"Task split {TASK_SPLIT} does not sum to {args.expected_classes}")

@@ -108,5 +108,6 @@ scripts/prepare_grid*
 docs/model_args
 
 cache
+external/
 
 uv.lock
