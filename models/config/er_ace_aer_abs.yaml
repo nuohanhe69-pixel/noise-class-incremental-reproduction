@@ -4,3 +4,22 @@ seq-cifar100:
     buffer_fitting_type: mixmatch
     lr: 0.1
     model: er_ace_aer_abs
+seq-ntu60:
+  500:
+    buffer_fitting_epochs: 0
+    buffer_fitting_type: mixmatch
+    lr: 0.0005
+    optimizer: adamw
+    optim_wd: 0.05
+    sample_selection_strategy: abs
+    use_aer: 1
+    alpha_sample_insertion: 0.75
+  2000:
+    buffer_fitting_epochs: 0
+    buffer_fitting_type: mixmatch
+    lr: 0.0005
+    optimizer: adamw
+    optim_wd: 0.05
+    sample_selection_strategy: abs
+    use_aer: 1
+    alpha_sample_insertion: 0.75

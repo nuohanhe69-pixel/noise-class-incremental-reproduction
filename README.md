@@ -105,57 +105,39 @@ All the new additions will try to preserve the current structure of the reposito
 
 ## 🧠 Models
 
-Mammoth currently supports **more than 70** models, with new releases covering the main competitors in literature.
+### 在这个代码库中    我们的baseline的model为   er_ace_aer_abs.py   ;而我们改进的model为aer_dgc_cbp.py；   要进行训练的命令为（可在命令中进行model替换，以及--args进行其他参数的配置）：
 
-<details>
-<summary><b>Click to expand model list</b></summary>
+#### 1. Seq. CIFAR-100
 
-- AttriCLIP: A Non-Incremental Learner for Incremental Knowledge Learning (AttriCLIP): `attriclip`.
-- Bias Correction (BiC): `bic`.
-- CaSpeR-IL (on DER++, X-DER with RPC, iCaRL, and ER-ACE): `derpp_casper`, `xder_rpc_casper`, `icarl_casper`, `er_ace_casper`.
-- CODA-Prompt: COntinual Decomposed Attention-based Prompting for Rehearsal-Free Continual Learning (CODA-Prompt) - _Requires_ `pip install timm==0.9.8`: `coda-prompt`.
-- Continual Contrastive Interpolation Consistency (CCIC) - _Requires_ `pip install kornia`: `ccic`.
-- Continual Generative training for Incremental prompt-Learning (CGIL): `cgil`
-- Contrastive Language-Image Pre-Training (CLIP): `clip` (*static* method with no learning).
-- CSCCT (on DER++, X-DER with RPC, iCaRL, and ER-ACE): `derpp_cscct`, `xder_rpc_cscct`, `icarl_cscct`, `er_ace_cscct`.
-- Dark Experience for General Continual Learning: a Strong, Simple Baseline (DER & DER++): `der` and `derpp`.
-- DualPrompt: Complementary Prompting for Rehearsal-free Continual Learning (DualPrompt) - _Requires_ `pip install timm==0.9.8`: `dualprompt`.
-- Efficient Lifelong Learning with A-GEM (A-GEM, A-GEM-R - A-GEM with reservoir buffer): `agem`, `agem_r`.
-- Experience Replay (ER): `er`.
-- Experience Replay with Asymmetric Cross-Entropy (ER-ACE): `er_ace`.
-- eXtended-DER (X-DER): `xder` (full version), `xder_ce` (X-DER with CE), `xder_rpc` (X-DER with RPC).
-- Function Distance Regularization (FDR): `fdr`.
-- Generating Instance-level Prompts for Rehearsal-free Continual Learning (DAP): `dap`.
-- Gradient Episodic Memory (GEM) - _Unavailable on windows_: `gem`.
-- Greedy gradient-based Sample Selection (GSS): `gss`.
-- Greedy Sampler and Dumb Learner (GDumb): `gdumb`.
-- Hindsight Anchor Learning (HAL): `hal`.
-- Image-aware Decoder Enhanced à la Flamingo with Interleaved Cross-attentionS (IDEFICS): `idefics` (*static* method with no learning).
-- Incremental Classifier and Representation Learning (iCaRL): `icarl`.
-- Joint training for the General Continual setting: `joint_gcl` (_only for General Continual_).
-- Large Language and Vision Assistant (LLAVA): `llava` (*static* method with no learning).
-- Learning a Unified Classifier Incrementally via Rebalancing (LUCIR): `lucir`.
-- Learning to Prompt (L2P) - _Requires_ `pip install timm==0.9.8`: `l2p`.
-- Learning without Forgetting (LwF): `lwf`.
-- Learning without Forgetting adapted for Multi-Class classification (LwF.MC): `lwf_mc` (from the iCaRL paper).
-- Learning without Shortcuts (LwS): `lws`.
-- LiDER (on DER++, iCaRL, GDumb, and ER-ACE): `derpp_lider`, `icarl_lider`, `gdumb_lider`, `er_ace_lider`.
-- May the Forgetting Be with You: Alternate Replay for Learning with Noisy Labels (AER & ABS): `er_ace_aer_abs`.
-- Meta-Experience Replay (MER): `mer`.
-- Mixture-of-Experts Adapters (MoE Adapters): `moe_adapters`.
-- Online Continual Learning on a Contaminated Data Stream with Blurry Task Boundaries (PuriDivER): `puridiver`.
-- online Elastic Weight Consolidation (oEWC): `ewc_on`.
-- Progressive Neural Networks (PNN): `pnn`.
-- Random Projections and Pre-trained Models for Continual Learning (RanPAC): `ranpac`.
-- Regular Polytope Classifier (RPC): `rpc`.
-- Rethinking Experience Replay: a Bag of Tricks for Continual Learning (ER-ACE with tricks): `er_ace_tricks`.
-- Semantic Two-level Additive Residual Prompt (STAR-Prompt): `starprompt`. Also includes the first-stage only (`first_stage_starprompt`) and second-stage only (`second_stage_starprompt`) versions.
-- SLCA: Slow Learner with Classifier Alignment for Continual Learning on a Pre-trained Model (SLCA) - _Requires_ `pip install timm==0.9.8`: `slca`.
-- Slow Learner with Classifier Alignment (SLCA): `slca`.
-- Synaptic Intelligence (SI): `si`.
-- Transfer without Forgetting (TwF): `twf`.
-- ZSCL: Zero-Shot Continual Learning: `zscl`.
-</details>
+**数据集名称：** `seq-cifar100`
+
+##### 1.1. Seq. CIFAR-100, Symmetric Noise (symm)
+
+**OURs (基础模型，无整合)**
+COMMON_ARGS="--backbone resnet18 --n_epochs 50 --batch_size 32 --lr 0.03 --buffer_size 2000"
+
+```bash
+ Noise rate 20%
+python main.py --dataset seq-cifar100 --model er_ace_aer_abs --noise_rate 0.2 --noise_type symm --buffer_fitting_epochs 0 ${COMMON_ARGS}
+
+ Noise rate 40%
+python main.py --dataset seq-cifar100 --model er_ace_aer_abs --noise_rate 0.4 --noise_type symm --buffer_fitting_epochs 0 ${COMMON_ARGS}
+
+
+#### 2.Seq_cifar10
+
+##### 2.1. Seq. CIFAR-10, Symmetric Noise (symm)
+
+**OURs (基础模型，无整合)**
+COMMON_ARGS="--backbone resnet18 --n_epochs 50 --batch_size 32 --lr 0.03 --buffer_size 500"
+
+```bash
+ Noise rate 20%
+python main.py --dataset seq-cifar10 --model ogc_sap --noise_rate 0.2 --noise_type symm --buffer_fitting_epochs 0 --sap_scale_coff 1000 ${COMMON_ARGS}
+
+ Noise rate 40%
+python main.py --dataset seq-cifar100 --model er_ace_aer_abs --noise_rate 0.4 --noise_type symm --buffer_fitting_epochs 0 ${COMMON_ARGS}
+
 
 ## 📊 Datasets
 
@@ -180,16 +162,7 @@ Mammoth currently includes **23** datasets, covering *toy classification problem
 - Sequential CIFAR-100 (_Class-Il / Task-IL_): `seq-cifar100`.
 - Sequential CIFAR-100 resized 224x224 (ViT version) (_Class-Il / Task-IL_): `seq-cifar100-224`.
 - Sequential CIFAR-100 resized 224x224 (ResNet50 version) (_Class-Il / Task-IL_): `seq-cifar100-224-rs`.
-- Sequential CUB-200 (_Class-Il / Task-IL_): `seq-cub200`.
-- Sequential ImageNet-R (_Class-Il / Task-IL_): `seq-imagenet-r`.
-- Sequential Cars-196 (_Class-Il / Task-IL_): `seq-cars196`.
-- Sequential RESISC45 (_Class-Il / Task-IL_): `seq-resisc45`.
-- Sequential EuroSAT-RGB (_Class-Il / Task-IL_): `seq-eurosat-rgb`.
-- Sequential ISIC (_Class-Il / Task-IL_): `seq-isic`.
-- Sequential ChestX (_Class-Il / Task-IL_): `seq-chestx`.
-- Sequential MIT-67 (_Class-Il / Task-IL_): `seq-mit67`.
-- Sequential CropDisease (_Class-Il / Task-IL_): `seq-cropdisease`.
-- Sequential CelebA (_Biased-Class-Il_): `seq-celeba`. *This dataset is multi-label (i.e., trains with binary cross-entropy)*
+
 </details>
 
 ## 📝 Citing the library

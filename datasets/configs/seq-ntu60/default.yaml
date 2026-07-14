@@ -1,0 +1,15 @@
+N_TASKS: 6
+N_CLASSES_PER_TASK: 10
+N_CLASSES: 60
+SIZE: [3, 120, 25, 2]
+data_path: data/NTU60_CS.npz
+num_channels: 3
+num_joints: 25
+num_frames: 120
+num_skeletons: 2
+backbone: efficient-gcn
+batch_size: 32
+n_epochs: 30
+lr: 0.0005
+optimizer: adamw
+optim_wd: 0.05

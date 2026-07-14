@@ -165,7 +165,11 @@ def to_kornia_transform(transform: transforms.Compose, apply: bool = True, overr
         elif isinstance(t, transforms.RandomResizedCrop):
             ts.append(kornia.augmentation.RandomResizedCrop(size=t.size, scale=t.scale, ratio=t.ratio, resample=_convert_interpolation_to_resample(t.interpolation), p=p))
         elif isinstance(t, transforms.Compose):
-            ts.extend(to_kornia_transform(t, apply=False, p=p))
+            ts.extend(to_kornia_transform(t, apply=False, override_p=p))
+        elif t.__class__.__name__.lower() in ("ntu_to_tensor", "random_rot"):
+            if apply:
+                return transforms.Compose(transform)
+            return transform
         elif isinstance(t, transforms.ToTensor) or isinstance(t, transforms.ToPILImage):
             pass
         elif isinstance(t, transforms.CenterCrop):

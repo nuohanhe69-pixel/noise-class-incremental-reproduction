@@ -175,7 +175,7 @@ def mammoth_load_checkpoint(checkpoint_path: str,
         if not os.path.exists(checkpoint_path):
             raise ValueError('The given checkpoint does not exist.')
 
-    saved_obj = torch.load(checkpoint_path, map_location=torch.device("cpu"), weights_only=True)
+    saved_obj = torch.load(checkpoint_path, map_location=torch.device("cpu"), weights_only=False)
 
     if 'args' in saved_obj:
         ckpt_args = Namespace(**saved_obj['args'])  # convert back to Namespace

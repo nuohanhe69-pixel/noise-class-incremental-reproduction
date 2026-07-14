@@ -592,16 +592,10 @@ class Buffer:
                                        replace=False).tolist()
         choice = np.array(choice)
 
-        if transform is None:
-            def transform(x): return x
-        # ret_tuple = (torch.stack([transform(ee.cpu()) for ee in self.examples[choice]]).to(self.device),)
-        ret_tuple = (apply_transform(self.examples[choice], transform=transform).to(self.device),)
-        for attr_str in self.attributes[1:]:
-            if hasattr(self, attr_str):
-                attr = getattr(self, attr_str)
-                ret_tuple += (attr[choice],)
-
-        return ret_tuple
+        inputs = apply_transform(self.examples[choice], transform=transform).to(self.device)
+        labels = self.labels[choice].to(self.device)
+        indices = torch.from_numpy(choice).to(self.device)
+        return inputs, labels, indices
 
     def get_data_by_index(self, indexes, transform: nn.Module = None, device=None) -> Tuple:
         """

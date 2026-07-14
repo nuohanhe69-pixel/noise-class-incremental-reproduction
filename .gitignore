@@ -1,4 +1,5 @@
 *.swp
+.DS_Store
 *.gif
 *.pdf
 data/
@@ -11,7 +12,11 @@ checkpoints/
 *.txt
 json/
 out/
+output/
 err/
+run_logs/
+*.npy
+*.npz
 .vscode/
 *.code-workspace
 .history/

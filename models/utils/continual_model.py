@@ -204,14 +204,22 @@ class ContinualModel(nn.Module):
 
         try:
             if transform is not None:
-                self.transform = to_kornia_transform(transform.transforms[-1].transforms)
+                if hasattr(transform, 'transforms') and hasattr(transform.transforms[-1], 'transforms'):
+                    transform_to_convert = transform.transforms[-1].transforms
+                else:
+                    transform_to_convert = transform
+                self.transform = to_kornia_transform(transform_to_convert)
                 self.normalization_transform = to_kornia_transform(self.dataset.get_normalization_transform())
             else:
                 logging.info("No transform provided.")
         except BaseException:
             logging.error("could not initialize kornia transforms.")
-            self.normalization_transform = transforms.Compose([transforms.ToPILImage(), self.dataset.TEST_TRANSFORM]) if hasattr(
-                self.dataset, 'TEST_TRANSFORM') else transforms.Compose([transforms.ToPILImage(), transforms.ToTensor(), self.dataset.get_normalization_transform()])
+            if hasattr(self.dataset, 'SIZE') and len(tuple(self.dataset.SIZE)) > 2:
+                self.transform = transform
+                self.normalization_transform = self.dataset.get_normalization_transform()
+            else:
+                self.normalization_transform = transforms.Compose([transforms.ToPILImage(), self.dataset.TEST_TRANSFORM]) if hasattr(
+                    self.dataset, 'TEST_TRANSFORM') else transforms.Compose([transforms.ToPILImage(), transforms.ToTensor(), self.dataset.get_normalization_transform()])
 
         if self.net is not None:
             self.opt = self.get_optimizer()
