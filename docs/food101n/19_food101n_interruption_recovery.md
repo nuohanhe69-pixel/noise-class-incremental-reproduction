@@ -25,7 +25,7 @@ conda activate /home/hnh/conda_envs/nrgp-mammoth
 ps -u "$USER" -f | grep '[m]ain.py'
 nvidia-smi
 
-LOG=/home/hnh/food101n_runs/main/food101n_ogc_sap_seed0_b16.log
+LOG=/home/hnh/food101n_runs/main/food101n_dgc_seed0_b16.log
 tail -120 "$LOG"
 grep -nE "Traceback|Error|Killed|CUDA out of memory|SIGINT|SIGTERM|KeyboardInterrupt|Checkpoint|completed|Logging results" "$LOG" | tail -80
 ```
@@ -88,24 +88,21 @@ COMMON_ARGS="--dataset seq-food101n \
   --noise_rate 0"
 
 nohup python -u main.py \
-  --model ogc-sap \
-  --enable_sap 1 \
-  --sap_scale_coff 5000 \
+  --model dgc \
   --ogc_loss_weight 0.3 \
   --ogc_low_conf_weight 0.3 \
   --ogc_buffer_penalty_coeff 2.0 \
-  --sap_retain_samples 2000 \
   --savecheck task \
-  --ckpt_name food101n_ogc_sap_seed0_b16_taskckpt \
+  --ckpt_name food101n_dgc_seed0_b16_taskckpt \
   --seed 0 \
   ${COMMON_ARGS} \
-  > /home/hnh/food101n_runs/main/food101n_ogc_sap_seed0_b16_taskckpt.log 2>&1 &
+  > /home/hnh/food101n_runs/main/food101n_dgc_seed0_b16_taskckpt.log 2>&1 &
 ```
 
 查看运行状态：
 
 ```bash
-tail -f /home/hnh/food101n_runs/main/food101n_ogc_sap_seed0_b16_taskckpt.log
+tail -f /home/hnh/food101n_runs/main/food101n_dgc_seed0_b16_taskckpt.log
 ```
 
 另开一个终端查看 GPU：
@@ -118,7 +115,7 @@ nvidia-smi -l 2
 
 ```bash
 find /home/hnh/mammoth_code_food101n/checkpoints \
-  -type f -name "food101n_ogc_sap_seed0_b16_taskckpt*.pt" \
+  -type f -name "food101n_dgc_seed0_b16_taskckpt*.pt" \
   -printf "%TY-%Tm-%Td %TH:%TM %p\n" | sort | tail -20
 ```
 
@@ -127,7 +124,7 @@ find /home/hnh/mammoth_code_food101n/checkpoints \
 如果以后已经使用 `--savecheck task`，并且看到类似：
 
 ```text
-checkpoints/food101n_ogc_sap_seed0_b16_taskckpt_2.pt
+checkpoints/food101n_dgc_seed0_b16_taskckpt_2.pt
 ```
 
 这通常表示 Task 3 结束后的 checkpoint，因为任务编号从 0 开始：`_0` 对应 Task 1 后，`_1` 对应 Task 2 后，`_2` 对应 Task 3 后。
@@ -135,15 +132,15 @@ checkpoints/food101n_ogc_sap_seed0_b16_taskckpt_2.pt
 从 Task 4 继续时使用：
 
 ```bash
-CKPT=/home/hnh/mammoth_code_food101n/checkpoints/food101n_ogc_sap_seed0_b16_taskckpt_2.pt
+CKPT=/home/hnh/mammoth_code_food101n/checkpoints/food101n_dgc_seed0_b16_taskckpt_2.pt
 
 nohup python -u main.py \
   --loadcheck "$CKPT" \
   --start_from 3 \
   --savecheck task \
-  --ckpt_name food101n_ogc_sap_seed0_b16_resume_from_task4 \
+  --ckpt_name food101n_dgc_seed0_b16_resume_from_task4 \
   ${COMMON_ARGS} \
-  > /home/hnh/food101n_runs/main/food101n_ogc_sap_seed0_b16_resume_from_task4.log 2>&1 &
+  > /home/hnh/food101n_runs/main/food101n_dgc_seed0_b16_resume_from_task4.log 2>&1 &
 ```
 
 注意：不要从 task 中途的 `paused` checkpoint 当作正式复现实验结果。正式结果最好从完整 task checkpoint 续跑，或者从头重跑。

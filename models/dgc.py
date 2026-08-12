@@ -1,46 +1,16 @@
-import copy
-from typing import Union, Optional
+from typing import Union
 from sklearn.mixture import GaussianMixture
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
-from torch.distributions.beta import Beta
 from argparse import ArgumentParser
-from tqdm.auto import tqdm, trange
 import numpy as np
 from scipy import stats
 from collections import deque
 
 import math
-from .er_ace_aer_abs import ErAceAerAbs, CustomDataset
-
-# A simple dataset class for SAP's internal testing, returning only (data, target)
-class SapTestDataset(torch.utils.data.Dataset):
-    def __init__(self, data: torch.Tensor, targets: torch.Tensor, transform=None):
-        self.data = data
-        self.targets = targets
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        img, target = self.data[idx], self.targets[idx]
-        if self.transform:
-            img = apply_transform(img, self.transform, autosqueeze=True)
-        return img, target
-from datasets.utils.continual_dataset import ContinualDataset
-from models.utils.continual_model import ContinualModel
-from utils.args import add_rehearsal_args
-from utils.buffer import Buffer
-from utils.augmentations import apply_transform, cutmix_data
-from utils.sap_model_utils import attach_sap_methods
-from utils.sap_core import activation_projection_based_unlearning
-from utils.efficiency_logger import EfficiencyLogger
-from argparse import Namespace
-
-import os
+from .er_ace_aer_abs import ErAceAerAbs
+from utils.augmentations import apply_transform
 
 def binary_search(left, right, func, target, tol, max_iter, is_func_decrease=True):
     for _ in range(max_iter):
@@ -358,15 +328,15 @@ class CustomDatasetOGC(torch.utils.data.Dataset):
         return ret + (self.probs[idx], self.ogc_weights[idx])
 
 
-# --- ErAceAerAbsOGC 模型 (继承自 ErAceAerAbs) ---
-class ErAceAerAbsOGC(ErAceAerAbs): # <<<--- IMPORTANT: Inherit from ErAceAerAbs
-    NAME = 'ogc_sap'
+# --- Baseline + DGC model (inherits from ErAceAerAbs) ---
+class DGC(ErAceAerAbs):
+    NAME = 'dgc'
     COMPATIBILITY = ['class-il', 'task-il']
 
     @staticmethod
     def get_parser(parser) -> ArgumentParser:
         # Call parent's get_parser to add all original ErAceAerAbs arguments
-        parser = super(ErAceAerAbsOGC, ErAceAerAbsOGC).get_parser(parser)
+        parser = super(DGC, DGC).get_parser(parser)
 
         # Add OGC specific arguments
         ogc_group = parser.add_argument_group('Optimized Gradient Clipping (OGC)')
@@ -392,38 +362,12 @@ class ErAceAerAbsOGC(ErAceAerAbs): # <<<--- IMPORTANT: Inherit from ErAceAerAbs
                             help='Weight assigned to low confidence (noisy) samples by OGC')
         ogc_group.add_argument('--ogc_buffer_penalty_coeff', default=2, type=float,
                             help='Penalty coefficient for buffer sample selection (higher = stricter filtering)')
-                            
-
-        # SAP Integration Args
-        sap_group = parser.add_argument_group('SAP Integration in OGC')
-        sap_group.add_argument('--enable_sap', type=int, default=1, help='Enable SAP unlearning?')
-        sap_group.add_argument('--sap_frequency_epochs', type=int, default=0, 
-                               help='Frequency of SAP execution in epochs (0 = end of task only)')
-        sap_group.add_argument('--sap_retain_samples', type=int, default=400, # Updated default for CIFAR10 buffer 500 scenario
-                               help='Number of clean samples to retain for SVD projection calculation')
-        sap_group.add_argument('--sap_mode', nargs='+', default=['sap'], help='modes: baseline, gpm, sgp, sap')
-        sap_group.add_argument('--sap_mode_forget', nargs='+', default=['sap'])
-        sap_group.add_argument('--sap_projection_type', nargs='+', default=['Mr'], choices=['baseline', 'Mr', 'I-Mf', 'Mr-Mi', 'I-(Mf-Mi)'], help='Projection type')
-        sap_group.add_argument('--sap_max_samples', type=int, default=2000, help='Max samples for SVD')
-        sap_group.add_argument('--sap_start_layer', nargs='+', type=int, default=[2], 
-                               help='Start layer index for SAP projection (e.g. 2 for ResNet deep layers)')
-        sap_group.add_argument('--sap_end_layer', nargs='+', type=int, default=[3], 
-                               help='End layer index for SAP projection (e.g. 3 for ResNet last block)')
-                            #    默认之前为 0  - 1；
-        sap_group.add_argument('--sap_scale_coff', nargs='+', type=float, default=[5000], # 针对CIL场景大幅下调，避免过度修正旧知识
-                               help='Scale coefficient for SAP (lower=gentler forgetting, e.g. 1000 vs 5000)')
-        sap_group.add_argument('--sap_projection_location', nargs='+', default=['post'], choices=['pre', 'post', 'all'])
-        sap_group.add_argument('--sap_project_classifier', type=int, default=1)
 
         return parser
 
     def __init__(self, backbone, loss, args, transform, dataset=None):
         # Initialize parent class (ErAceAerAbs) first
-        super(ErAceAerAbsOGC, self).__init__(backbone, loss, args, transform, dataset=dataset)
-
-        # Attach SAP methods to backbone if enabled
-        if args.enable_sap:
-            self.net = attach_sap_methods(self.net)
+        super(DGC, self).__init__(backbone, loss, args, transform, dataset=dataset)
 
         # Initialize OGC loss function
         ogc_kwargs = {
@@ -449,14 +393,6 @@ class ErAceAerAbsOGC(ErAceAerAbs): # <<<--- IMPORTANT: Inherit from ErAceAerAbs
         self.ogc_loss_weight = args.ogc_loss_weight
         self.current_batch_idx = 0
 
-    def _sync_aer_checkpoint_with_current_model(self): 
-        """ 
-        After SAP updates the model at epoch/task boundary, refresh AER checkpoint, 
-        otherwise the next fitting epoch may reload stale pre-SAP parameters. 
-        """ 
-        if getattr(self.args, 'use_aer', 0) and hasattr(self, 'past_model_ckpt'): 
-            self.past_model_ckpt = copy.deepcopy(self.net.state_dict()) 
-    
     @torch.no_grad() 
     def _reset_ogc_state_for_new_task(self): 
         self.ogc_loss_fn.current_queue_H.clear() 
@@ -494,225 +430,8 @@ class ErAceAerAbsOGC(ErAceAerAbs): # <<<--- IMPORTANT: Inherit from ErAceAerAbs
     
         self.net.train(was_training) 
     
-    def _select_class_aware_topk(self, candidate_indices, candidate_labels, candidate_losses, budget): 
-        """ 
-        From clean candidates, choose a class-aware low-loss subset. 
-        First allocate a per-class quota, then fill the remaining slots globally 
-        with the smallest remaining losses. 
-        """ 
-        candidate_indices = np.asarray(candidate_indices) 
-        candidate_labels = np.asarray(candidate_labels) 
-        candidate_losses = np.asarray(candidate_losses) 
-    
-        if len(candidate_indices) <= budget: 
-            return candidate_indices 
-    
-        unique_classes = np.unique(candidate_labels) 
-        per_class_quota = max(1, budget // max(1, len(unique_classes))) 
-    
-        selected = [] 
-        leftovers = [] 
-    
-        for cls in unique_classes: 
-            cls_mask = candidate_labels == cls 
-            cls_indices = candidate_indices[cls_mask] 
-            cls_losses = candidate_losses[cls_mask] 
-            order = np.argsort(cls_losses) 
-    
-            take = min(len(cls_indices), per_class_quota) 
-            selected.extend([(int(cls_indices[i]), float(cls_losses[i])) for i in order[:take]]) 
-            leftovers.extend([(int(cls_indices[i]), float(cls_losses[i])) for i in order[take:]]) 
-    
-        if len(selected) < budget: 
-            leftovers.sort(key=lambda x: x[1]) 
-            selected.extend(leftovers[:budget - len(selected)]) 
-        elif len(selected) > budget: 
-            selected.sort(key=lambda x: x[1]) 
-            selected = selected[:budget] 
-    
-        selected_indices = np.array([idx for idx, _ in selected], dtype=np.int64) 
-        return selected_indices
-
-    def apply_sap(self, dataset): 
-        """ 
-        Apply SAP at boundary: 
-        1) split buffer into clean / ambiguous by GMM on normalized CE loss 
-        2) build retain set from clean samples using class-aware top-k lowest-loss selection 
-        3) use ambiguous samples as forget set 
-        """ 
-        if self.buffer.is_empty(): 
-            return False 
-    
-        all_buf_data = self.buffer.get_all_data(device="cpu") 
-        inputs, labels = all_buf_data[0], all_buf_data[1] 
-    
-        not_aug_dataset = CustomDataset(inputs, labels, transform=self.normalization_transform) 
-        not_aug_loader = DataLoader( 
-            not_aug_dataset, 
-            batch_size=self.args.batch_size, 
-            shuffle=False 
-        ) 
-    
-        was_training_for_eval = self.net.training 
-        self.net.eval() 
-        _, amb_idxs, _, normalized_losses = self.split_data( 
-            test_loader=not_aug_loader, 
-            model=self.net, 
-            return_losses=True 
-        ) 
-        self.net.train(was_training_for_eval) 
-    
-        all_idxs = np.arange(len(inputs)) 
-        clean_idxs = np.setdiff1d(all_idxs, amb_idxs) 
-    
-        if len(clean_idxs) == 0: 
-            print("No clean samples found in buffer for SAP. Skipping SAP.") 
-            return False 
-        if len(amb_idxs) == 0: 
-            print("No ambiguous samples found in buffer for SAP. Skipping SAP.") 
-            return False 
-    
-        min_required_samples = max(10, self.num_classes) 
-        if len(clean_idxs) < min_required_samples: 
-            print(f"Too few clean samples ({len(clean_idxs)} < {min_required_samples}) for SAP. Skipping.") 
-            return False 
-    
-        sap_retain_samples = self.args.sap_retain_samples
-        # if 'cifar10' in self.dataset.NAME.lower():
-        #     sap_retain_samples = min(sap_retain_samples, 400)
-        # elif 'cifar100' in self.dataset.NAME.lower():
-        #     sap_retain_samples = min(sap_retain_samples, 1500)
-
-    
-        # ---- fixed: no random truncation, use class-aware top-k by loss ---- 
-        if len(clean_idxs) > sap_retain_samples: 
-            clean_labels_np = labels[clean_idxs].cpu().numpy() 
-            clean_losses_np = normalized_losses[clean_idxs]
-            clean_idxs = self._select_class_aware_topk( 
-                candidate_indices=clean_idxs, 
-                candidate_labels=clean_labels_np, 
-                candidate_losses=clean_losses_np, 
-                budget=sap_retain_samples 
-            ) 
-    
-        print(f"SAP Execution: {len(clean_idxs)} Clean Retain, {len(amb_idxs)} Ambiguous Forget.") 
-    
-        clean_indices = torch.tensor(clean_idxs, device="cpu", dtype=torch.long) 
-        corrupt_indices = torch.tensor(amb_idxs, device="cpu", dtype=torch.long) 
-    
-        inputs_clean = inputs[clean_indices] 
-        labels_clean = labels[clean_indices] 
-        inputs_corrupt = inputs[corrupt_indices] 
-        labels_corrupt = labels[corrupt_indices] 
-    
-        clean_dataset = SapTestDataset(inputs_clean, labels_clean, transform=self.normalization_transform) 
-        corrupt_dataset = SapTestDataset(inputs_corrupt, labels_corrupt, transform=self.normalization_transform) 
-        full_dataset = SapTestDataset(inputs, labels, transform=self.normalization_transform) 
-    
-        train_loader = DataLoader(full_dataset, batch_size=self.args.batch_size, shuffle=True) 
-        train_loader_clean = DataLoader(clean_dataset, batch_size=self.args.batch_size, shuffle=True) 
-        train_loader_corrupt = DataLoader(corrupt_dataset, batch_size=self.args.batch_size, shuffle=True) 
-    
-        train_loaders = (train_loader, train_loader_clean, train_loader_corrupt) 
-        val_loaders = (None, None, None) 
-        test_loader = dataset.test_loaders[-1] if dataset and hasattr(dataset, 'test_loaders') else None 
-    
-        sap_args = Namespace( 
-            mode=self.args.sap_mode, 
-            mode_forget=self.args.sap_mode_forget, 
-            projection_type=self.args.sap_projection_type, 
-            start_layer=self.args.sap_start_layer, 
-            end_layer=self.args.sap_end_layer, 
-            scale_coff=self.args.sap_scale_coff, 
-            scale_coff_forget=getattr(self.args, 'sap_scale_coff_forget', self.args.sap_scale_coff), 
-            projection_location=self.args.sap_projection_location, 
-            retain_samples=len(inputs_clean), 
-            forget_samples=len(inputs_corrupt), 
-            max_batch_size=self.args.batch_size, 
-            max_samples=self.args.sap_max_samples, 
-            class_label_names=[], 
-            num_classes=self.num_classes, 
-            use_valset=False, 
-            gpm_eps=0.95, 
-            project_classifier=bool(self.args.sap_project_classifier), 
-        ) 
-    
-        was_training = self.net.training 
-        self.net.eval() 
-    
-        try: 
-            unlearnt_model, _ = activation_projection_based_unlearning( 
-                sap_args, self.net, train_loaders, val_loaders, test_loader, full_dataset, self.device 
-            ) 
-            self.net = unlearnt_model.to(self.device) 
-            return True 
-        except Exception as e: 
-            print(f"SAP Unlearning failed: {e}") 
-            import traceback 
-            traceback.print_exc() 
-            self.net.to(self.device) 
-            return False 
-        finally: 
-            self.net.train(was_training)
-
-    @torch.no_grad() 
-    def split_data(self, test_loader: DataLoader, model: nn.Module, return_losses: bool = False): 
-        CE = nn.CrossEntropyLoss(reduction='none') 
-        model.eval() 
-        model = model.to(self.device) 
-    
-        losses = torch.tensor([]) 
-        for data in test_loader: 
-            inputs, targets = data[0], data[1] 
-            inputs, targets = inputs.to(self.device), targets.to(self.device) 
-            outputs = model(inputs) 
-            loss = CE(outputs, targets) 
-            losses = torch.cat([losses, loss.detach().cpu()]) 
-    
-        losses = (losses - losses.min()) / ((losses.max() - losses.min()) + torch.finfo(torch.float32).eps) 
-        input_loss = losses.reshape(-1, 1) 
-    
-        gmm = GaussianMixture( 
-            n_components=2, 
-            max_iter=200, 
-            tol=1e-3, 
-            reg_covar=1e-4, 
-            n_init=10,
-            random_state=getattr(self.args, 'seed', None) 
-        ) 
-        gmm.fit(input_loss) 
-    
-        prob = gmm.predict_proba(input_loss) 
-        mean_index = np.argsort(gmm.means_, axis=0) 
-        prob = prob[:, mean_index] 
-        pred = prob.argmax(axis=1) 
-    
-        correct_idx = np.where(pred == 0)[0] 
-        amb_idx = np.where(pred == 1)[0] 
-    
-        if return_losses: 
-            return correct_idx, amb_idx, prob, losses.numpy() 
-        return correct_idx, amb_idx, prob
-
-    def end_epoch(self, epoch: int, dataset: ContinualDataset): 
-        super().end_epoch(epoch, dataset) 
-    
-        if self.args.enable_sap and self.args.sap_frequency_epochs > 0: 
-            if (epoch + 1) % self.args.sap_frequency_epochs == 0: 
-                print(f"Executing Periodic SAP at epoch {epoch}...") 
-                applied = self.apply_sap(dataset) 
-                # if applied: 
-                #     self._sync_aer_checkpoint_with_current_model()
-
     def end_task(self, dataset): 
         super().end_task(dataset)
-
-        if self.args.enable_sap:
-            print("Executing End-of-Task SAP...")
-            applied = self.apply_sap(dataset)
-            if applied:
-                self._sync_aer_checkpoint_with_current_model()
-
         self.last_epoch = -1
         
 

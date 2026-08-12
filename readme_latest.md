@@ -10,13 +10,11 @@
 ```bash
 # AER/ABS baseline
 --model er-ace-aer-abs
-# AER/ABS + SAP
---model aer-sap
-# AER/ABS + OGC
---model ogc-sap --enable_sap 0
-# AER/ABS + OGC + SAP
---model ogc-sap --enable_sap 1
+# AER/ABS + DGC
+--model dgc
 ```
+
+旧 CBP/SAP 实现已从活跃代码中删除。当前阶段只比较 Baseline 与 DGC；SAP 将在后续步骤中按开源实现重新接入。
 
 噪声类型：
 
@@ -59,60 +57,50 @@ COMMON_ARGS="--backbone resnet18 --n_epochs 50 --batch_size 32 --lr 0.03 --buffe
 ### CIFAR100 Symmetric 20%
 
 ```bash
-python main.py --dataset seq-cifar100 --model ogc-sap --noise_rate 0.2 --noise_type symm \
-  --sap_scale_coff 1000 \
+python main.py --dataset seq-cifar100 --model dgc --noise_rate 0.2 --noise_type symm \
   --ogc_loss_weight 0.2 \
   --ogc_low_conf_weight 0.5 \
   --ogc_buffer_penalty_coeff 1.5 \
-  --sap_retain_samples 1500 \
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
 ### CIFAR100 Symmetric 40%
 
 ```bash
-python main.py --dataset seq-cifar100 --model ogc-sap --noise_rate 0.4 --noise_type symm \
-  --sap_scale_coff 3000 \
+python main.py --dataset seq-cifar100 --model dgc --noise_rate 0.4 --noise_type symm \
   --ogc_loss_weight 0.3 \
   --ogc_low_conf_weight 0.4 \
   --ogc_buffer_penalty_coeff 1.8 \
-  --sap_retain_samples 1500 \
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
 ### CIFAR100 Symmetric 60%
 
 ```bash
-python main.py --dataset seq-cifar100 --model ogc-sap --noise_rate 0.6 --noise_type symm \
-  --sap_scale_coff 5000 \
+python main.py --dataset seq-cifar100 --model dgc --noise_rate 0.6 --noise_type symm \
   --ogc_loss_weight 0.3 \
   --ogc_low_conf_weight 0.3 \
   --ogc_buffer_penalty_coeff 2.0 \
-  --sap_retain_samples 1500 \
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
 ### CIFAR100 Asymmetric 20%
 
 ```bash
-python main.py --dataset seq-cifar100 --model ogc-sap --noise_rate 0.2 --noise_type asym \
-  --sap_scale_coff 1000 \
+python main.py --dataset seq-cifar100 --model dgc --noise_rate 0.2 --noise_type asym \
   --ogc_loss_weight 0.2 \
   --ogc_low_conf_weight 0.5 \
   --ogc_buffer_penalty_coeff 1.5 \
-  --sap_retain_samples 1500 \
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
 ### CIFAR100 Asymmetric 40%
 
 ```bash
-python main.py --dataset seq-cifar100 --model ogc-sap --noise_rate 0.4 --noise_type asym \
-  --sap_scale_coff 3000 \
+python main.py --dataset seq-cifar100 --model dgc --noise_rate 0.4 --noise_type asym \
   --ogc_loss_weight 0.3 \
   --ogc_low_conf_weight 0.4 \
   --ogc_buffer_penalty_coeff 1.8 \
-  --sap_retain_samples 1500 \
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
@@ -127,60 +115,50 @@ COMMON_ARGS="--backbone resnet18 --n_epochs 50 --batch_size 32 --lr 0.03 --buffe
 ### CIFAR10 Symmetric 20%
 
 ```bash
-python main.py --dataset seq-cifar10 --model ogc-sap --noise_rate 0.2 --noise_type symm \
-  --sap_scale_coff 1000 \
+python main.py --dataset seq-cifar10 --model dgc --noise_rate 0.2 --noise_type symm \
   --ogc_loss_weight 0.3 \
   --ogc_low_conf_weight 0.5 \
   --ogc_buffer_penalty_coeff 1.5 \
-  --sap_retain_samples 400 \
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
 ### CIFAR10 Symmetric 40%
 
 ```bash
-python main.py --dataset seq-cifar10 --model ogc-sap --noise_rate 0.4 --noise_type symm \
-  --sap_scale_coff 2000 \
+python main.py --dataset seq-cifar10 --model dgc --noise_rate 0.4 --noise_type symm \
   --ogc_loss_weight 0.4 \
   --ogc_low_conf_weight 0.3 \
   --ogc_buffer_penalty_coeff 2.0 \
-  --sap_retain_samples 400 \
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
 ### CIFAR10 Symmetric 60%
 
 ```bash
-python main.py --dataset seq-cifar10 --model ogc-sap --noise_rate 0.6 --noise_type symm \
-  --sap_scale_coff 3000 \
+python main.py --dataset seq-cifar10 --model dgc --noise_rate 0.6 --noise_type symm \
   --ogc_loss_weight 0.5 \
   --ogc_low_conf_weight 0.2 \
   --ogc_buffer_penalty_coeff 2.5 \
-  --sap_retain_samples 400 \
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
 ### CIFAR10 Asymmetric 20%
 
 ```bash
-python main.py --dataset seq-cifar10 --model ogc-sap --noise_rate 0.2 --noise_type asym \
-  --sap_scale_coff 1000 \
+python main.py --dataset seq-cifar10 --model dgc --noise_rate 0.2 --noise_type asym \
   --ogc_loss_weight 0.3 \
   --ogc_low_conf_weight 0.5 \
   --ogc_buffer_penalty_coeff 1.5 \
-  --sap_retain_samples 400 \
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
 ### CIFAR10 Asymmetric 40%
 
 ```bash
-python main.py --dataset seq-cifar10 --model ogc-sap --noise_rate 0.4 --noise_type asym \
-  --sap_scale_coff 2000 \
+python main.py --dataset seq-cifar10 --model dgc --noise_rate 0.4 --noise_type asym \
   --ogc_loss_weight 0.4 \
   --ogc_low_conf_weight 0.3 \
   --ogc_buffer_penalty_coeff 2.0 \
-  --sap_retain_samples 400 \
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
@@ -256,10 +234,10 @@ python scripts/validate_food101n_dataset.py \
 
 ### Food101N Debug Smoke
 
-只用于验证数据、模型、loader、buffer、OGC/SAP 调用链是否能跑通，不作为论文结果：
+只用于验证数据、模型、loader、buffer、DGC 调用链是否能跑通，不作为论文结果：
 
 ```bash
-python main.py --dataset seq-food101n --model ogc-sap --enable_sap 1 \
+python main.py --dataset seq-food101n --model dgc \
   --food101n_root "$(pwd)/data/Food-101N" \
   --food101n_train_list meta/train.tsv \
   --food101n_test_list meta/test.tsv \
@@ -272,18 +250,16 @@ python main.py --dataset seq-food101n --model ogc-sap --enable_sap 1 \
 
 ### Food101N 正式训练模板
 
-真实实验建议先从 OGC+SAP 主方法开始，使用论文/AER/NTD 对齐设置：
+真实实验建议先从 DGC 主方法开始，使用论文/AER/NTD 对齐设置：
 
 ```bash
 FOOD101N_ROOT="$(pwd)/data/Food-101N"
 COMMON_ARGS="--dataset seq-food101n --food101n_root ${FOOD101N_ROOT} --food101n_train_list meta/train.tsv --food101n_test_list meta/test.tsv --food101n_images_dir images --food101n_classes_file meta/classes.txt --backbone resnet34 --n_epochs 20 --batch_size 32 --minibatch_size 32 --lr 0.03 --buffer_size 2000 --num_workers 4 --noise_rate 0"
 
-python main.py --model ogc-sap --enable_sap 1 \
-  --sap_scale_coff 5000 \
+python main.py --model dgc \
   --ogc_loss_weight 0.3 \
   --ogc_low_conf_weight 0.3 \
   --ogc_buffer_penalty_coeff 2.0 \
-  --sap_retain_samples 2000 \
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
@@ -291,13 +267,12 @@ python main.py --model ogc-sap --enable_sap 1 \
 
 ```bash
 python main.py --model er-ace-aer-abs --savecheck last --seed 0 ${COMMON_ARGS}
-python main.py --model aer-sap --enable_sap 1 --sap_retain_samples 2000 --savecheck last --seed 0 ${COMMON_ARGS}
-python main.py --model ogc-sap --enable_sap 0 --ogc_loss_weight 0.3 --ogc_low_conf_weight 0.3 --ogc_buffer_penalty_coeff 2.0 --savecheck last --seed 0 ${COMMON_ARGS}
+python main.py --model dgc --ogc_loss_weight 0.3 --ogc_low_conf_weight 0.3 --ogc_buffer_penalty_coeff 2.0 --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
 ## Ablation Commands
 
-以下命令用于保持同一组超参数，只切换模块组合。
+以下命令用于保持同一组超参数，只切换 Baseline 与 DGC。
 
 ### Baseline: AER/ABS
 
@@ -306,36 +281,16 @@ python main.py --dataset seq-cifar100 --model er-ace-aer-abs --noise_rate 0.6 --
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
-### SAP Only
+### DGC
 
 ```bash
-python main.py --dataset seq-cifar100 --model aer-sap --noise_rate 0.6 --noise_type symm \
-  --sap_scale_coff 5000 \
-  --sap_retain_samples 400 \
-  --savecheck last --seed 0 ${COMMON_ARGS}
-```
-
-### OGC Only
-
-```bash
-python main.py --dataset seq-cifar100 --model ogc-sap --enable_sap 0 --noise_rate 0.6 --noise_type symm \
+python main.py --dataset seq-cifar100 --model dgc --noise_rate 0.6 --noise_type symm \
   --ogc_loss_weight 0.3 \
   --ogc_low_conf_weight 0.3 \
   --ogc_buffer_penalty_coeff 2.0 \
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
-### OGC + SAP
-
-```bash
-python main.py --dataset seq-cifar100 --model ogc-sap --enable_sap 1 --noise_rate 0.6 --noise_type symm \
-  --sap_scale_coff 5000 \
-  --ogc_loss_weight 0.3 \
-  --ogc_low_conf_weight 0.3 \
-  --ogc_buffer_penalty_coeff 2.0 \
-  --sap_retain_samples 400 \
-  --savecheck last --seed 0 ${COMMON_ARGS}
-```
 ## NTU60
 
 NTU60 推荐 `buffer_size=500`。
@@ -348,7 +303,7 @@ COMMON_ARGS="--n_epochs 30 --batch_size 32 --lr 0.1 --buffer_size 500"
 ```bash
 python main.py \
   --dataset seq-ntu60 \
-  --model aer_ogc_sap \
+  --model dgc \
   --noise_rate 0.4 \
   --noise_type symmetric \
   --seed 0 

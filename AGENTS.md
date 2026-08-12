@@ -42,9 +42,10 @@
 | 名称 | 注册模型名 | 文件 | 当前作用 |
 |---|---|---|---|
 | AER/ABS baseline | `er-ace-aer-abs` | `models/er_ace_aer_abs.py` | 基于 ER-ACE、AER 和 ABS 的噪声鲁棒 rehearsal baseline |
-| SAP only | `aer-sap` | `models/aer_sap.py` | 在 AER/ABS 上加入 SAP，用于消融 |
-| OGC + optional SAP | `ogc-sap` | `models/ogc_sap.py` | 当前 `readme_latest.md` 推荐主方法 |
+| Baseline + DGC | `dgc` | `models/dgc.py` | 在 AER/ABS 上加入动态梯度裁剪；当前主方法 |
 | ER / ER-ACE | `er`, `er-ace` | `models/er.py`, `models/er_ace.py` | Mammoth 原有/基础 replay baseline，可辅助比较 |
+
+旧 CBP/SAP 实现已于 2026-08-12 从活跃代码和历史副本中删除。下一阶段在 `dgc` 基础上重新接入 SAP，删除前版本可从 Git 历史恢复。
 
 当前主要数据集：
 
@@ -63,22 +64,22 @@
 |---|---|---|
 | 原论文严格复现 | 数据、class order、noise labels、seed、backbone、epoch、batch size、buffer、optimizer、指标均与论文一致 | 待确认 |
 | 资源受限复现 | 因设备或环境调整 batch size、worker、设备或部分超参 | 已有本机 MPS 运行记录，见 `cifar10_symm40_readme_latest_local_retry2_20260703_231106_analysis.md` |
-| 参数调整实验 | 为追指标调整 OGC/SAP 超参 | 已有多份 CIFAR10 调参汇总 |
+| 参数调整实验 | 为追指标调整 DGC 超参 | 已有多份 CIFAR10 调参汇总 |
 | baseline 实验 | `er-ace-aer-abs` 等 baseline 单独运行 | 部分记录存在，需按日志逐项确认 |
-| 完整方法实验 | `ogc-sap --enable_sap 1` | CIFAR10 多个结果目录与日志存在 |
-| 消融实验 | `er-ace-aer-abs`、`aer-sap`、`ogc-sap --enable_sap 0/1` 对比 | `readme_latest.md` 给出命令；完整执行状态待确认 |
+| 完整方法实验 | `dgc` | CIFAR10 多个历史结果目录与日志存在；新入口需重新核验 |
+| 消融实验 | `er-ace-aer-abs` 与 `dgc` 对比 | `readme_latest.md` 给出命令；完整执行状态待确认 |
 
 当前已开展的证据主要集中在 CIFAR10；CIFAR100 有 checkpoint 和外层整理文档；NTU60 目前更多是代码和结果文档线索，数据文件不在当前仓库。
 
 ## 5. 当前项目状态
 
-以下状态基于 2026-07-14 的只读检查。
+以下状态已于 2026-08-12 更新。
 
 | 项目 | 状态 | 证据 |
 |---|---|---|
-| Git 仓库 | 已确认 | 当前目录是 Git 根目录，分支 `master`，落后 `origin/master` 3 个提交 |
-| 工作树 | 存在大量既有改动 | 多个模型/测试文件删除或未跟踪，`readme_latest.md`、`models/ogc_sap.py` 等为未跟踪或修改状态 |
-| 当前 shell 环境 | 未建立可运行训练环境 | `python` 不存在；`python3` 为 3.9.6，缺少 `torch`、`torchvision`、`sklearn` |
+| Git 仓库 | 已确认 | 当前目录是 Git 根目录，正在 `SAP` 分支执行 Baseline+DGC 重构 |
+| 工作树 | 本轮改动待用户审核 | 删除旧 CBP/SAP，新增 `models/dgc.py`，尚未提交 |
+| 当前 shell 环境 | 已确认 | `nrgp-mammoth` 提供 Python 3.10、PyTorch 与测试依赖 |
 | 依赖声明 | 已存在 | `requirements.txt`、`requirements-optional.txt`、`pyproject.toml` |
 | CIFAR-10 数据 | 已准备 | `data/CIFAR10/cifar-10-batches-py` 存在 |
 | CIFAR-100 数据 | 未发现 | 未发现 `data/CIFAR100` |
@@ -119,9 +120,7 @@ mammoth_code/
 ├── models/
 │   ├── __init__.py               # model 动态注册
 │   ├── er_ace_aer_abs.py
-│   ├── aer_sap.py
-│   ├── ogc_sap.py
-│   ├── ogc_sap_old.py            # 疑似历史版本，尚未完全验证
+│   ├── dgc.py                     # Baseline + DGC
 │   └── config/
 ├── utils/
 │   ├── args.py                   # argparse 参数定义
@@ -133,8 +132,7 @@ mammoth_code/
 │   ├── loggers.py
 │   ├── schedulers.py
 │   ├── loss_trace.py            # iteration 级逐样本 loss 与四组曲线记录
-│   ├── sap_core.py
-│   └── sap_model_utils.py
+│   └── ...
 ├── scripts/
 │   ├── prepare_ntu60_npz.py
 │   └── plot_loss_trace.py       # 绘制 noisy/hard-old/easy-old/new 四线图
@@ -162,17 +160,14 @@ mammoth_code/
 | `datasets/seq_cifar100.py` | CIFAR100 类增量数据集 | 是 | `datasets.get_dataset()` | 高 | 已阅读 | 默认 10 tasks，每任务 10 类 |
 | `datasets/seq_ntu60.py` | NTU60 类增量数据集 | 待验证 | 注册为 `seq-ntu60` | 高 | 已阅读 | 数据文件缺失 |
 | `models/er_ace_aer_abs.py` | AER/ABS baseline | 是 | `models.get_model()` | 高 | 已阅读 | 使用 `true_labels` 额外字段 |
-| `models/aer_sap.py` | SAP-only 消融 | 是 | `models.get_model()` | 高 | 已阅读 | 依赖 SAP activation projection |
-| `models/ogc_sap.py` | 当前主改进方法 | 是 | `models.get_model()` | 高 | 已阅读 | OGC + SAP，parser 定义关键超参 |
+| `models/dgc.py` | 当前主改进方法 | 是 | `models.get_model()` | 高 | 待本轮验证 | Baseline + DGC，parser 保留 `ogc_*` 参数以兼容已有实验配置 |
 | `utils/buffer.py` | replay buffer 和采样策略 | 是 | rehearsal models | 高 | 已阅读 | 支持 reservoir/lars/labrs/abs/balancoir |
-| `utils/loss_trace.py` | 可选的逐样本 loss 和四组 iteration 曲线记录 | 启用参数时 | AER/ABS、AER-SAP、OGC-SAP | 中 | 单元与 debug 训练已验证 | 默认关闭；要求 synthetic noise 的 `true_labels` |
+| `utils/loss_trace.py` | 可选的逐样本 loss 和四组 iteration 曲线记录 | 启用参数时 | AER/ABS、DGC | 中 | 单元与 debug 训练已验证 | 默认关闭；要求 synthetic noise 的 `true_labels` |
 | `scripts/plot_loss_trace.py` | 从 `iteration_curves.csv` 生成四线图 | 手工运行 | 用户/实验脚本 | 低 | 语法已验证 | 需要可选依赖 matplotlib |
 | `utils/checkpoints.py` | checkpoint 保存/加载 | 是 | `main.py`, `training.py` | 高 | 已阅读 | safe checkpoint 保存 args/results/buffer |
 | `readme_latest.md` | 当前主要运行说明 | 是，文档参考 | 人/Agent | 中 | 已阅读 | 不得直接覆盖 |
 | `README.md` | 上游 Mammoth + 历史片段 | 辅助 | 人/Agent | 中 | 已阅读 | 有旧命令与当前代码差异 |
 | `checkpoints/1.py` | 硬编码权重转换脚本 | 否/辅助 | 手工运行 | 高 | 已阅读 | 不要直接执行或改源/目标路径 |
-| `other/aer_ogc_sap.py` | 历史/辅助模型文件 | 否，未在 `models/` 注册 | 未确认 | 中 | 搜索确认 | 疑似历史遗留，尚未完全验证 |
-| `models/ogc_sap_old.py` | OGC/SAP 旧版本 | 否/历史 | 未确认 | 中 | 部分搜索 | 疑似历史遗留，尚未完全验证 |
 
 ## 8. 代码调用链
 
@@ -247,7 +242,7 @@ CIFAR 样本流程：
 → model.meta_observe(..., true_labels=...)
 → backbone features
 → classifier logits
-→ CE/OGC/replay/SAP 相关 loss
+→ CE/DGC/replay 相关 loss
 → backward + optimizer.step()
 → buffer 保存 not_aug_inputs/noisy labels/可选 true_labels
 ```
@@ -380,7 +375,7 @@ python scripts/prepare_ntu60_npz.py --source <skeleton_zip_or_dir> --output data
 | train label | Food-101N noisy class label |
 | test label | NTD/PuriDivER Food-101N `4,741` test split label；不是完整 Food-101 25,250 clean test |
 
-Food-101N 的训练标签已经是真实噪声标签，不应再设置 `--noise_rate` 触发 CIFAR 式合成噪声。当前 `er-ace-aer-abs` 已允许 `true_labels=None`，`aer-sap` 继承该兼容；`ogc-sap` 原本已支持可选 `true_labels`。不得把 verification label 当成 clean class label。
+Food-101N 的训练标签已经是真实噪声标签，不应再设置 `--noise_rate` 触发 CIFAR 式合成噪声。当前 `er-ace-aer-abs` 与 `dgc` 均允许 `true_labels=None`。不得把 verification label 当成 clean class label。
 
 本地数据检查入口：
 
@@ -468,18 +463,15 @@ class order：
 |---|---|---|---|---|
 | backbone 注册 | `backbone/__init__.py` | `register_backbone`, `get_backbone` | 根据 `--backbone` 构造网络 | 影响 logits 维度和 checkpoint |
 | CIFAR ResNet | `backbone/ResNetBlock.py` | `resnet18`, `ResNet.forward` | CIFAR 主 backbone | 改 feature_dim/classifier 会影响 checkpoint |
-| NTU EfficientGCN | `backbone/EfficientGCN.py` | `efficient_gcn` | NTU skeleton backbone | SAP 兼容性待验证 |
+| NTU EfficientGCN | `backbone/EfficientGCN.py` | `efficient_gcn` | NTU skeleton backbone | DGC 兼容性待验证 |
 | 模型注册 | `models/__init__.py` | `get_model_names`, `get_model` | 扫描 `models/*.py` | 文件名/NAME 改动会影响 CLI |
 | baseline | `models/er_ace_aer_abs.py` | `ErAceAerAbs.observe` | AER/ABS + buffer | 影响 baseline 和消融 |
-| SAP only | `models/aer_sap.py` | `AerSap.apply_sap` | buffer clean/ambiguous split + SAP | 影响消融和 checkpoint |
-| OGC+SAP | `models/ogc_sap.py` | `ErAceAerAbsOGC.observe` | OGC loss、queue、sample weighting、SAP | 当前主方法，高风险 |
-| SAP 核心 | `utils/sap_core.py` | `activation_projection_based_unlearning` | SVD projection unlearning | 影响训练后 task boundary |
-| SAP 挂载 | `utils/sap_model_utils.py` | `attach_sap_methods` | 给 ResNet 添加 activation/project 方法 | 非 ResNet 支持待确认 |
+| DGC | `models/dgc.py` | `DGC.observe` | DGC loss、queue、sample weighting | 当前主方法，高风险 |
 | buffer | `utils/buffer.py` | `Buffer`, `ABSSampling` | replay memory 和样本替换 | 影响公平性和 checkpoint |
 | checkpoint | `utils/checkpoints.py` | `save_mammoth_checkpoint`, `mammoth_load_checkpoint` | 保存/加载模型、args、buffer | 高风险 |
 | logger | `utils/loggers.py` | `Logger.write`, `log_accs` | 写入 `logs.pyd` | 影响结果汇总 |
 
-`ogc_sap.py` 中存在 `disable_dynamic_threshold` / `fixed_prob_threshold` 分支，但当前 parser 未定义这两个参数；除非另有外部注入，不能把它们写成正式可用 CLI 参数。
+`dgc.py` 中存在 `disable_dynamic_threshold` / `fixed_prob_threshold` 分支，但当前 parser 未定义这两个参数；除非另有外部注入，不能把它们写成正式可用 CLI 参数。
 
 ## 15. 配置文件与参数优先级
 
@@ -506,9 +498,9 @@ class order：
 | `buffer_size`, `minibatch_size` | rehearsal parser + CLI | rehearsal 模型要求 `buffer_size` |
 | `noise_type`, `noise_rate` | `utils.args.add_experiment_args()` | 命令行覆盖默认 |
 | `base_path`, `results_path`, `checkpoint_path` | `utils.args.add_management_args()` | results_path 相对 base_path |
-| OGC/SAP 参数 | `models/ogc_sap.py` / `models/aer_sap.py` parser | `aer_sap` 和 `ogc_sap` 当前未发现专属 YAML |
+| DGC 参数 | `models/dgc.py` parser | 为保持实验可比性，CLI 参数仍使用 `ogc_*` 前缀；当前无专属 YAML |
 
-`models/config/er_ace_aer_abs.yaml` 存在 `seq-cifar100` 和 `seq-ntu60` 配置；`models/config/aer_sap.yaml` 和 `models/config/ogc_sap.yaml` 当前未发现。
+`models/config/er_ace_aer_abs.yaml` 存在 `seq-cifar100` 和 `seq-ntu60` 配置；`models/config/dgc.yaml` 当前未发现。
 
 ## 16. 训练流程
 
@@ -529,24 +521,25 @@ python -c "import torch; print(torch.cuda.is_available())"
 建议先做 smoke test，当前环境未验证：
 
 ```bash
-python main.py --dataset seq-cifar10 --model ogc-sap --backbone resnet18 \
+python main.py --dataset seq-cifar10 --model dgc --backbone resnet18 \
   --noise_rate 0.2 --noise_type symm \
-  --sap_scale_coff 1000 --ogc_loss_weight 0.3 --ogc_low_conf_weight 0.5 \
-  --ogc_buffer_penalty_coeff 1.5 --sap_retain_samples 400 \
+  --ogc_loss_weight 0.3 --ogc_low_conf_weight 0.5 \
+  --ogc_buffer_penalty_coeff 1.5 \
   --n_epochs 1 --batch_size 32 --lr 0.03 --buffer_size 500 \
-  --num_workers 0 --debug_mode 1 --disable_log 1 --stop_after 1
+  --num_workers 0 --debug_mode 1 --stop_after 1 \
+  --results_path /tmp/dgc_smoke_results --checkpoint_path /tmp/dgc_smoke_checkpoints
 ```
+
+当前 `--disable_log 1` 会在 `utils/training.py` 中触发未初始化 `logger` 的既有错误；smoke 暂时使用 `/tmp` 结果目录隔离测试产物。
 
 CIFAR10 正式命令以 `readme_latest.md` 为准，例如 symmetric 40%：
 
 ```bash
 COMMON_ARGS="--backbone resnet18 --n_epochs 50 --batch_size 32 --lr 0.03 --buffer_size 500 --num_workers 4"
-python main.py --dataset seq-cifar10 --model ogc-sap --noise_rate 0.4 --noise_type symm \
-  --sap_scale_coff 2000 \
+python main.py --dataset seq-cifar10 --model dgc --noise_rate 0.4 --noise_type symm \
   --ogc_loss_weight 0.4 \
   --ogc_low_conf_weight 0.3 \
   --ogc_buffer_penalty_coeff 2.0 \
-  --sap_retain_samples 400 \
   --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
@@ -608,7 +601,7 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 | 加载完整 checkpoint | 会加载 model state 和 buffer |
 | `start_from` | 用于跳过前面 task 并建立 dataset/model task 状态 |
 | `stop_after` | task 上限，end exclusive |
-| 修改模型结构 | classifier、backbone、SAP/OGC state 改动可能导致不兼容 |
+| 修改模型结构 | classifier、backbone、DGC state 改动可能导致不兼容 |
 | 修改 buffer_size | `load_buffer()` 会检查 buffer size，可能失败 |
 
 不要覆盖正式 checkpoint。`checkpoints/paused/` 是中断保存目录，清理前必须确认用途。
@@ -652,7 +645,7 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 
 若因显存、MPS/CPU、num_workers 或 batch size 调整导致协议不同，结果必须标为资源受限复现或参数调整实验，不得称为严格复现。
 
-随机性来源包括 Python、NumPy、PyTorch、CUDA、DataLoader worker、class permutation、noisy label generation、GMM/SAP clean/ambiguous split和 buffer sampling。
+随机性来源包括 Python、NumPy、PyTorch、CUDA、DataLoader worker、class permutation、noisy label generation、DGC 的 GMM 和 buffer sampling。
 
 ## 21. 主实验与消融实验规范
 
@@ -663,9 +656,7 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 | 实验 | 命令核心 |
 |---|---|
 | Baseline AER/ABS | `--model er-ace-aer-abs` |
-| SAP only | `--model aer-sap` |
-| OGC only | `--model ogc-sap --enable_sap 0` |
-| OGC + SAP | `--model ogc-sap --enable_sap 1` |
+| Baseline + DGC | `--model dgc` |
 
 公平性要求：
 
@@ -696,7 +687,7 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 |---|---|
 | `datasets/utils/continual_dataset.py` | 影响 task 划分、noisy labels、验证集 |
 | `datasets/utils/label_noise.py` | 影响噪声复现可比性 |
-| `models/ogc_sap.py` | 影响主方法、loss、buffer、SAP |
+| `models/dgc.py` | 影响主方法、loss、queue 和 buffer |
 | `utils/buffer.py` | 影响 replay 公平性和 checkpoint |
 | `utils/checkpoints.py` | 影响旧权重兼容 |
 | `utils/evaluate.py` / `utils/loggers.py` | 影响指标和论文对比 |
@@ -737,7 +728,7 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 → 输入和 logits 维度
 → checkpoint 参数兼容
 → loss 和 optimizer
-→ SAP/OGC 阈值与 GMM
+→ DGC 阈值与 GMM
 → logger 和 results_path
 ```
 
@@ -753,9 +744,9 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 | noisy labels 不一致 | seed、cache path、`disable_noisy_labels_cache` |
 | `true_labels` 缺失 | 是否设置 `noise_rate > 0`；`observe()` 是否要求 true_labels |
 | checkpoint 不兼容 | backbone、num_classes、buffer_size、model name |
-| NTU60 命令失败 | `readme_latest.md` 中 `aer_ogc_sap` 未在 `models/` 注册 |
+| NTU60 命令失败 | 检查 `dgc` 与 `efficient_gcn` 的接口兼容性及数据文件 |
 | 输出被覆盖 | 显式设置 `--results_path`、`--checkpoint_path`、`--ckpt_name` |
-| loss NaN | OGC/SAP/lr/noise_rate/batch 数据 |
+| loss NaN | DGC/lr/noise_rate/batch 数据 |
 
 ## 25. AI Agent 标准工作流程
 
@@ -838,9 +829,7 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 | T1 | 当前推荐 Python/Conda 环境 | `nrgp-mammoth` 已确认 Python 3.10.20、torch 2.12.1；未安装 matplotlib | 正式运行前激活该环境，绘图时安装 optional dependency | 训练环境已确认，绘图依赖待安装 |
 | T2 | `main.py --help` 输出是否完整 | 已在 `nrgp-mammoth` 中确认 loss trace 参数进入 parser | 后续新增参数时继续做 CLI smoke test | 已验证本次新增参数 |
 | T3 | CIFAR100 数据准备状态 | 未发现 `data/CIFAR100`，但有 CIFAR100 checkpoint | 检查服务器/外层数据包或运行只读数据路径检查 | 待确认 |
-| T4 | NTU60 是否可跑通 | `seq-ntu60` 存在，数据缺失；`readme_latest.md` 使用未注册 `aer_ogc_sap` | 准备 `data/NTU60_CS.npz` 后测试当前注册模型 | 代码与文档存在差异 |
-| T5 | `other/aer_ogc_sap.py` 是否为历史模型 | 文件在 `other/`，不被 `models/__init__.py` 扫描 | 查 Git 历史或用户说明 | 疑似历史遗留，尚未完全验证 |
-| T6 | `models/ogc_sap_old.py` 是否仍被任何脚本使用 | 文件存在但主命令使用 `models/ogc_sap.py` | 全仓搜索脚本和日志引用 | 疑似历史遗留，尚未完全验证 |
+| T4 | NTU60 是否可跑通 | `seq-ntu60` 存在，数据缺失；文档已改用注册模型 `dgc` | 准备 `data/NTU60_CS.npz` 后测试 DGC | 数据待准备 |
 | T7 | checkpoint 恢复训练是否能自动从正确 task 继续 | 代码需要 `start_from` 建 task 状态，未实测 | 用小型 debug checkpoint 验证恢复 | 尚未验证 |
 | T8 | CIFAR10 asymmetric noisy label cache | 当前只发现 symmetric 20/40 cache | 检查运行日志或重新生成前先备份/记录 seed | 待确认 |
 | T9 | 多 seed 正式结果 | `readme_latest.md` 建议 seed 0/152，结果记录不完整 | 汇总 `logs.pyd` 和外层报告 | 待确认 |
@@ -852,7 +841,8 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 
 | 日期 | 修改内容 | 修改原因 | 验证情况 |
 |---|---|---|---|
-| 2026-07-31 | 新增 iteration 级逐样本 CE loss、动态 noisy/hard-old/easy-old/new 聚合、CSV 输出和绘图脚本 | 用户要求将 Figure 1 扩展为四线图，并保留 task/epoch/iteration/sample/buffer/class/loss 级数据 | 3 个 unittest 通过；`er-ace-aer-abs` 与 `ogc-sap` 均完成 Seq-CIFAR10 两任务 debug 端到端验证；绘图脚本因当前环境缺 matplotlib 仅完成语法/CLI 验证 |
+| 2026-08-12 | 删除旧 CBP/SAP 活跃与历史代码，将原主模型重构为注册名 `dgc` 的纯 Baseline+DGC | 用户审核通过完整删除范围，先建立可验证的干净 DGC 基线，再重新接入 SAP | `py_compile`、注册/CLI 检查、3 个 loss trace unittest、Seq-CIFAR10 两任务 debug smoke 通过；结果与删除前 `ogc-sap --enable_sap 0` 完全一致 |
+| 2026-07-31 | 新增 iteration 级逐样本 CE loss、动态 noisy/hard-old/easy-old/new 聚合、CSV 输出和绘图脚本 | 用户要求将 Figure 1 扩展为四线图，并保留 task/epoch/iteration/sample/buffer/class/loss 级数据 | 3 个 unittest 通过；`er-ace-aer-abs` 与当时的旧主模型均完成 Seq-CIFAR10 两任务 debug 端到端验证；绘图脚本因当前环境缺 matplotlib 仅完成语法/CLI 验证 |
 | 2026-07-14 | 拉取 NTD `tasks/Food-101N`，生成本机 `data/Food-101N/meta/train.tsv/test.tsv/classes.txt`，并完成离线 metadata 验证 | 用户要求先解决除数据下载外的全部问题；split metadata 可由 NTD/PuriDivER 提供，图片本体仍需用户下载 | 已验证 records=52,867/4,741、classes=101、label range=0..100；图片路径检查因未下载图片仍待执行 |
 | 2026-07-14 | 新增 `scripts/prepare_food101n_metadata.py`，并记录本地 Food101N 数据只读扫描结果 | 下一步需要把 AER/NTD/Food101N 原始 split 转成项目标准 `train.tsv/test.tsv/classes.txt` | 已完成脚本语法检查；当前本机仍未发现真实 Food101N 数据 |
 | 2026-07-14 | 确认 Food101N 采用论文/AER/NTD 接近的 `52,867 train / 4,741 test` split，并同步默认配置和验证脚本 | 用户明确选择该 split；需要避免误扫完整约 310k Food101N，且默认配置应对齐 ResNet34/20 epochs | 已更新配置与验证逻辑；真实数据仍待准备后验证 |

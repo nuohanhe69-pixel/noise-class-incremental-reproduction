@@ -16,7 +16,7 @@
 | 远程 Windows 桌面 | `/mnt/c/Users/a/Desktop` |
 | 后台运行 | `screen` |
 
-本实验是 `Seq-CIFAR10 / ER-ACE / 40% symmetric noise / Task 2 epochs [5,10)` 的四线图。不涉及 DGC、OGC、CBP 或 SAP，不应上传或覆盖服务器上手工修改过的 `models/aer_sap.py` 和 `models/ogc_sap.py`。
+本实验是 `Seq-CIFAR10 / ER-ACE / 40% symmetric noise / Task 2 epochs [5,10)` 的四线图。不涉及 DGC，不应上传或覆盖服务器上手工修改过的模型文件。
 
 ## 2. 上传包内容
 
@@ -158,7 +158,7 @@ echo "LOSS_TRACE_BACKUP=${LOSS_TRACE_BACKUP}"
 find "${LOSS_TRACE_BACKUP}" -type f -print
 ```
 
-保留屏幕中输出的 `LOSS_TRACE_BACKUP=...`，它是需要回滚时的备份目录。这个补丁不包含 `models/aer_sap.py` 或 `models/ogc_sap.py`，所以不会覆盖服务器上的 SAP 实现。
+保留屏幕中输出的 `LOSS_TRACE_BACKUP=...`，它是需要回滚时的备份目录。这个补丁不包含 `models/er_ace_aer_abs.py` 或 `models/dgc.py`，所以不会覆盖服务器上的当前模型实现。
 
 ## 7. 在现有 CIFAR-10 项目中安装上传补丁
 

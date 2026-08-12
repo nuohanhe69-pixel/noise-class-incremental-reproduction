@@ -563,7 +563,7 @@ export CUDA_VISIBLE_DEVICES=0
 export PYTHONPATH=.
 export FOOD101N_ROOT=/home/hnh/mammoth_code_food101n/data/Food-101N
 
-nohup python -u main.py --dataset seq-food101n --model ogc-sap --enable_sap 1 \
+nohup python -u main.py --dataset seq-food101n --model dgc \
   --food101n_root "$FOOD101N_ROOT" \
   --food101n_train_list meta/train.tsv \
   --food101n_test_list meta/test.tsv \
@@ -572,13 +572,13 @@ nohup python -u main.py --dataset seq-food101n --model ogc-sap --enable_sap 1 \
   --backbone resnet34 --n_epochs 1 --batch_size 8 --minibatch_size 8 \
   --lr 0.03 --buffer_size 500 --num_workers 0 --debug_mode 1 \
   --noise_rate 0 --seed 0 \
-  > /home/hnh/food101n_runs/smoke/food101n_ogc_sap_smoke_seed0.log 2>&1 &
+  > /home/hnh/food101n_runs/smoke/food101n_dgc_smoke_seed0.log 2>&1 &
 ```
 
 查看日志：
 
 ```bash
-tail -f /home/hnh/food101n_runs/smoke/food101n_ogc_sap_smoke_seed0.log
+tail -f /home/hnh/food101n_runs/smoke/food101n_dgc_smoke_seed0.log
 ```
 
 另开一个终端看 GPU：
@@ -591,7 +591,7 @@ smoke 成功后再进入正式训练。
 
 ## 11. 运行 Food101N 正式主实验
 
-正式主实验先跑 OGC+SAP。
+正式主实验先跑 DGC。
 
 ```bash
 cd /home/hnh/mammoth_code_food101n
@@ -616,20 +616,18 @@ COMMON_ARGS="--dataset seq-food101n \
   --num_workers 4 \
   --noise_rate 0"
 
-nohup python -u main.py --model ogc-sap --enable_sap 1 \
-  --sap_scale_coff 5000 \
+nohup python -u main.py --model dgc \
   --ogc_loss_weight 0.3 \
   --ogc_low_conf_weight 0.3 \
   --ogc_buffer_penalty_coeff 2.0 \
-  --sap_retain_samples 2000 \
   --savecheck last --seed 0 ${COMMON_ARGS} \
-  > /home/hnh/food101n_runs/main/food101n_ogc_sap_seed0.log 2>&1 &
+  > /home/hnh/food101n_runs/main/food101n_dgc_seed0.log 2>&1 &
 ```
 
 看日志：
 
 ```bash
-tail -f /home/hnh/food101n_runs/main/food101n_ogc_sap_seed0.log
+tail -f /home/hnh/food101n_runs/main/food101n_dgc_seed0.log
 ```
 
 查看后台进程：
@@ -672,14 +670,12 @@ COMMON_ARGS="--dataset seq-food101n \
   --noise_rate 0"
 
 for SEED in 0 1 2; do
-  nohup python -u main.py --model ogc-sap --enable_sap 1 \
-    --sap_scale_coff 5000 \
+  nohup python -u main.py --model dgc \
     --ogc_loss_weight 0.3 \
     --ogc_low_conf_weight 0.3 \
     --ogc_buffer_penalty_coeff 2.0 \
-    --sap_retain_samples 2000 \
     --savecheck last --seed ${SEED} ${COMMON_ARGS} \
-    > /home/hnh/food101n_runs/main/food101n_ogc_sap_seed${SEED}.log 2>&1 &
+    > /home/hnh/food101n_runs/main/food101n_dgc_seed${SEED}.log 2>&1 &
 done
 ```
 
@@ -870,7 +866,7 @@ Food101N 已经是真实 noisy label 数据集，正式命令应保持：
 
 ### 8. Food101N 正式训练显存接近 100% 或看起来不动
 
-如果正式 OGC+SAP 日志停在类似：
+如果正式 DGC 日志停在类似：
 
 ```text
 Task 1 - Epoch 2: 6% | 370/6560 [18:11<29:31:01, 17.17s/it]
@@ -887,7 +883,7 @@ Memory-Usage 24099MiB / 24564MiB
 
 - Food101N 是 224x224 图片，CIFAR 是 32x32。
 - Food101N 当前正式配置是 ResNet34。
-- OGC+SAP 会同时用当前 batch、replay minibatch、buffer、SAP/OGC 相关中间量。
+- DGC 会同时使用当前 batch、replay minibatch、buffer 和动态梯度裁剪相关中间量。
 - `batch_size=32`、`minibatch_size=32`、`buffer_size=2000` 对 24GB GPU 会非常紧。
 - PyTorch 会缓存/保留显存，所以看起来可能接近满显存。
 
@@ -895,7 +891,7 @@ Memory-Usage 24099MiB / 24564MiB
 
 ```bash
 ps -p <PID> -o pid,etime,pcpu,pmem,cmd
-tail -n 40 /home/hnh/food101n_runs/main/food101n_ogc_sap_seed0.log
+tail -n 40 /home/hnh/food101n_runs/main/food101n_dgc_seed0.log
 nvidia-smi
 ```
 
@@ -941,20 +937,18 @@ COMMON_ARGS="--dataset seq-food101n \
   --num_workers 4 \
   --noise_rate 0"
 
-nohup python -u main.py --model ogc-sap --enable_sap 1 \
-  --sap_scale_coff 5000 \
+nohup python -u main.py --model dgc \
   --ogc_loss_weight 0.3 \
   --ogc_low_conf_weight 0.3 \
   --ogc_buffer_penalty_coeff 2.0 \
-  --sap_retain_samples 2000 \
   --savecheck last --seed 0 ${COMMON_ARGS} \
-  > /home/hnh/food101n_runs/main/food101n_ogc_sap_seed0_b16.log 2>&1 &
+  > /home/hnh/food101n_runs/main/food101n_dgc_seed0_b16.log 2>&1 &
 ```
 
 监控：
 
 ```bash
-tail -f /home/hnh/food101n_runs/main/food101n_ogc_sap_seed0_b16.log
+tail -f /home/hnh/food101n_runs/main/food101n_dgc_seed0_b16.log
 nvidia-smi -l 2
 ```
 

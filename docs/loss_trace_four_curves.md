@@ -1,6 +1,6 @@
 # Iteration 级四组 Loss 曲线
 
-本功能为 `er-ace`、`er-ace-aer-abs`、`aer-sap` 和 `ogc-sap` 增加可选的逐样本 loss 记录。默认关闭，不改变原训练命令。
+本功能为 `er-ace`、`er-ace-aer-abs` 和 `dgc` 增加可选的逐样本 loss 记录。默认关闭，不改变原训练命令。
 
 ## 统计口径
 
@@ -133,7 +133,7 @@ python main.py \
 
 `alpha_sample_insertion=0.75` 表示丢弃 current batch 中 loss 最高的 75%，只把低 loss 25% 作为 buffer 写入候选。它与四线图中 hard/easy old 的 20%/80% 完全独立。
 
-`ogc-sap` 和 `aer-sap` 可追加同样的 trace 参数，但其 OGC/SAP 超参必须另外固定，不能把上面的纯 ER-ACE 命令直接当成 OGC-SAP 的完整实验配置。
+`dgc` 可追加同样的 trace 参数，但其 DGC 超参必须另外固定，不能把上面的纯 ER-ACE 命令直接当成 DGC 的完整实验配置。
 
 ## 输出文件
 

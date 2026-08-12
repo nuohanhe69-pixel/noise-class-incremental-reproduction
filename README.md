@@ -105,7 +105,7 @@ All the new additions will try to preserve the current structure of the reposito
 
 ## 🧠 Models
 
-### 在这个代码库中    我们的baseline的model为   er_ace_aer_abs.py   ;而我们改进的model为aer_dgc_cbp.py；   要进行训练的命令为（可在命令中进行model替换，以及--args进行其他参数的配置）：
+### 本仓库当前以 `er_ace_aer_abs.py` 为 Baseline，以 `dgc.py` 为 Baseline+DGC。旧 CBP/SAP 代码已移除，后续将重新接入 SAP。
 
 #### 1. Seq. CIFAR-100
 
@@ -113,7 +113,7 @@ All the new additions will try to preserve the current structure of the reposito
 
 ##### 1.1. Seq. CIFAR-100, Symmetric Noise (symm)
 
-**OURs (基础模型，无整合)**
+**Baseline**
 COMMON_ARGS="--backbone resnet18 --n_epochs 50 --batch_size 32 --lr 0.03 --buffer_size 2000"
 
 ```bash
@@ -128,12 +128,11 @@ python main.py --dataset seq-cifar100 --model er_ace_aer_abs --noise_rate 0.4 --
 
 ##### 2.1. Seq. CIFAR-10, Symmetric Noise (symm)
 
-**OURs (基础模型，无整合)**
+**Baseline / DGC（通过 `--model er-ace-aer-abs` 或 `--model dgc` 切换）**
 COMMON_ARGS="--backbone resnet18 --n_epochs 50 --batch_size 32 --lr 0.03 --buffer_size 500"
 
 ```bash
  Noise rate 20%
-python main.py --dataset seq-cifar10 --model ogc_sap --noise_rate 0.2 --noise_type symm --buffer_fitting_epochs 0 --sap_scale_coff 1000 ${COMMON_ARGS}
 
  Noise rate 40%
 python main.py --dataset seq-cifar100 --model er_ace_aer_abs --noise_rate 0.4 --noise_type symm --buffer_fitting_epochs 0 ${COMMON_ARGS}
