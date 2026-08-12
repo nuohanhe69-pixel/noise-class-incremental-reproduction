@@ -717,7 +717,7 @@ class ErAceAerAbsOGC(ErAceAerAbs): # <<<--- IMPORTANT: Inherit from ErAceAerAbs
         
 
 
-    def observe(self, inputs, labels, not_aug_inputs, epoch, true_labels=None):
+    def observe(self, inputs, labels, not_aug_inputs, epoch, true_labels=None, sample_ids=None, source_task_ids=None):
         if hasattr(self, 'eff_logger'):
             self.eff_logger.start_timer()
         # This method is largely rewritten to integrate OGC
@@ -807,6 +807,9 @@ class ErAceAerAbsOGC(ErAceAerAbs): # <<<--- IMPORTANT: Inherit from ErAceAerAbs
 
         # --- Replay Loss (if buffer not empty) ---
         loss_re = torch.tensor(0., device=self.device)
+        buf_indexes = None
+        not_aug_buf_inputs = None
+        buf_labels = None
         if not self.buffer.is_empty():
             buffer_batch = self.buffer.get_data(
                 self.args.minibatch_size, transform=self.transform, return_index=True, return_not_aug=True,
@@ -862,6 +865,12 @@ class ErAceAerAbsOGC(ErAceAerAbs): # <<<--- IMPORTANT: Inherit from ErAceAerAbs
             if self.args.use_aer and epoch % 2 == 0:
                 loss_re = torch.tensor(0., device=self.device) # No replay loss during even epochs for AER
 
+        self._record_loss_trace(
+            epoch=epoch, not_aug_inputs=not_aug_inputs, labels=labels, true_labels=true_labels,
+            sample_ids=sample_ids, source_task_ids=source_task_ids,
+            memory_inputs=not_aug_buf_inputs, memory_labels=buf_labels, memory_indexes=buf_indexes,
+        )
+
         total_loss = combined_loss_current + loss_re
         self.opt.zero_grad()
         total_loss.backward()
@@ -886,9 +895,12 @@ class ErAceAerAbsOGC(ErAceAerAbs): # <<<--- IMPORTANT: Inherit from ErAceAerAbs
                                          round((1 - self.args.alpha_sample_insertion) * inputs.shape[0]),
                                          largest=False)
 
+                trace_enabled = self.loss_trace_recorder is not None
                 self.buffer.add_data(examples=not_aug_inputs[clean_mask],
                                      labels=labels[clean_mask],
                                      true_labels=true_labels[clean_mask] if true_labels is not None else None,
+                                     task_labels=source_task_ids[clean_mask] if trace_enabled and source_task_ids is not None else None,
+                                     sample_ids=sample_ids[clean_mask] if trace_enabled and sample_ids is not None else None,
                                      sample_selection_scores=loss_not_aug_ext_for_buffer[clean_mask] if self.args.sample_selection_strategy != 'reservoir' else None)
 
         if hasattr(self, 'eff_logger'):

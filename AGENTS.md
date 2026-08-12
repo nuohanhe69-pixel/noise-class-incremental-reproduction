@@ -132,10 +132,12 @@ mammoth_code/
 │   ├── checkpoints.py
 │   ├── loggers.py
 │   ├── schedulers.py
+│   ├── loss_trace.py            # iteration 级逐样本 loss 与四组曲线记录
 │   ├── sap_core.py
 │   └── sap_model_utils.py
 ├── scripts/
-│   └── prepare_ntu60_npz.py
+│   ├── prepare_ntu60_npz.py
+│   └── plot_loss_trace.py       # 绘制 noisy/hard-old/easy-old/new 四线图
 ├── data/                         # 数据、noisy label cache、结果；不要随意修改
 ├── checkpoints/                  # 权重；不要覆盖或删除
 ├── output/                       # 图、阈值、消融辅助输出
@@ -163,6 +165,8 @@ mammoth_code/
 | `models/aer_sap.py` | SAP-only 消融 | 是 | `models.get_model()` | 高 | 已阅读 | 依赖 SAP activation projection |
 | `models/ogc_sap.py` | 当前主改进方法 | 是 | `models.get_model()` | 高 | 已阅读 | OGC + SAP，parser 定义关键超参 |
 | `utils/buffer.py` | replay buffer 和采样策略 | 是 | rehearsal models | 高 | 已阅读 | 支持 reservoir/lars/labrs/abs/balancoir |
+| `utils/loss_trace.py` | 可选的逐样本 loss 和四组 iteration 曲线记录 | 启用参数时 | AER/ABS、AER-SAP、OGC-SAP | 中 | 单元与 debug 训练已验证 | 默认关闭；要求 synthetic noise 的 `true_labels` |
+| `scripts/plot_loss_trace.py` | 从 `iteration_curves.csv` 生成四线图 | 手工运行 | 用户/实验脚本 | 低 | 语法已验证 | 需要可选依赖 matplotlib |
 | `utils/checkpoints.py` | checkpoint 保存/加载 | 是 | `main.py`, `training.py` | 高 | 已阅读 | safe checkpoint 保存 args/results/buffer |
 | `readme_latest.md` | 当前主要运行说明 | 是，文档参考 | 人/Agent | 中 | 已阅读 | 不得直接覆盖 |
 | `README.md` | 上游 Mammoth + 历史片段 | 辅助 | 人/Agent | 中 | 已阅读 | 有旧命令与当前代码差异 |
@@ -619,6 +623,7 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 | checkpoint | `checkpoints/` | 不覆盖、不批量删除 |
 | 日志 | `run_logs/` | 保留完整命令、PID、异常 |
 | 辅助图/数组 | `output/` | 判断是否正式产物后再清理 |
+| loss trace | `output/loss_trace/<dataset>_<model>_<run-id>/` | 保存 metadata、逐样本 CSV、iteration 曲线和可选图片 |
 | 外层报告 | `../*.md` | 只作为辅助，不在本任务中修改 |
 
 建议实验命名：
@@ -830,8 +835,8 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 
 | 编号 | 待确认内容 | 当前依据 | 建议验证方式 | 状态 |
 |---|---|---|---|---|
-| T1 | 当前推荐 Python/Conda 环境 | 当前 shell `python` 不存在，`python3` 缺 torch；历史日志显示曾用独立环境 | 激活项目环境后执行环境检查命令 | 待确认 |
-| T2 | `main.py --help` 输出是否完整 | 代码 parser 已读，但当前环境无法导入 torch | 安装依赖后执行 `python main.py --help` | 当前环境未完成验证 |
+| T1 | 当前推荐 Python/Conda 环境 | `nrgp-mammoth` 已确认 Python 3.10.20、torch 2.12.1；未安装 matplotlib | 正式运行前激活该环境，绘图时安装 optional dependency | 训练环境已确认，绘图依赖待安装 |
+| T2 | `main.py --help` 输出是否完整 | 已在 `nrgp-mammoth` 中确认 loss trace 参数进入 parser | 后续新增参数时继续做 CLI smoke test | 已验证本次新增参数 |
 | T3 | CIFAR100 数据准备状态 | 未发现 `data/CIFAR100`，但有 CIFAR100 checkpoint | 检查服务器/外层数据包或运行只读数据路径检查 | 待确认 |
 | T4 | NTU60 是否可跑通 | `seq-ntu60` 存在，数据缺失；`readme_latest.md` 使用未注册 `aer_ogc_sap` | 准备 `data/NTU60_CS.npz` 后测试当前注册模型 | 代码与文档存在差异 |
 | T5 | `other/aer_ogc_sap.py` 是否为历史模型 | 文件在 `other/`，不被 `models/__init__.py` 扫描 | 查 Git 历史或用户说明 | 疑似历史遗留，尚未完全验证 |
@@ -847,6 +852,7 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 
 | 日期 | 修改内容 | 修改原因 | 验证情况 |
 |---|---|---|---|
+| 2026-07-31 | 新增 iteration 级逐样本 CE loss、动态 noisy/hard-old/easy-old/new 聚合、CSV 输出和绘图脚本 | 用户要求将 Figure 1 扩展为四线图，并保留 task/epoch/iteration/sample/buffer/class/loss 级数据 | 3 个 unittest 通过；`er-ace-aer-abs` 与 `ogc-sap` 均完成 Seq-CIFAR10 两任务 debug 端到端验证；绘图脚本因当前环境缺 matplotlib 仅完成语法/CLI 验证 |
 | 2026-07-14 | 拉取 NTD `tasks/Food-101N`，生成本机 `data/Food-101N/meta/train.tsv/test.tsv/classes.txt`，并完成离线 metadata 验证 | 用户要求先解决除数据下载外的全部问题；split metadata 可由 NTD/PuriDivER 提供，图片本体仍需用户下载 | 已验证 records=52,867/4,741、classes=101、label range=0..100；图片路径检查因未下载图片仍待执行 |
 | 2026-07-14 | 新增 `scripts/prepare_food101n_metadata.py`，并记录本地 Food101N 数据只读扫描结果 | 下一步需要把 AER/NTD/Food101N 原始 split 转成项目标准 `train.tsv/test.tsv/classes.txt` | 已完成脚本语法检查；当前本机仍未发现真实 Food101N 数据 |
 | 2026-07-14 | 确认 Food101N 采用论文/AER/NTD 接近的 `52,867 train / 4,741 test` split，并同步默认配置和验证脚本 | 用户明确选择该 split；需要避免误扫完整约 310k Food101N，且默认配置应对齐 ResNet34/20 epochs | 已更新配置与验证逻辑；真实数据仍待准备后验证 |

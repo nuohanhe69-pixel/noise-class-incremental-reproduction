@@ -16,6 +16,7 @@ from models.utils.continual_model import ContinualModel
 from utils.args import add_rehearsal_args
 from utils.buffer import Buffer
 from utils.augmentations import apply_transform, cutmix_data
+from utils.loss_trace import LossTraceRecorder, add_loss_trace_args
 
 
 class CustomDataset(torch.utils.data.Dataset):
@@ -74,6 +75,8 @@ class ErAceAerAbs(ContinualModel):
         parser.add_argument('--use_aer', default=1, type=int, choices=[0, 1], help='Use Alternate Replay?')
         parser.add_argument('--alpha_sample_insertion', default=0.75, type=float, help='percentage of high loss samples to remove from buffer')
 
+        add_loss_trace_args(parser)
+
         group = parser.add_argument_group('Buffer fitting')
         group.add_argument('--buffer_fitting_epochs', type=int, default=0, help='Number of epochs to fit on buffer')
         group.add_argument('--enable_cutmix_buffer_fitting', type=int, default=0, choices=[0, 1], help='Enable cutmix augmentation during buffer fitting?')
@@ -98,6 +101,11 @@ class ErAceAerAbs(ContinualModel):
                              sample_selection_strategy=self.args.sample_selection_strategy)
 
         self.seen_so_far = torch.tensor([]).long().to(self.device)
+        self.loss_trace_recorder = None
+        if self.args.enable_loss_trace:
+            self.loss_trace_recorder = LossTraceRecorder(
+                self.args, dataset_name=self.dataset.NAME, model_name=self.NAME,
+            )
 
     def reload_model_checkpoint(self):
         self.net.load_state_dict(self.past_model_ckpt)
@@ -117,6 +125,77 @@ class ErAceAerAbs(ContinualModel):
                 self.fit_buffer_mixmatch()
             else:
                 raise ValueError(f'Unknown buffer fitting type: {self.args.buffer_fitting_type}')
+        if self.loss_trace_recorder is not None:
+            self.loss_trace_recorder.flush()
+
+    def _should_trace_loss(self, epoch: int) -> bool:
+        if self.loss_trace_recorder is None:
+            return False
+        trace_task = self.args.loss_trace_task
+        if trace_task >= 0 and self.current_task != trace_task:
+            return False
+        if epoch < self.args.loss_trace_start_epoch:
+            return False
+        return self.args.loss_trace_end_epoch < 0 or epoch <= self.args.loss_trace_end_epoch
+
+    def _record_loss_trace(self, *, epoch: int, not_aug_inputs: torch.Tensor, labels: torch.Tensor,
+                           true_labels: torch.Tensor, sample_ids: torch.Tensor, source_task_ids: torch.Tensor,
+                           memory_inputs=None, memory_labels=None, memory_indexes=None) -> None:
+        """Record comparable pre-update CE losses without changing BatchNorm/dropout state."""
+        if not self._should_trace_loss(epoch):
+            return
+        required_current = {
+            'true_labels': true_labels, 'sample_ids': sample_ids, 'source_task_ids': source_task_ids,
+        }
+        missing = [name for name, value in required_current.items() if value is None]
+        if missing:
+            raise ValueError(f'Loss tracing requires current-batch metadata: {missing}')
+
+        current_inputs = apply_transform(not_aug_inputs, self.normalization_transform)
+        trace_inputs = current_inputs
+        trace_labels = labels
+        memory_count = 0 if memory_inputs is None else memory_inputs.shape[0]
+        if memory_count:
+            for attr_name in ('true_labels', 'task_labels', 'sample_ids'):
+                if not hasattr(self.buffer, attr_name):
+                    raise ValueError(f'Loss tracing requires buffer attribute `{attr_name}`')
+            trace_inputs = torch.cat((current_inputs, memory_inputs), dim=0)
+            trace_labels = torch.cat((labels, memory_labels), dim=0)
+
+        was_training = self.net.training
+        try:
+            self.net.eval()
+            with torch.no_grad():
+                trace_logits = self.net(trace_inputs)[:, :self.n_seen_classes]
+                trace_losses = self.loss(trace_logits, trace_labels, reduction='none')
+        finally:
+            self.net.train(was_training)
+
+        current_count = labels.shape[0]
+        current_losses = trace_losses[:current_count]
+        memory_losses = trace_losses[current_count:] if memory_count else None
+        replay_on = not self.args.use_aer or epoch % 2 == 1
+        num_batches = len(self.dataset.train_loader)
+
+        memory_kwargs = {}
+        if memory_count:
+            metadata_indexes = memory_indexes.to(self.buffer.true_labels.device)
+            memory_kwargs = {
+                'memory_losses': memory_losses,
+                'memory_labels': memory_labels,
+                'memory_true_labels': self.buffer.true_labels[metadata_indexes],
+                'memory_sample_ids': self.buffer.sample_ids[metadata_indexes],
+                'memory_source_task_ids': self.buffer.task_labels[metadata_indexes],
+                'memory_buffer_slot_ids': memory_indexes,
+            }
+        self.loss_trace_recorder.record(
+            task_id=self.current_task, epoch_id=epoch,
+            epoch_iteration_id=self.epoch_iteration, task_iteration_id=self.task_iteration,
+            num_batches_per_epoch=num_batches, replay_on=replay_on,
+            current_losses=current_losses, current_labels=labels, current_true_labels=true_labels,
+            current_sample_ids=sample_ids, current_source_task_ids=source_task_ids,
+            **memory_kwargs,
+        )
 
     def is_aer_fitting_epoch(self, epoch):
         # fit the buffer only during odd epochs or the last epoch (i.e., start with no replay and end with replay)
@@ -134,7 +213,7 @@ class ErAceAerAbs(ContinualModel):
             # the epoch was a buffer fitting epoch, save the model checkpoint
             self.save_model_checkpoint()
 
-    def observe(self, inputs, labels, not_aug_inputs, epoch, true_labels=None):
+    def observe(self, inputs, labels, not_aug_inputs, epoch, true_labels=None, sample_ids=None, source_task_ids=None):
 
         present = labels.unique()
 
@@ -160,11 +239,16 @@ class ErAceAerAbs(ContinualModel):
 
         loss_re = torch.tensor(0.)
 
+        buf_indexes = None
+        not_aug_buf_inputs = None
+        buf_labels = None
+
         if not self.buffer.is_empty():
             # always sample from buffer (needed to update scores)
-            buf_indexes, not_aug_buf_inputs, buf_inputs, buf_labels = self.buffer.get_data(
+            buffer_batch = self.buffer.get_data(
                 self.args.minibatch_size, transform=self.transform, return_index=True, return_not_aug=True,
                 not_aug_transform=self.normalization_transform)
+            buf_indexes, not_aug_buf_inputs, buf_inputs, buf_labels = buffer_batch[:4]
 
             if self.args.sample_selection_strategy != 'reservoir':
                 with torch.no_grad():
@@ -181,6 +265,12 @@ class ErAceAerAbs(ContinualModel):
             if self.args.use_aer and epoch % 2 == 0:
                 loss_re = torch.tensor(0.)
 
+        self._record_loss_trace(
+            epoch=epoch, not_aug_inputs=not_aug_inputs, labels=labels, true_labels=true_labels,
+            sample_ids=sample_ids, source_task_ids=source_task_ids,
+            memory_inputs=not_aug_buf_inputs, memory_labels=buf_labels, memory_indexes=buf_indexes,
+        )
+
         loss += loss_re
         loss.backward()
         # torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1)
@@ -196,8 +286,12 @@ class ErAceAerAbs(ContinualModel):
                 # sample insertion
                 _, clean_mask = torch.topk(loss_not_aug_ext, round((1 - self.args.alpha_sample_insertion) * inputs.shape[0]), largest=False)
 
+                trace_enabled = self.loss_trace_recorder is not None
                 self.buffer.add_data(examples=not_aug_inputs[clean_mask],
                                      labels=labels[clean_mask],
+                                     true_labels=true_labels[clean_mask] if trace_enabled and true_labels is not None else None,
+                                     task_labels=source_task_ids[clean_mask] if trace_enabled and source_task_ids is not None else None,
+                                     sample_ids=sample_ids[clean_mask] if trace_enabled and sample_ids is not None else None,
                                      sample_selection_scores=loss_not_aug_ext[clean_mask] if self.args.sample_selection_strategy != 'reservoir' else None)
 
         return loss.item()
@@ -366,7 +460,8 @@ class ErAceAerAbs(ContinualModel):
 
     def fit_buffer_ce(self):
 
-        inputs, labels = self.buffer.get_all_data()
+        buffer_data = self.buffer.get_all_data()
+        inputs, labels = buffer_data[:2]
 
         train_dataset = CustomDataset(inputs, targets=labels, transform=self.transform, device=self.device)
         train_loader = DataLoader(train_dataset, batch_size=self.args.batch_size, shuffle=True)

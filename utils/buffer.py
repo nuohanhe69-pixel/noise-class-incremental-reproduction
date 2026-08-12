@@ -310,6 +310,7 @@ class Buffer:
     logits: torch.Tensor  # (optional) buffer attribute: the tensor of logits
     task_labels: torch.Tensor  # (optional) buffer attribute: the tensor of task labels
     true_labels: torch.Tensor  # (optional) buffer attribute: the tensor of true labels
+    sample_ids: torch.Tensor  # (optional) stable ids of the original dataset samples
 
     def __init__(self, buffer_size: int, device="cpu", sample_selection_strategy='reservoir', **kwargs):
         """
@@ -336,7 +337,7 @@ class Buffer:
         self._buffer_size = buffer_size
         self.device = device
         self.num_seen_examples = 0
-        self.attributes = ['examples', 'labels', 'logits', 'task_labels', 'true_labels']
+        self.attributes = ['examples', 'labels', 'logits', 'task_labels', 'true_labels', 'sample_ids']
         self.attention_maps = [None] * buffer_size
         self.sample_selection_strategy = sample_selection_strategy
 
@@ -393,7 +394,7 @@ class Buffer:
 
     def init_tensors(self, examples: torch.Tensor, labels: torch.Tensor,
                      logits: torch.Tensor, task_labels: torch.Tensor,
-                     true_labels: torch.Tensor) -> None:
+                     true_labels: torch.Tensor, sample_ids: torch.Tensor = None) -> None:
         """
         Initializes just the required tensors.
 
@@ -407,9 +408,8 @@ class Buffer:
         for attr_str in self.attributes:
             attr = eval(attr_str)
             if attr is not None and not hasattr(self, attr_str):  # create tensor if not already present
-                typ = torch.int64 if attr_str.endswith('els') else torch.float32
                 setattr(self, attr_str, torch.zeros((self._buffer_size,
-                        *attr.shape[1:]), dtype=typ, device=self.device))
+                        *attr.shape[1:]), dtype=attr.dtype, device=self.device))
             elif hasattr(self, attr_str):  # if tensor already exists, update it and possibly resize it according to the buffer_size
                 if self.num_seen_examples < self._buffer_size:  # if the buffer is full, extend the tensor
                     old_tensor = getattr(self, attr_str)
@@ -444,7 +444,8 @@ class Buffer:
     def is_full(self):
         return self.num_seen_examples >= self.buffer_size
 
-    def add_data(self, examples, labels=None, logits=None, task_labels=None, attention_maps=None, true_labels=None, sample_selection_scores=None):
+    def add_data(self, examples, labels=None, logits=None, task_labels=None, attention_maps=None, true_labels=None,
+                 sample_selection_scores=None, sample_ids=None):
         """
         Adds the data to the memory buffer according to the reservoir strategy.
 
@@ -455,13 +456,14 @@ class Buffer:
             task_labels: tensor containing the task labels
             attention_maps: list of tensors containing the attention maps
             true_labels: if setting is noisy, the true labels associated with the examples. **Used only for logging.**
+            sample_ids: stable ids of the original dataset samples, used for tracing and logging.
             sample_selection_scores: tensor containing the scores used for the sample selection strategy. NOTE: this is only used if the sample selection strategy defines the `update` method.
 
         Note:
             Only the examples are required. The other tensors are initialized only if they are provided.
         """
         if not hasattr(self, 'examples'):
-            self.init_tensors(examples, labels, logits, task_labels, true_labels)
+            self.init_tensors(examples, labels, logits, task_labels, true_labels, sample_ids)
 
         for i in range(examples.shape[0]):
             if self.sample_selection_strategy == 'abs' or self.sample_selection_strategy == 'labrs':
@@ -474,7 +476,7 @@ class Buffer:
             if index >= 0:
                 if self.sample_selection_strategy == 'unlimited' and self.num_seen_examples > self._buffer_size:
                     self._buffer_size *= 2
-                    self.init_tensors(examples, labels, logits, task_labels, true_labels)
+                    self.init_tensors(examples, labels, logits, task_labels, true_labels, sample_ids)
                 if self.sample_selection_strategy == 'balancoir':
                     self.sample_selection_fn.update_unique_map(labels[i], self.labels[index] if index < self.num_seen_examples else None)
 
@@ -491,6 +493,8 @@ class Buffer:
                     self.sample_selection_fn.update(index, sample_selection_scores[i])
                 if true_labels is not None:
                     self.true_labels[index] = true_labels[i].to(self.device)
+                if sample_ids is not None:
+                    self.sample_ids[index] = sample_ids[i].to(self.device)
 
     def get_data(self, size: int, transform: nn.Module = None, return_index=False, device=None,
                  mask_task_out=None, cpt=None, return_not_aug=False, not_aug_transform=None, force_indexes=None) -> Tuple:

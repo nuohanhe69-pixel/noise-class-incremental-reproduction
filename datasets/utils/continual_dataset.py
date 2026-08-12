@@ -524,6 +524,16 @@ def store_masked_loaders(train_dataset: Dataset, test_dataset: Dataset,
             train_dataset.add_extra_return_field('indexes', np.arange(len(train_dataset.targets)))
             test_dataset.add_extra_return_field('bias_label', test_dataset.bias_label[test_mask])
 
+    # Loss tracing needs stable dataset ids and source-task ids to follow a
+    # sample through DataLoader shuffling and later memory-buffer replacement.
+    # Add them after task filtering so that they align directly with data/targets.
+    if getattr(setting.args, 'enable_loss_trace', 0):
+        train_dataset.add_extra_return_field('sample_ids', train_dataset.indexes.copy())
+        train_dataset.add_extra_return_field(
+            'source_task_ids',
+            np.full(len(train_dataset.targets), setting.c_task, dtype=np.int64),
+        )
+
     # Finalize data, apply unlabeled mask
     train_dataset, test_dataset = _prepare_data_loaders(train_dataset, test_dataset, setting)
 
