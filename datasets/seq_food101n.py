@@ -308,7 +308,12 @@ def _default_images_dir(root: Path, train: bool) -> Path:
 def _resolve_root(user_root: Optional[str]) -> Path:
     if user_root:
         path = Path(user_root).expanduser()
-        return path if path.is_absolute() else Path(base_path()) / path
+        if path.is_absolute():
+            return path
+        cwd_candidate = Path.cwd() / path
+        if cwd_candidate.exists():
+            return cwd_candidate
+        return Path(base_path()) / path
 
     candidates = [Path(base_path()) / name for name in (
         "Food-101N",

@@ -319,14 +319,84 @@ tar -xzf /home/hnh/tmp/Food-101N_release.tar.gz -C /home/hnh/datasets/Food-101N/
 pip install kaggle
 ```
 
-把 Kaggle token 放在 `/home/hnh/.kaggle/kaggle.json`，然后：
+注意：当前服务器终端用户可能是 `xjl`，但本任务只允许在 `/home/hnh` 下操作。因此不要把凭证放到默认的 `~/.kaggle`，而是放到 `/home/hnh/.kaggle`，并在每次使用 Kaggle 前设置：
 
 ```bash
+export KAGGLE_CONFIG_DIR=/home/hnh/.kaggle
+```
+
+#### 推荐：使用旧版 `kaggle.json`
+
+如果当前环境是 Python 3.10，`pip install kaggle` 可能安装到 `kaggle 1.7.x`。这个版本最稳的是使用 Kaggle 页面下方的“旧版 API 凭证 kaggle.json”，而不是新版 API 令牌。
+
+在本机 Kaggle 设置页下载 `kaggle.json`，通过向日葵上传到服务器 Windows 下载目录后，在 WSL 中执行：
+
+```bash
+mkdir -p /home/hnh/.kaggle /home/hnh/tmp
+find /mnt/c/Users -maxdepth 4 -iname 'kaggle.json' 2>/dev/null
+```
+
+假设找到的是：
+
+```text
+/mnt/c/Users/a/Downloads/kaggle.json
+```
+
+则复制到 `/home/hnh` 下：
+
+```bash
+cp /mnt/c/Users/a/Downloads/kaggle.json /home/hnh/.kaggle/kaggle.json
 chmod 600 /home/hnh/.kaggle/kaggle.json
+export KAGGLE_CONFIG_DIR=/home/hnh/.kaggle
+```
+
+测试：
+
+```bash
+kaggle --version
+kaggle datasets list -s food-101n | head
+```
+
+#### 可选：使用新版 API 令牌
+
+Kaggle 设置页上方的“API 令牌”需要 `Kaggle CLI >= 1.8.0` 或 `KaggleHub >= 0.4.1`。如果服务器当前 `kaggle --version` 是 `1.7.x`，新版令牌可能不能直接用。
+
+可以先尝试升级：
+
+```bash
+pip install -U "kaggle>=1.8.0"
+kaggle --version
+```
+
+如果升级后版本仍低于 1.8，或因为 Python 版本不支持而升级失败，请改用上面的旧版 `kaggle.json`。
+
+如果确实已经是 `kaggle >= 1.8.0`，可以把新版 API token 放到：
+
+```bash
+mkdir -p /home/hnh/.kaggle
+nano /home/hnh/.kaggle/access_token
+chmod 600 /home/hnh/.kaggle/access_token
+export KAGGLE_CONFIG_DIR=/home/hnh/.kaggle
+```
+
+然后测试：
+
+```bash
+kaggle datasets list -s food-101n | head
+```
+
+#### 下载数据
+
+Kaggle 凭证测试通过后：
+
+```bash
 mkdir -p /home/hnh/tmp /home/hnh/datasets/Food-101N/raw
+export KAGGLE_CONFIG_DIR=/home/hnh/.kaggle
 kaggle datasets download -d kuanghueilee/food-101n -p /home/hnh/tmp
 python -m zipfile -e /home/hnh/tmp/food-101n.zip /home/hnh/datasets/Food-101N/raw
 ```
+
+如果 `kaggle datasets list` 或 `kaggle datasets download` 仍然连接失败，说明服务器命令行也访问不了 Kaggle。这时不要继续折腾服务器浏览器，改为在本机下载 Food101N zip，然后通过向日葵文件传输上传到 `/home/hnh/tmp/`，再在服务器解压。
 
 ## 7. 找到真正的图片根目录
 
@@ -490,9 +560,11 @@ cd /home/hnh/mammoth_code_food101n
 mkdir -p /home/hnh/food101n_runs/smoke
 export WANDB_MODE=disabled
 export CUDA_VISIBLE_DEVICES=0
+export PYTHONPATH=.
+export FOOD101N_ROOT=/home/hnh/mammoth_code_food101n/data/Food-101N
 
 nohup python -u main.py --dataset seq-food101n --model ogc-sap --enable_sap 1 \
-  --food101n_root data/Food-101N \
+  --food101n_root "$FOOD101N_ROOT" \
   --food101n_train_list meta/train.tsv \
   --food101n_test_list meta/test.tsv \
   --food101n_images_dir images \
@@ -526,9 +598,11 @@ cd /home/hnh/mammoth_code_food101n
 mkdir -p /home/hnh/food101n_runs/main
 export WANDB_MODE=disabled
 export CUDA_VISIBLE_DEVICES=0
+export PYTHONPATH=.
+export FOOD101N_ROOT=/home/hnh/mammoth_code_food101n/data/Food-101N
 
 COMMON_ARGS="--dataset seq-food101n \
-  --food101n_root data/Food-101N \
+  --food101n_root ${FOOD101N_ROOT} \
   --food101n_train_list meta/train.tsv \
   --food101n_test_list meta/test.tsv \
   --food101n_images_dir images \
@@ -579,9 +653,11 @@ cd /home/hnh/mammoth_code_food101n
 mkdir -p /home/hnh/food101n_runs/main
 export WANDB_MODE=disabled
 export CUDA_VISIBLE_DEVICES=0
+export PYTHONPATH=.
+export FOOD101N_ROOT=/home/hnh/mammoth_code_food101n/data/Food-101N
 
 COMMON_ARGS="--dataset seq-food101n \
-  --food101n_root data/Food-101N \
+  --food101n_root ${FOOD101N_ROOT} \
   --food101n_train_list meta/train.tsv \
   --food101n_test_list meta/test.tsv \
   --food101n_images_dir images \
@@ -666,7 +742,103 @@ pip install -r requirements.txt
 
 如果是可选包缺失，再按错误名单独安装。
 
-### 4. `Too many open files` 或 dataloader 卡住
+### 4. `git clone` GitHub 报 `Recv failure: Connection reset by peer`
+
+如果执行：
+
+```bash
+git clone --depth 1 https://github.com/wish44165/ntd.git external/ntd
+```
+
+出现：
+
+```text
+fatal: unable to access 'https://github.com/wish44165/ntd.git/':
+Recv failure: Connection reset by peer
+```
+
+这不是 Python 虚拟环境错误，也不是 Food101N 代码错误，而是服务器访问 GitHub 时连接被重置。常见原因是服务器网络、代理、DNS、防火墙或 GitHub 访问不稳定。
+
+先清理半截目录，再重试：
+
+```bash
+cd /home/hnh/mammoth_code_food101n
+rm -rf external/ntd
+git clone --depth 1 https://github.com/wish44165/ntd.git external/ntd
+```
+
+如果仍然失败，可以改用本地上传方式：
+
+1. 在本地电脑打开：https://github.com/wish44165/ntd
+2. 下载 `Code -> Download ZIP`。
+3. 通过向日葵文件传输上传到服务器：
+
+```text
+/home/hnh/tmp/ntd-main.zip
+```
+
+4. 在服务器解压：
+
+```bash
+cd /home/hnh/mammoth_code_food101n
+rm -rf external/ntd
+mkdir -p external
+python -m zipfile -e /home/hnh/tmp/ntd-main.zip /home/hnh/tmp/ntd_zip
+mv /home/hnh/tmp/ntd_zip/ntd-main external/ntd
+ls external/ntd/tasks/Food-101N | head
+```
+
+只要最后能看到 `external/ntd/tasks/Food-101N` 下的 JSON 文件，就可以继续 Food101N metadata 生成。
+
+### 5. Kaggle CLI 报 `ProxyError: Cannot connect to proxy`
+
+如果 `kaggle.json` 已经放好，但执行：
+
+```bash
+kaggle datasets list -s food-101n | head
+```
+
+出现：
+
+```text
+ProxyError('Cannot connect to proxy.', ConnectionResetError(104, 'Connection reset by peer'))
+```
+
+说明 Kaggle 账号凭证已通过文件检查，但服务器命令行访问 Kaggle 时走了一个不可用代理，或者当前网络把命令行连接重置了。这个错误不是 Food101N 代码问题，也不是 API token 内容错误。
+
+先检查代理环境变量：
+
+```bash
+env | grep -i proxy
+```
+
+如果输出了 `http_proxy`、`https_proxy`、`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 等变量，可以先临时取消：
+
+```bash
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+export KAGGLE_CONFIG_DIR=/home/hnh/.kaggle
+kaggle datasets list -s food-101n | head
+```
+
+如果取消代理后仍然不通，说明服务器命令行直连 Kaggle 也不可用。此时不要继续卡在 Kaggle CLI，改用浏览器手动下载：
+
+1. 在服务器浏览器打开 Kaggle Food-101N 数据集页面。
+2. 点击 Download 下载 zip。
+3. 在 WSL 中用 `find /mnt/c/Users -maxdepth 5 -iname '*food*101*n*.zip'` 找到下载文件。
+4. 复制到 `/home/hnh/tmp/` 后解压。
+
+示例：
+
+```bash
+find /mnt/c/Users -maxdepth 5 -iname '*food*101*n*.zip' 2>/dev/null
+mkdir -p /home/hnh/tmp /home/hnh/datasets/Food-101N/raw
+cp "/mnt/c/Users/a/Downloads/food-101n.zip" /home/hnh/tmp/food-101n.zip
+python -m zipfile -e /home/hnh/tmp/food-101n.zip /home/hnh/datasets/Food-101N/raw
+```
+
+如果服务器浏览器能打开网页但下载很慢，也可以在本机下载 zip，然后通过向日葵文件传输上传到 `/home/hnh/tmp/`。
+
+### 6. `Too many open files` 或 dataloader 卡住
 
 先降低 workers：
 
@@ -676,7 +848,7 @@ pip install -r requirements.txt
 
 确认能跑后再慢慢调到 2 或 4。
 
-### 5. Food101N 不要设置 CIFAR 式噪声
+### 7. Food101N 不要设置 CIFAR 式噪声
 
 Food101N 已经是真实 noisy label 数据集，正式命令应保持：
 
@@ -695,6 +867,96 @@ Food101N 已经是真实 noisy label 数据集，正式命令应保持：
 ```
 
 这些是 CIFAR10/100 的合成噪声设置。
+
+### 8. Food101N 正式训练显存接近 100% 或看起来不动
+
+如果正式 OGC+SAP 日志停在类似：
+
+```text
+Task 1 - Epoch 2: 6% | 370/6560 [18:11<29:31:01, 17.17s/it]
+```
+
+同时 `nvidia-smi` 显示：
+
+```text
+GPU-Util 100%
+Memory-Usage 24099MiB / 24564MiB
+```
+
+这通常不是卡死，而是模型仍在计算。Food101N 比 CIFAR10/100 重很多：
+
+- Food101N 是 224x224 图片，CIFAR 是 32x32。
+- Food101N 当前正式配置是 ResNet34。
+- OGC+SAP 会同时用当前 batch、replay minibatch、buffer、SAP/OGC 相关中间量。
+- `batch_size=32`、`minibatch_size=32`、`buffer_size=2000` 对 24GB GPU 会非常紧。
+- PyTorch 会缓存/保留显存，所以看起来可能接近满显存。
+
+先判断是否真卡住：
+
+```bash
+ps -p <PID> -o pid,etime,pcpu,pmem,cmd
+tail -n 40 /home/hnh/food101n_runs/main/food101n_ogc_sap_seed0.log
+nvidia-smi
+```
+
+如果日志 iteration 数还在变化，说明仍在跑。如果每步已经到十几秒，完整 20 epoch 会非常慢，建议停止当前 `batch32/minibatch32` 任务，改用更稳的 `batch16/minibatch16` 先跑正式 seed0，并在报告中记录 batch 调整。
+
+停止当前任务：
+
+```bash
+kill <PID>
+sleep 5
+nvidia-smi
+```
+
+如果进程没有退出，再用：
+
+```bash
+kill -9 <PID>
+```
+
+然后重跑较稳配置：
+
+```bash
+cd /home/hnh/mammoth_code_food101n
+mkdir -p /home/hnh/food101n_runs/main
+export PYTHONPATH=.
+export WANDB_MODE=disabled
+export CUDA_VISIBLE_DEVICES=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export FOOD101N_ROOT=/home/hnh/mammoth_code_food101n/data/Food-101N
+
+COMMON_ARGS="--dataset seq-food101n \
+  --food101n_root ${FOOD101N_ROOT} \
+  --food101n_train_list meta/train.tsv \
+  --food101n_test_list meta/test.tsv \
+  --food101n_images_dir images \
+  --food101n_classes_file meta/classes.txt \
+  --backbone resnet34 \
+  --n_epochs 20 \
+  --batch_size 16 \
+  --minibatch_size 16 \
+  --lr 0.03 \
+  --buffer_size 2000 \
+  --num_workers 4 \
+  --noise_rate 0"
+
+nohup python -u main.py --model ogc-sap --enable_sap 1 \
+  --sap_scale_coff 5000 \
+  --ogc_loss_weight 0.3 \
+  --ogc_low_conf_weight 0.3 \
+  --ogc_buffer_penalty_coeff 2.0 \
+  --sap_retain_samples 2000 \
+  --savecheck last --seed 0 ${COMMON_ARGS} \
+  > /home/hnh/food101n_runs/main/food101n_ogc_sap_seed0_b16.log 2>&1 &
+```
+
+监控：
+
+```bash
+tail -f /home/hnh/food101n_runs/main/food101n_ogc_sap_seed0_b16.log
+nvidia-smi -l 2
+```
 
 ## 15. 打包日志和结果
 
@@ -751,4 +1013,3 @@ python scripts/validate_food101n_dataset.py \
 ```
 
 验证通过后，先跑 smoke，再跑正式训练。
-

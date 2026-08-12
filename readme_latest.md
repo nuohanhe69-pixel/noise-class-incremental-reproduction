@@ -260,7 +260,7 @@ python scripts/validate_food101n_dataset.py \
 
 ```bash
 python main.py --dataset seq-food101n --model ogc-sap --enable_sap 1 \
-  --food101n_root data/Food-101N \
+  --food101n_root "$(pwd)/data/Food-101N" \
   --food101n_train_list meta/train.tsv \
   --food101n_test_list meta/test.tsv \
   --food101n_images_dir images \
@@ -275,7 +275,8 @@ python main.py --dataset seq-food101n --model ogc-sap --enable_sap 1 \
 真实实验建议先从 OGC+SAP 主方法开始，使用论文/AER/NTD 对齐设置：
 
 ```bash
-COMMON_ARGS="--dataset seq-food101n --food101n_root data/Food-101N --food101n_train_list meta/train.tsv --food101n_test_list meta/test.tsv --food101n_images_dir images --food101n_classes_file meta/classes.txt --backbone resnet34 --n_epochs 20 --batch_size 32 --minibatch_size 32 --lr 0.03 --buffer_size 2000 --num_workers 4 --noise_rate 0"
+FOOD101N_ROOT="$(pwd)/data/Food-101N"
+COMMON_ARGS="--dataset seq-food101n --food101n_root ${FOOD101N_ROOT} --food101n_train_list meta/train.tsv --food101n_test_list meta/test.tsv --food101n_images_dir images --food101n_classes_file meta/classes.txt --backbone resnet34 --n_epochs 20 --batch_size 32 --minibatch_size 32 --lr 0.03 --buffer_size 2000 --num_workers 4 --noise_rate 0"
 
 python main.py --model ogc-sap --enable_sap 1 \
   --sap_scale_coff 5000 \
