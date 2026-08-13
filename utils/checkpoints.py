@@ -194,6 +194,10 @@ def mammoth_load_checkpoint(checkpoint_path: str,
                 if args.model != loading_model:
                     logging.warning(f'The loaded model was trained with a different model: {loading_model}')
                 model.load_buffer(saved_obj['buffer'])
+            if 'sap_state' in saved_obj:
+                if not hasattr(model, 'load_sap_state'):
+                    raise ValueError('Checkpoint contains SAP state but the selected model cannot load it')
+                model.load_sap_state(saved_obj['sap_state'])
 
             return model, saved_obj['results']
         else:
@@ -250,6 +254,8 @@ def save_mammoth_checkpoint(task: int, end_task: int, args: Namespace, model: to
         }
         if 'buffer_size' in model.args:
             save_obj['buffer'] = model.buffer.serialize()
+    if hasattr(model, 'serialize_sap_state'):
+        save_obj['sap_state'] = model.serialize_sap_state()
 
     torch.save(save_obj, checkpoint_name + '.pt')
     logging.warning(f"Checkpoint for task {task} saved at {checkpoint_name}")
