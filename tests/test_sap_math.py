@@ -37,6 +37,17 @@ class SAPMathTests(unittest.TestCase):
 
         torch.testing.assert_close(gram, direct, rtol=1e-9, atol=1e-10)
 
+    def test_rank_limited_float32_gram_matches_svd_for_fewer_patches_than_dimensions(self):
+        generator = torch.Generator().manual_seed(17)
+        patches = torch.randn(4, 64, generator=generator)
+
+        direct = build_sap_projection_from_patches(patches, scale=3000.0)
+        gram = build_sap_projection_from_gram(
+            patches.T @ patches, scale=3000.0, max_rank=patches.shape[0],
+        )
+
+        torch.testing.assert_close(gram, direct, rtol=2e-4, atol=2e-4)
+
     def test_projection_is_symmetric_and_has_bounded_eigenvalues(self):
         patches = torch.tensor([
             [3.0, 0.0, 0.0],
