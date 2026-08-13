@@ -61,6 +61,7 @@ def validate(data_root: Path, noisy_targets_path: Path, trained_checkpoint: Path
     labels = torch.from_numpy(noisy_targets[mask]).long()
     normalized = torch.cat(list(_normalized_batches(images, batch_size=256)))
 
+    trained_saved = torch.load(trained_checkpoint, map_location='cpu', weights_only=False)
     trained_model = _load_trained_backbone(trained_checkpoint)
     scores = score_seen_class_samples(
         trained_model,
@@ -81,6 +82,16 @@ def validate(data_root: Path, noisy_targets_path: Path, trained_checkpoint: Path
     if len(references) != 30:
         raise RuntimeError(f'expected 30 real references, got {len(references)}')
     reference_images = torch.stack([reference.image for reference in references])
+    reference_labels = torch.tensor([reference.observed_label for reference in references])
+    buffer_images = trained_saved['buffer']['examples']
+    buffer_labels = trained_saved['buffer']['labels']
+
+    def labeled_batches(batch_images, batch_labels, batch_size=32):
+        for start in range(0, len(batch_images), batch_size):
+            normalized_batch = list(_normalized_batches(
+                batch_images[start:start + batch_size], batch_size=batch_size,
+            ))[0]
+            yield normalized_batch, batch_labels[start:start + batch_size]
 
     source = resnet18(num_classes=10, num_filters=2)
     before = copy.deepcopy(source.state_dict())
@@ -92,11 +103,43 @@ def validate(data_root: Path, noisy_targets_path: Path, trained_checkpoint: Path
         scale=3000.0,
         seed=0,
         dry_run=True,
+        diagnostic_batch_factories={
+            'reference': lambda: labeled_batches(reference_images, reference_labels),
+            'replay_buffer': lambda: labeled_batches(buffer_images, buffer_labels),
+        },
+        seen_classes=10,
     )
     if dry.committed:
         raise RuntimeError('dry-run unexpectedly committed weights')
     _assert_equal_state(source, before)
-    print('DRY_RUN_OK', f'references={len(reference_images)}', f'layers={len(dry.layer_stats)}')
+    if set(dry.comparisons) != {'reference', 'replay_buffer'}:
+        raise RuntimeError('dry-run did not produce both SAP diagnostic comparisons')
+    for name, stats in dry.layer_stats.items():
+        if not (-1e-5 <= stats.projection_min_eigenvalue <= stats.projection_max_eigenvalue <= 1.00001):
+            raise RuntimeError(f'invalid projection eigenvalue range for {name}')
+        if stats.projection_effective_rank <= 0 or not np.isfinite(stats.projection_trace):
+            raise RuntimeError(f'invalid projection rank/trace for {name}')
+        print(
+            'LAYER_DIAGNOSTIC', name,
+            f'eigen=[{stats.projection_min_eigenvalue:.8f},{stats.projection_max_eigenvalue:.8f}]',
+            f'trace={stats.projection_trace:.8f}', f'rank={stats.projection_effective_rank}',
+            f'norm_ratio={stats.weight_norm_ratio:.8f}',
+        )
+    replay = dry.comparisons['replay_buffer']
+    if replay.sample_count != len(buffer_images):
+        raise RuntimeError('replay diagnostic sample count mismatch')
+    for group_name, group in replay.loss_tertiles.items():
+        print(
+            'REPLAY_TERTILE', group_name, f'count={group.sample_count}',
+            f'loss_delta={group.mean_loss_delta:.8f}',
+            f'accuracy_delta={group.accuracy_delta:.8f}',
+            f'flip_rate={group.prediction_flip_rate:.8f}',
+        )
+    print(
+        'DRY_RUN_OK', f'references={len(reference_images)}', f'layers={len(dry.layer_stats)}',
+        f'reference_logits_delta={dry.comparisons["reference"].mean_abs_logits_delta:.8f}',
+        f'replay_logits_delta={replay.mean_abs_logits_delta:.8f}',
+    )
 
     committed = run_sap_projection_transaction(
         source,

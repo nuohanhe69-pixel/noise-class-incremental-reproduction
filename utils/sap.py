@@ -44,6 +44,11 @@ class SAPLayerProjectionStats:
     sampled_patches: int
     patch_dimension: int
     relative_weight_delta: float
+    weight_norm_ratio: float
+    projection_min_eigenvalue: float
+    projection_max_eigenvalue: float
+    projection_trace: float
+    projection_effective_rank: int
 
 
 def _unwrap_parallel_model(model: nn.Module) -> nn.Module:
@@ -110,13 +115,12 @@ def _sap_importance(energy: Tensor, scale: float) -> Tensor:
     return scale * ratios / ((scale - 1.0) * ratios + 1.0)
 
 
-def build_sap_projection_from_gram(
+def _build_sap_projection_and_spectrum_from_gram(
     gram: Tensor,
     scale: float,
     *,
     max_rank: int | None = None,
-) -> Tensor:
-    """Build ``Mr`` from ``X.T @ X`` using the official SAP scaling rule."""
+) -> tuple[Tensor, Tensor]:
     symmetric_gram = _validate_gram(gram, scale)
     eigenvalues, eigenvectors = torch.linalg.eigh(symmetric_gram)
 
@@ -130,7 +134,20 @@ def build_sap_projection_from_gram(
         eigenvectors = eigenvectors[:, -keep:]
     importance = _sap_importance(energy, scale)
     projection = (eigenvectors * importance.unsqueeze(0)) @ eigenvectors.transpose(0, 1)
-    return (projection + projection.transpose(0, 1)) * 0.5
+    return (projection + projection.transpose(0, 1)) * 0.5, importance
+
+
+def build_sap_projection_from_gram(
+    gram: Tensor,
+    scale: float,
+    *,
+    max_rank: int | None = None,
+) -> Tensor:
+    """Build ``Mr`` from ``X.T @ X`` using the official SAP scaling rule."""
+    projection, _ = _build_sap_projection_and_spectrum_from_gram(
+        gram, scale, max_rank=max_rank,
+    )
+    return projection
 
 
 def build_sap_projection_from_patches(patches: Tensor, scale: float) -> Tensor:
@@ -328,7 +345,7 @@ def project_resnet18_from_reference_batches(
             max_patches=max_patches,
             seed=int(seed) + layer_index * total_images,
         )
-        projection = build_sap_projection_from_gram(
+        projection, projection_spectrum = _build_sap_projection_and_spectrum_from_gram(
             gram_stats.gram,
             scale,
             max_rank=gram_stats.sampled_patches,
@@ -351,7 +368,15 @@ def project_resnet18_from_reference_batches(
             sampled_patches=gram_stats.sampled_patches,
             patch_dimension=gram_stats.patch_dimension,
             relative_weight_delta=relative_delta,
+            weight_norm_ratio=(projected.norm() / denominator).item(),
+            projection_min_eigenvalue=(
+                0.0 if projection_spectrum.numel() < gram_stats.patch_dimension
+                else projection_spectrum.min().item()
+            ),
+            projection_max_eigenvalue=projection_spectrum.max().item(),
+            projection_trace=projection_spectrum.sum().item(),
+            projection_effective_rank=int((projection_spectrum > 1e-6).sum().item()),
         )
-        del gram_stats, projection, projected
+        del gram_stats, projection, projection_spectrum, projected
 
     return stats

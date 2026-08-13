@@ -12,6 +12,8 @@ from utils.sap_reference import SAPReferenceMemory, select_task_references
 from utils.sap_runtime import (
     SAP_EXECUTED,
     SAP_SKIPPED_EXCESSIVE_FALLBACK,
+    compare_models_on_labeled_batches,
+    diagnose_reference_purity,
     extract_cifar_task_tensors,
     run_sap_projection_transaction,
     validate_reference_gate,
@@ -57,6 +59,19 @@ class SAPRuntimeTests(unittest.TestCase):
         self.assertEqual(decision.status, SAP_EXECUTED)
         self.assertTrue(decision.should_execute)
 
+    def test_reference_purity_is_diagnostic_and_sample_id_aligned(self):
+        memory, _ = self._memory_with_two_classes()
+        references = memory.items()
+        true_labels = torch.full((240,), -1)
+        for reference in references:
+            true_labels[reference.sample_id] = reference.observed_label
+        true_labels[references[0].sample_id] = 9
+
+        purity = diagnose_reference_purity(references, true_labels)
+
+        self.assertAlmostEqual(purity, (len(references) - 1) / len(references))
+        self.assertIsNone(diagnose_reference_purity(references, torch.zeros(1)))
+
     def test_reference_gate_rejects_excessive_fallback(self):
         memory, reports = self._memory_with_two_classes(source='fallback')
 
@@ -82,7 +97,9 @@ class SAPRuntimeTests(unittest.TestCase):
         self.assertEqual(sample_ids.tolist(), [101, 202])
 
     def test_projection_transaction_dry_run_preserves_every_source_parameter(self):
-        source = resnet18(num_classes=10, num_filters=1)
+        with torch.random.fork_rng():
+            torch.manual_seed(101)
+            source = resnet18(num_classes=10, num_filters=1)
         before = {name: value.detach().clone() for name, value in source.state_dict().items()}
         inputs = torch.randn(2, 3, 32, 32, generator=torch.Generator().manual_seed(31))
 
@@ -97,11 +114,14 @@ class SAPRuntimeTests(unittest.TestCase):
         )
 
         self.assertFalse(transaction.committed)
+        self.assertEqual(transaction.max_non_target_state_delta, 0.0)
         for name, value in source.state_dict().items():
             torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
     def test_projection_transaction_commit_changes_only_target_weights(self):
-        source = resnet18(num_classes=10, num_filters=1)
+        with torch.random.fork_rng():
+            torch.manual_seed(103)
+            source = resnet18(num_classes=10, num_filters=1)
         before = {name: value.detach().clone() for name, value in source.state_dict().items()}
         inputs = torch.randn(2, 3, 32, 32, generator=torch.Generator().manual_seed(37))
 
@@ -116,6 +136,7 @@ class SAPRuntimeTests(unittest.TestCase):
         )
 
         self.assertTrue(transaction.committed)
+        self.assertEqual(transaction.max_non_target_state_delta, 0.0)
         target_weights = {f'{name}.weight' for name in RESNET18_LATE_STAGE_CONVS}
         for name, value in source.state_dict().items():
             if name in target_weights:
@@ -124,7 +145,9 @@ class SAPRuntimeTests(unittest.TestCase):
                 torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
     def test_projection_transaction_rolls_back_when_reference_batches_fail(self):
-        source = resnet18(num_classes=10, num_filters=1)
+        with torch.random.fork_rng():
+            torch.manual_seed(107)
+            source = resnet18(num_classes=10, num_filters=1)
         before = {name: value.detach().clone() for name, value in source.state_dict().items()}
 
         with self.assertRaisesRegex(ValueError, 'contain 0 images'):
@@ -140,6 +163,32 @@ class SAPRuntimeTests(unittest.TestCase):
 
         for name, value in source.state_dict().items():
             torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+    def test_model_comparison_reports_loss_tertiles_accuracy_and_prediction_flips(self):
+        before = torch.nn.Linear(2, 2, bias=False)
+        after = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            before.weight.copy_(torch.tensor([[2.0, 0.0], [0.0, 2.0]]))
+            after.weight.copy_(torch.tensor([[0.0, 2.0], [2.0, 0.0]]))
+        inputs = torch.tensor([
+            [2.0, 0.0], [1.0, 0.0], [0.2, 0.0],
+            [0.0, 0.2], [0.0, 1.0], [0.0, 2.0],
+        ])
+        labels = torch.tensor([0, 0, 0, 1, 1, 1])
+
+        comparison = compare_models_on_labeled_batches(
+            before,
+            after,
+            lambda: [(inputs, labels)],
+            seen_classes=2,
+        )
+
+        self.assertEqual(comparison.sample_count, 6)
+        self.assertGreater(comparison.mean_abs_logits_delta, 0)
+        self.assertEqual(comparison.prediction_flip_rate, 1.0)
+        self.assertEqual(set(comparison.loss_tertiles), {'low', 'mid', 'high'})
+        self.assertTrue(all(group.sample_count == 2 for group in comparison.loss_tertiles.values()))
+        self.assertTrue(all(group.accuracy_delta == -1.0 for group in comparison.loss_tertiles.values()))
 
 
 if __name__ == '__main__':
