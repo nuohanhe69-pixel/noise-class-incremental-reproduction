@@ -153,6 +153,8 @@ allowed = {
 statuses = [event.get('status') for event in history]
 if any(status not in allowed for status in statuses):
     raise SystemExit(f'unexpected SAP status: {statuses}')
+if 'SAP_EXECUTED' not in statuses:
+    raise SystemExit(f'SAP never executed; full run is blocked: {statuses}')
 for event in history:
     if event.get('status') == 'SAP_EXECUTED':
         if len(event.get('layer_stats', {})) != 10:
@@ -161,6 +163,9 @@ for event in history:
             raise SystemExit('non-target model state changed during SAP')
         if set(event.get('comparisons', {})) != {'reference', 'replay_buffer'}:
             raise SystemExit('executed SAP event is missing reference/replay diagnostics')
+        expected_accuracy_rows = event['task_id'] + 1
+        if len(event.get('task_accuracy_comparisons', [])) != expected_accuracy_rows:
+            raise SystemExit('executed SAP event is missing per-task immediate accuracy deltas')
 print('LATEST_CHECKPOINT=' + str(checkpoint_paths[-1]))
 print('SAP_STATUSES=' + ','.join(statuses))
 print('SAP_REFERENCE_COUNT=' + str(sum(len(items) for items in sap_state['reference_memory']['tasks'].values())))

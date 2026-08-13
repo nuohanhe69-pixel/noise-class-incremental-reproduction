@@ -13,6 +13,7 @@ from utils.sap_runtime import (
     SAP_EXECUTED,
     SAP_SKIPPED_EXCESSIVE_FALLBACK,
     compare_models_on_labeled_batches,
+    compare_models_task_accuracy,
     diagnose_reference_purity,
     extract_cifar_task_tensors,
     run_sap_projection_transaction,
@@ -189,6 +190,25 @@ class SAPRuntimeTests(unittest.TestCase):
         self.assertEqual(set(comparison.loss_tertiles), {'low', 'mid', 'high'})
         self.assertTrue(all(group.sample_count == 2 for group in comparison.loss_tertiles.values()))
         self.assertTrue(all(group.accuracy_delta == -1.0 for group in comparison.loss_tertiles.values()))
+
+    def test_task_accuracy_comparison_reports_immediate_delta(self):
+        before = torch.nn.Linear(2, 2, bias=False)
+        after = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            before.weight.copy_(torch.eye(2))
+            after.weight.copy_(torch.tensor([[0.0, 1.0], [1.0, 0.0]]))
+        inputs = torch.eye(2)
+        labels = torch.tensor([0, 1])
+
+        comparison = compare_models_task_accuracy(
+            before, after, lambda: [(inputs, labels)], seen_classes=2, task_id=3,
+        )
+
+        self.assertEqual(comparison.task_id, 3)
+        self.assertEqual(comparison.sample_count, 2)
+        self.assertEqual(comparison.accuracy_before, 1.0)
+        self.assertEqual(comparison.accuracy_after, 0.0)
+        self.assertEqual(comparison.accuracy_delta, -1.0)
 
 
 if __name__ == '__main__':

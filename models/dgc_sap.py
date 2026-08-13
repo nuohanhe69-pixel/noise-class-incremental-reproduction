@@ -100,6 +100,15 @@ class DgcSap(DGC):
 
         return factory
 
+    def _test_task_batch_factories(self, dataset):
+        factories = []
+        for test_loader in dataset.test_loaders:
+            def factory(loader=test_loader):
+                for data in loader:
+                    yield data[0].to(self.device), data[1].to(self.device)
+            factories.append(factory)
+        return factories
+
     def _record_sap_event(self, **event) -> None:
         event = {'task_id': int(self.current_task), **event}
         self.sap_history.append(event)
@@ -173,6 +182,7 @@ class DgcSap(DGC):
                 dry_run=bool(self.args.sap_dry_run),
                 diagnostic_batch_factories=diagnostic_factories,
                 seen_classes=self.n_seen_classes,
+                test_task_batch_factories=self._test_task_batch_factories(dataset),
             )
             if transaction.committed:
                 self.past_model_ckpt = copy.deepcopy(self.net.state_dict())
@@ -194,6 +204,10 @@ class DgcSap(DGC):
                     for name, comparison in transaction.comparisons.items()
                 },
                 max_non_target_state_delta=transaction.max_non_target_state_delta,
+                task_accuracy_comparisons=[
+                    comparison.__dict__.copy()
+                    for comparison in transaction.task_accuracy_comparisons
+                ],
             )
         except Exception as error:
             self._record_sap_event(

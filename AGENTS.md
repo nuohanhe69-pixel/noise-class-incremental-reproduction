@@ -163,7 +163,7 @@ mammoth_code/
 | `models/er_ace_aer_abs.py` | AER/ABS baseline | 是 | `models.get_model()` | 高 | 已阅读 | 使用 `true_labels` 额外字段 |
 | `models/dgc.py` | 当前主改进方法 | 是 | `models.get_model()` | 高 | 待本轮验证 | Baseline + DGC，parser 保留 `ogc_*` 参数以兼容已有实验配置 |
 | `models/dgc_sap.py` | DGC + 新 SAP | 是 | `models.get_model()` | 高 | 真实 CIFAR10 验证已通过 | 完成后评分、按类 Robust GMM、持久 reference、事务式 `layer3/layer4` pre-projection、dry-run/回滚和诊断 |
-| `utils/sap.py` / `utils/sap_reference.py` / `utils/sap_runtime.py` | SAP 核心、trusted reference 与任务边界运行时 | 是（仅 `dgc-sap`） | `models/dgc_sap.py` | 高 | 30 个单元测试+真实 CIFAR10 分阶段验证 | 只投影 ResNet18 `layer3/layer4` 的10个 Conv2d；每层最多采样 patch 数由 CLI 控制 |
+| `utils/sap.py` / `utils/sap_reference.py` / `utils/sap_runtime.py` | SAP 核心、trusted reference 与任务边界运行时 | 是（仅 `dgc-sap`） | `models/dgc_sap.py` | 高 | 31 个单元测试+真实 CIFAR10 分阶段验证 | 只投影 ResNet18 `layer3/layer4` 的10个 Conv2d；每层最多采样 patch 数由 CLI 控制 |
 | `utils/buffer.py` | replay buffer 和采样策略 | 是 | rehearsal models | 高 | 已阅读 | 支持 reservoir/lars/labrs/abs/balancoir |
 | `utils/loss_trace.py` | 可选的逐样本 loss 和四组 iteration 曲线记录 | 启用参数时 | AER/ABS、DGC | 中 | 单元与 debug 训练已验证 | 默认关闭；要求 synthetic noise 的 `true_labels` |
 | `scripts/plot_loss_trace.py` | 从 `iteration_curves.csv` 生成四线图 | 手工运行 | 用户/实验脚本 | 低 | 语法已验证 | 需要可选依赖 matplotlib |
@@ -845,7 +845,7 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 
 | 日期 | 修改内容 | 修改原因 | 验证情况 |
 |---|---|---|---|
-| 2026-08-14 | 新增独立 `dgc-sap`：论文式 SAP 数学、ResNet18 `layer3/layer4` pre-hook/Gram 投影、seen-class CE + Robust GMM、持久 reference、事务/dry-run/回滚、checkpoint、投影/replay 诊断和 CIFAR100 服务器脚本 | 在干净 Baseline+DGC 上重新接入可验证 SAP，且不恢复旧 CBP/旧 SAP | 30 个单元测试通过；真实 CIFAR10 数据验证 10 层 patch/投影、Symm40 checkpoint GMM（30 references、fallback=0、诊断纯度1.0）、dry-run/提交/回滚、500张 replay 三档诊断和 safe checkpoint恢复；CIFAR100 smoke/full 待 RTX4090 运行 |
+| 2026-08-14 | 新增独立 `dgc-sap`：论文式 SAP 数学、ResNet18 `layer3/layer4` pre-hook/Gram 投影、seen-class CE + Robust GMM、持久 reference、事务/dry-run/回滚、checkpoint、投影/replay 诊断和 CIFAR100 服务器脚本 | 在干净 Baseline+DGC 上重新接入可验证 SAP，且不恢复旧 CBP/旧 SAP | 31 个单元测试通过；真实 CIFAR10 数据验证 10 层 patch/投影、Symm40 checkpoint GMM（30 references、fallback=0、诊断纯度1.0）、dry-run/提交/回滚、500张 replay 三档诊断、5个 test Task 即时准确率 delta 和 safe checkpoint恢复；CIFAR100 smoke/full 待 RTX4090 运行 |
 | 2026-08-12 | 删除旧 CBP/SAP 活跃与历史代码，将原主模型重构为注册名 `dgc` 的纯 Baseline+DGC | 用户审核通过完整删除范围，先建立可验证的干净 DGC 基线，再重新接入 SAP | `py_compile`、注册/CLI 检查、3 个 loss trace unittest、Seq-CIFAR10 两任务 debug smoke 通过；结果与删除前 `ogc-sap --enable_sap 0` 完全一致 |
 | 2026-07-31 | 新增 iteration 级逐样本 CE loss、动态 noisy/hard-old/easy-old/new 聚合、CSV 输出和绘图脚本 | 用户要求将 Figure 1 扩展为四线图，并保留 task/epoch/iteration/sample/buffer/class/loss 级数据 | 3 个 unittest 通过；`er-ace-aer-abs` 与当时的旧主模型均完成 Seq-CIFAR10 两任务 debug 端到端验证；绘图脚本因当前环境缺 matplotlib 仅完成语法/CLI 验证 |
 | 2026-07-14 | 拉取 NTD `tasks/Food-101N`，生成本机 `data/Food-101N/meta/train.tsv/test.tsv/classes.txt`，并完成离线 metadata 验证 | 用户要求先解决除数据下载外的全部问题；split metadata 可由 NTD/PuriDivER 提供，图片本体仍需用户下载 | 已验证 records=52,867/4,741、classes=101、label range=0..100；图片路径检查因未下载图片仍待执行 |

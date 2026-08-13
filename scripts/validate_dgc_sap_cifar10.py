@@ -53,6 +53,7 @@ def validate(data_root: Path, noisy_targets_path: Path, trained_checkpoint: Path
     from torchvision.datasets import CIFAR10
 
     dataset = CIFAR10(root=data_root, train=True, download=False)
+    test_dataset = CIFAR10(root=data_root, train=False, download=False)
     with noisy_targets_path.open('rb') as handle:
         noisy_targets = np.asarray(pickle.load(handle), dtype=np.int64)
     mask = np.isin(noisy_targets, [8, 9])
@@ -93,6 +94,17 @@ def validate(data_root: Path, noisy_targets_path: Path, trained_checkpoint: Path
             ))[0]
             yield normalized_batch, batch_labels[start:start + batch_size]
 
+    test_images = torch.from_numpy(test_dataset.data).permute(0, 3, 1, 2).contiguous()
+    test_labels = torch.tensor(test_dataset.targets)
+    test_task_factories = []
+    for task_id in range(5):
+        task_mask = (test_labels >= task_id * 2) & (test_labels < (task_id + 1) * 2)
+        task_images = test_images[task_mask]
+        task_labels = test_labels[task_mask]
+        test_task_factories.append(
+            lambda images=task_images, labels=task_labels: labeled_batches(images, labels, batch_size=128)
+        )
+
     source = resnet18(num_classes=10, num_filters=2)
     before = copy.deepcopy(source.state_dict())
     dry = run_sap_projection_transaction(
@@ -108,6 +120,7 @@ def validate(data_root: Path, noisy_targets_path: Path, trained_checkpoint: Path
             'replay_buffer': lambda: labeled_batches(buffer_images, buffer_labels),
         },
         seen_classes=10,
+        test_task_batch_factories=test_task_factories,
     )
     if dry.committed:
         raise RuntimeError('dry-run unexpectedly committed weights')
@@ -134,6 +147,17 @@ def validate(data_root: Path, noisy_targets_path: Path, trained_checkpoint: Path
             f'loss_delta={group.mean_loss_delta:.8f}',
             f'accuracy_delta={group.accuracy_delta:.8f}',
             f'flip_rate={group.prediction_flip_rate:.8f}',
+        )
+    if len(dry.task_accuracy_comparisons) != 5:
+        raise RuntimeError('expected immediate accuracy diagnostics for five CIFAR-10 tasks')
+    for comparison in dry.task_accuracy_comparisons:
+        if comparison.sample_count != 2000:
+            raise RuntimeError(f'unexpected test task size: {comparison.sample_count}')
+        print(
+            'TASK_ACCURACY_DELTA', f'task={comparison.task_id}',
+            f'before={comparison.accuracy_before:.8f}',
+            f'after={comparison.accuracy_after:.8f}',
+            f'delta={comparison.accuracy_delta:.8f}',
         )
     print(
         'DRY_RUN_OK', f'references={len(reference_images)}', f'layers={len(dry.layer_stats)}',

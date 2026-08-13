@@ -41,6 +41,7 @@ class SAPProjectionTransaction:
     committed: bool
     layer_stats: dict[str, SAPLayerProjectionStats]
     comparisons: dict[str, 'SAPModelComparison']
+    task_accuracy_comparisons: list['SAPTaskAccuracyComparison']
     max_non_target_state_delta: float
 
 
@@ -63,6 +64,15 @@ class SAPModelComparison:
     max_abs_logits_delta: float
     prediction_flip_rate: float
     loss_tertiles: dict[str, SAPLossGroupComparison]
+
+
+@dataclass(frozen=True)
+class SAPTaskAccuracyComparison:
+    task_id: int
+    sample_count: int
+    accuracy_before: float
+    accuracy_after: float
+    accuracy_delta: float
 
 
 def diagnose_reference_purity(references, true_labels_by_sample_id) -> float | None:
@@ -153,6 +163,7 @@ def run_sap_projection_transaction(
     dry_run: bool,
     diagnostic_batch_factories: dict[str, Callable] | None = None,
     seen_classes: int | None = None,
+    test_task_batch_factories: Sequence[Callable] | None = None,
 ) -> SAPProjectionTransaction:
     """Project a candidate completely before optionally committing it to the source."""
     source_state = copy.deepcopy(source_model.state_dict())
@@ -170,7 +181,10 @@ def run_sap_projection_transaction(
         if any(stats.relative_weight_delta <= 0 for stats in layer_stats.values()):
             raise ValueError('SAP produced a zero weight delta for at least one target layer')
         diagnostic_batch_factories = diagnostic_batch_factories or {}
-        if diagnostic_batch_factories and (seen_classes is None or seen_classes <= 0):
+        test_task_batch_factories = test_task_batch_factories or []
+        if (diagnostic_batch_factories or test_task_batch_factories) and (
+            seen_classes is None or seen_classes <= 0
+        ):
             raise ValueError('seen_classes must be positive when SAP diagnostics are requested')
         comparisons = {
             name: compare_models_on_labeled_batches(
@@ -181,6 +195,16 @@ def run_sap_projection_transaction(
             )
             for name, factory in diagnostic_batch_factories.items()
         }
+        task_accuracy_comparisons = [
+            compare_models_task_accuracy(
+                source_model,
+                candidate,
+                factory,
+                seen_classes=seen_classes,
+                task_id=task_id,
+            )
+            for task_id, factory in enumerate(test_task_batch_factories)
+        ]
         target_weights = {f'{name}.weight' for name in RESNET18_LATE_STAGE_CONVS}
         candidate_state = candidate.state_dict()
         non_target_deltas = [
@@ -202,6 +226,7 @@ def run_sap_projection_transaction(
         committed=not dry_run,
         layer_stats=dict(layer_stats),
         comparisons=comparisons,
+        task_accuracy_comparisons=task_accuracy_comparisons,
         max_non_target_state_delta=max_non_target_state_delta,
     )
 
@@ -271,4 +296,47 @@ def compare_models_on_labeled_batches(
         max_abs_logits_delta=logits_delta.max().item(),
         prediction_flip_rate=(prediction_before != prediction_after).float().mean().item(),
         loss_tertiles=loss_tertiles,
+    )
+
+
+def compare_models_task_accuracy(
+    before_model,
+    after_model,
+    batch_factory,
+    *,
+    seen_classes: int,
+    task_id: int,
+) -> SAPTaskAccuracyComparison:
+    """Compare Class-IL accuracy for one test task without selecting on it."""
+    correct_before = 0
+    correct_after = 0
+    sample_count = 0
+    before_states = {module: module.training for module in before_model.modules()}
+    after_states = {module: module.training for module in after_model.modules()}
+    try:
+        before_model.eval()
+        after_model.eval()
+        with torch.no_grad():
+            for inputs, labels in batch_factory():
+                labels = labels.to(inputs.device)
+                prediction_before = before_model(inputs)[:, :seen_classes].argmax(dim=1)
+                prediction_after = after_model(inputs)[:, :seen_classes].argmax(dim=1)
+                correct_before += (prediction_before == labels).sum().item()
+                correct_after += (prediction_after == labels).sum().item()
+                sample_count += labels.numel()
+    finally:
+        for module, state in before_states.items():
+            module.training = state
+        for module, state in after_states.items():
+            module.training = state
+    if sample_count == 0:
+        raise ValueError('test task diagnostic received no samples')
+    accuracy_before = correct_before / sample_count
+    accuracy_after = correct_after / sample_count
+    return SAPTaskAccuracyComparison(
+        task_id=int(task_id),
+        sample_count=sample_count,
+        accuracy_before=accuracy_before,
+        accuracy_after=accuracy_after,
+        accuracy_delta=accuracy_after - accuracy_before,
     )
