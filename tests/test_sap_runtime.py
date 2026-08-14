@@ -8,20 +8,70 @@ import torch
 
 from backbone.ResNetBlock import resnet18
 from utils.sap import RESNET18_LATE_STAGE_CONVS
-from utils.sap_reference import SAPReferenceMemory, select_task_references
+from utils.sap_reference import SAPReferenceMemory, select_task_references, split_trusted_and_pending
 from utils.sap_runtime import (
     SAP_EXECUTED,
-    SAP_SKIPPED_EXCESSIVE_FALLBACK,
+    SAPLossGroupComparison,
+    SAPModelComparison,
+    SAP_SKIPPED_INSUFFICIENT_REFERENCE,
     compare_models_on_labeled_batches,
     compare_models_task_accuracy,
     diagnose_reference_purity,
     extract_cifar_task_tensors,
     run_sap_projection_transaction,
+    assess_sap_candidate,
     validate_reference_gate,
 )
 
 
 class SAPRuntimeTests(unittest.TestCase):
+    @staticmethod
+    def _comparison(accuracy_before, accuracy_after):
+        group = SAPLossGroupComparison(
+            sample_count=10,
+            mean_loss_before=0.1,
+            mean_loss_after=0.1,
+            mean_loss_delta=0.0,
+            accuracy_before=accuracy_before,
+            accuracy_after=accuracy_after,
+            accuracy_delta=accuracy_after - accuracy_before,
+            prediction_flip_rate=0.0,
+        )
+        return SAPModelComparison(
+            sample_count=30,
+            mean_abs_logits_delta=0.1,
+            max_abs_logits_delta=0.2,
+            prediction_flip_rate=0.0,
+            loss_tertiles={'low': group, 'mid': group, 'high': group},
+        )
+
+    def test_candidate_safety_gate_rejects_old_replay_task_regression(self):
+        layer_stats = {
+            'layer': SimpleNamespace(weight_norm_ratio=0.8),
+        }
+        decision = assess_sap_candidate(
+            layer_stats,
+            {
+                'reference': self._comparison(1.0, 1.0),
+                'replay_task_0': self._comparison(0.9, 0.6),
+                'replay_task_1': self._comparison(0.8, 0.82),
+            },
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertIn('REPLAY_TASK_ACCURACY_DROP:replay_task_0', decision.rejection_reasons)
+
+    def test_candidate_safety_gate_accepts_bounded_training_side_changes(self):
+        decision = assess_sap_candidate(
+            {'layer': SimpleNamespace(weight_norm_ratio=0.8)},
+            {
+                'reference': self._comparison(1.0, 0.995),
+                'replay_task_0': self._comparison(0.9, 0.89),
+            },
+        )
+
+        self.assertTrue(decision.accepted)
+
     def _memory_with_two_classes(self, source='GMM_MAIN'):
         memory = SAPReferenceMemory()
         count = 240
@@ -47,7 +97,8 @@ class SAPRuntimeTests(unittest.TestCase):
             class_quota=15,
             seed=0,
         )
-        memory.add_task(0, selected)
+        trusted, _ = split_trusted_and_pending(selected)
+        memory.add_task(0, trusted)
         return memory, reports
 
     def test_reference_gate_scales_cifar100_ratios_to_a_two_class_cifar10_task(self):
@@ -73,15 +124,17 @@ class SAPRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(purity, (len(references) - 1) / len(references))
         self.assertIsNone(diagnose_reference_purity(references, torch.zeros(1)))
 
-    def test_reference_gate_rejects_excessive_fallback(self):
+    def test_pending_fallback_is_not_counted_by_the_trusted_gate(self):
         memory, reports = self._memory_with_two_classes(source='fallback')
 
         decision = validate_reference_gate(
             memory, reports, current_class_count=2, seen_class_count=2,
         )
 
-        self.assertEqual(decision.status, SAP_SKIPPED_EXCESSIVE_FALLBACK)
+        self.assertEqual(decision.status, SAP_SKIPPED_INSUFFICIENT_REFERENCE)
         self.assertFalse(decision.should_execute)
+        self.assertEqual(decision.reference_count, 0)
+        self.assertEqual(decision.fallback_fraction, 0.0)
 
     def test_extract_cifar_task_tensors_preserves_observed_labels_and_sample_ids(self):
         wrapped_dataset = SimpleNamespace(

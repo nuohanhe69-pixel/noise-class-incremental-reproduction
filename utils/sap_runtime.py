@@ -17,7 +17,11 @@ from utils.sap import (
     SAPLayerProjectionStats,
     project_resnet18_from_reference_batches,
 )
-from utils.sap_reference import GMM_MAIN, SAPClassSelectionReport, SAPReferenceMemory
+from utils.sap_reference import (
+    SAPClassSelectionReport,
+    SAPReferenceMemory,
+    TRUSTED_SELECTION_SOURCES,
+)
 
 
 SAP_EXECUTED = 'SAP_EXECUTED'
@@ -39,6 +43,10 @@ class SAPGateDecision:
 @dataclass(frozen=True)
 class SAPProjectionTransaction:
     committed: bool
+    accepted: bool
+    rejection_reasons: tuple[str, ...]
+    minimum_weight_norm_ratio: float
+    training_side_accuracy_deltas: dict[str, float]
     layer_stats: dict[str, SAPLayerProjectionStats]
     comparisons: dict[str, 'SAPModelComparison']
     task_accuracy_comparisons: list['SAPTaskAccuracyComparison']
@@ -73,6 +81,63 @@ class SAPTaskAccuracyComparison:
     accuracy_before: float
     accuracy_after: float
     accuracy_delta: float
+
+
+@dataclass(frozen=True)
+class SAPCandidateDecision:
+    accepted: bool
+    rejection_reasons: tuple[str, ...]
+    minimum_weight_norm_ratio: float
+    accuracy_deltas: dict[str, float]
+
+
+def _comparison_accuracy(comparison: SAPModelComparison, *, after: bool) -> float:
+    total = sum(group.sample_count for group in comparison.loss_tertiles.values())
+    if total <= 0:
+        raise ValueError('SAP comparison contains no samples')
+    field = 'accuracy_after' if after else 'accuracy_before'
+    return sum(
+        group.sample_count * getattr(group, field)
+        for group in comparison.loss_tertiles.values()
+    ) / total
+
+
+def assess_sap_candidate(
+    layer_stats,
+    comparisons: dict[str, SAPModelComparison],
+    *,
+    minimum_weight_norm_ratio: float = 0.25,
+    maximum_reference_accuracy_drop: float = 0.01,
+    maximum_replay_task_accuracy_drop: float = 0.02,
+) -> SAPCandidateDecision:
+    """Gate a candidate using training-side trusted/replay evidence only."""
+    minimum_ratio = min(
+        (stats.weight_norm_ratio for stats in layer_stats.values()),
+        default=1.0,
+    )
+    reasons = []
+    if minimum_ratio < minimum_weight_norm_ratio:
+        reasons.append('WEIGHT_NORM_RATIO_BELOW_FLOOR')
+    accuracy_deltas = {}
+    for name, comparison in comparisons.items():
+        delta = _comparison_accuracy(comparison, after=True) - _comparison_accuracy(
+            comparison, after=False,
+        )
+        accuracy_deltas[name] = delta
+        if name == 'reference' and delta < -maximum_reference_accuracy_drop:
+            reasons.append('REFERENCE_ACCURACY_DROP')
+
+    replay_task_names = sorted(name for name in comparisons if name.startswith('replay_task_'))
+    replay_names = replay_task_names or (['replay_buffer'] if 'replay_buffer' in comparisons else [])
+    for name in replay_names:
+        if accuracy_deltas[name] < -maximum_replay_task_accuracy_drop:
+            reasons.append(f'REPLAY_TASK_ACCURACY_DROP:{name}')
+    return SAPCandidateDecision(
+        accepted=not reasons,
+        rejection_reasons=tuple(reasons),
+        minimum_weight_norm_ratio=float(minimum_ratio),
+        accuracy_deltas=accuracy_deltas,
+    )
 
 
 def diagnose_reference_purity(references, true_labels_by_sample_id) -> float | None:
@@ -115,11 +180,14 @@ def validate_reference_gate(
     """Apply the agreed CIFAR100 gate, scaled by the current task class count."""
     if current_class_count <= 0 or seen_class_count <= 0:
         raise ValueError('class counts must be positive')
-    current_class_coverage = sum(report.selected_main_count + report.fallback_count > 0 for report in current_reports)
+    current_class_coverage = sum(report.selected_main_count > 0 for report in current_reports)
     current_classes_with_five_main = sum(report.selected_main_count >= 5 for report in current_reports)
     references = memory.items()
     seen_class_coverage = len({reference.observed_label for reference in references})
-    fallback_count = sum(reference.selection_source != GMM_MAIN for reference in references)
+    fallback_count = sum(
+        reference.selection_source not in TRUSTED_SELECTION_SOURCES
+        for reference in references
+    )
     reference_count = len(references)
     fallback_fraction = fallback_count / reference_count if reference_count else 0.0
 
@@ -164,6 +232,7 @@ def run_sap_projection_transaction(
     diagnostic_batch_factories: dict[str, Callable] | None = None,
     seen_classes: int | None = None,
     test_task_batch_factories: Sequence[Callable] | None = None,
+    enforce_candidate_safety: bool = False,
 ) -> SAPProjectionTransaction:
     """Project a candidate completely before optionally committing it to the source."""
     source_state = copy.deepcopy(source_model.state_dict())
@@ -205,6 +274,17 @@ def run_sap_projection_transaction(
             )
             for task_id, factory in enumerate(test_task_batch_factories)
         ]
+        if enforce_candidate_safety:
+            candidate_decision = assess_sap_candidate(layer_stats, comparisons)
+        else:
+            candidate_decision = SAPCandidateDecision(
+                accepted=True,
+                rejection_reasons=(),
+                minimum_weight_norm_ratio=min(
+                    stats.weight_norm_ratio for stats in layer_stats.values()
+                ),
+                accuracy_deltas={},
+            )
         target_weights = {f'{name}.weight' for name in RESNET18_LATE_STAGE_CONVS}
         candidate_state = candidate.state_dict()
         non_target_deltas = [
@@ -215,7 +295,7 @@ def run_sap_projection_transaction(
         max_non_target_state_delta = max(non_target_deltas, default=0.0)
         if max_non_target_state_delta != 0:
             raise ValueError('SAP changed at least one non-target parameter or buffer')
-        if not dry_run:
+        if not dry_run and candidate_decision.accepted:
             source_model.load_state_dict(candidate.state_dict())
     except Exception:
         source_model.load_state_dict(source_state)
@@ -223,7 +303,11 @@ def run_sap_projection_transaction(
     finally:
         del candidate
     return SAPProjectionTransaction(
-        committed=not dry_run,
+        committed=not dry_run and candidate_decision.accepted,
+        accepted=candidate_decision.accepted,
+        rejection_reasons=candidate_decision.rejection_reasons,
+        minimum_weight_norm_ratio=candidate_decision.minimum_weight_norm_ratio,
+        training_side_accuracy_deltas=candidate_decision.accuracy_deltas,
         layer_stats=dict(layer_stats),
         comparisons=comparisons,
         task_accuracy_comparisons=task_accuracy_comparisons,

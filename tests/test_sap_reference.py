@@ -6,10 +6,17 @@ import torch
 from utils.sap_reference import (
     GMM_FALLBACK_LOW_LOSS,
     GMM_MAIN,
+    MULTISTAGE_PROMOTED,
     SAPReferenceMemory,
+    SAPTrajectorySnapshot,
+    assess_gmm_stability,
+    build_trajectory_snapshot,
+    deserialize_reference_memories,
     fit_class_robust_gmm,
+    promote_pending_references,
     score_seen_class_samples,
     select_task_references,
+    split_trusted_and_pending,
 )
 
 
@@ -23,6 +30,37 @@ class _IndexLogitModel(torch.nn.Module):
 
 
 class SAPReferenceTests(unittest.TestCase):
+    def test_stable_boundary_gmm_is_accepted_without_lowering_the_hard_floor(self):
+        decision = assess_gmm_stability(
+            separations=[0.94, 0.95, 0.96, 0.95, 0.94],
+            component_min_weights=[0.20] * 5,
+            converged_fits=5,
+            attempted_fits=5,
+        )
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual(decision.acceptance_tier, 'STABLE_BOUNDARY')
+        self.assertAlmostEqual(decision.separation_median, 0.95)
+
+    def test_unstable_or_below_floor_gmm_is_rejected_with_a_reason(self):
+        unstable = assess_gmm_stability(
+            separations=[0.91, 0.94, 0.99, 0.92, 0.98],
+            component_min_weights=[0.20] * 5,
+            converged_fits=5,
+            attempted_fits=5,
+        )
+        below_floor = assess_gmm_stability(
+            separations=[0.86, 0.88, 0.89, 0.87, 0.88],
+            component_min_weights=[0.20] * 5,
+            converged_fits=5,
+            attempted_fits=5,
+        )
+
+        self.assertFalse(unstable.accepted)
+        self.assertIn('SEPARATION_UNSTABLE', unstable.rejection_reasons)
+        self.assertFalse(below_floor.accepted)
+        self.assertIn('SEPARATION_BELOW_FLOOR', below_floor.rejection_reasons)
+
     def test_seen_class_scoring_excludes_future_logits(self):
         logits = torch.tensor([
             [5.0, 1.0, 100.0],
@@ -80,6 +118,99 @@ class SAPReferenceTests(unittest.TestCase):
         self.assertTrue(all(item.selection_source == GMM_FALLBACK_LOW_LOSS for item in selected))
         self.assertEqual([item.sample_id for item in selected], [0, 1, 2])
         self.assertEqual(reports[0].fallback_count, 3)
+
+        trusted, pending = split_trusted_and_pending(selected)
+        self.assertEqual(trusted, [])
+        self.assertEqual([item.sample_id for item in pending], [0, 1, 2])
+
+    def test_v1_reference_memory_migrates_main_to_trusted_and_fallback_to_pending(self):
+        count = 120
+        images = torch.zeros(count, 3, 32, 32, dtype=torch.uint8)
+        labels = torch.zeros(count, dtype=torch.long)
+        selected, _ = select_task_references(
+            images=images,
+            observed_labels=labels,
+            sample_ids=torch.arange(count),
+            source_task_id=0,
+            losses=torch.linspace(0.4, 0.401, count),
+            predictions=labels,
+            confidences=torch.ones(count),
+            class_quota=15,
+            seed=3,
+        )
+        legacy = SAPReferenceMemory()
+        legacy.add_task(0, selected)
+
+        trusted, pending, migrated = deserialize_reference_memories(legacy.serialize())
+
+        self.assertTrue(migrated)
+        self.assertEqual(len(trusted), 0)
+        self.assertEqual(len(pending), 5)
+
+    def test_pending_requires_consistent_multistage_evidence_before_promotion(self):
+        count = 120
+        labels = torch.zeros(count, dtype=torch.long)
+        selected, _ = select_task_references(
+            images=torch.zeros(count, 3, 32, 32, dtype=torch.uint8),
+            observed_labels=labels,
+            sample_ids=torch.arange(count),
+            source_task_id=0,
+            losses=torch.linspace(0.4, 0.401, count),
+            predictions=labels,
+            confidences=torch.ones(count),
+            class_quota=15,
+            seed=3,
+        )
+        _, pending = split_trusted_and_pending(selected)
+        snapshots = []
+        for epoch in (35, 45, 50):
+            predictions = torch.zeros(len(pending), dtype=torch.long)
+            if epoch == 50:
+                predictions[-1] = 1
+            snapshots.append(SAPTrajectorySnapshot(
+                epoch=epoch,
+                sample_ids=torch.tensor([item.sample_id for item in pending]),
+                observed_labels=torch.zeros(len(pending), dtype=torch.long),
+                losses=torch.linspace(0.10, 0.12, len(pending)) * {
+                    35: 1.0, 45: 0.3, 50: 0.05,
+                }[epoch],
+                predictions=predictions,
+                confidences=torch.full((len(pending),), 0.9),
+                class_loss_quantiles=torch.full((len(pending),), 0.2),
+                ogc_high_confidence=torch.ones(len(pending), dtype=torch.bool),
+                abs_insertion_eligible=torch.ones(len(pending), dtype=torch.bool),
+                ogc_probability_threshold=0.5,
+            ))
+
+        promoted, remaining, reports = promote_pending_references(pending, snapshots, promoted_at_task_id=0)
+
+        self.assertEqual(len(promoted), len(pending) - 1)
+        self.assertTrue(all(item.selection_source == MULTISTAGE_PROMOTED for item in promoted))
+        self.assertEqual([item.sample_id for item in remaining], [pending[-1].sample_id])
+        self.assertFalse(reports[-1]['promoted'])
+        self.assertIn('PREDICTION_INCONSISTENT', reports[-1]['rejection_reasons'])
+
+    def test_trajectory_snapshot_records_class_rank_ogc_and_abs_evidence(self):
+        scores = type('Scores', (), {
+            'losses': torch.tensor([0.1, 0.4, 0.2, 0.8]),
+            'predictions': torch.tensor([0, 0, 1, 1]),
+            'confidences': torch.tensor([0.9, 0.4, 0.8, 0.3]),
+        })()
+
+        snapshot = build_trajectory_snapshot(
+            epoch=35,
+            sample_ids=torch.arange(4),
+            observed_labels=torch.tensor([0, 0, 1, 1]),
+            scores=scores,
+            ogc_probability_threshold=0.5,
+            ogc_low_conf_weight=0.5,
+            ogc_buffer_penalty_coeff=1.5,
+            alpha_sample_insertion=0.5,
+        )
+
+        torch.testing.assert_close(snapshot.class_loss_quantiles, torch.tensor([0.0, 1.0, 0.0, 1.0]))
+        self.assertEqual(snapshot.ogc_high_confidence.tolist(), [True, False, True, False])
+        self.assertEqual(snapshot.abs_insertion_eligible.tolist(), [True, False, True, False])
 
     def test_selection_applies_independent_observed_class_quotas(self):
         per_class = 200

@@ -37,6 +37,16 @@ class SAPMathTests(unittest.TestCase):
 
         torch.testing.assert_close(gram, direct, rtol=1e-9, atol=1e-10)
 
+    @unittest.skipUnless(torch.backends.mps.is_available(), 'requires Apple MPS')
+    def test_mps_gram_projection_falls_back_to_cpu_eigendecomposition(self):
+        gram = torch.diag(torch.tensor([9.0, 4.0, 1.0], device='mps'))
+
+        projection = build_sap_projection_from_gram(gram, scale=3000.0)
+
+        expected = build_sap_projection_from_gram(gram.cpu(), scale=3000.0)
+        self.assertEqual(projection.device.type, 'mps')
+        torch.testing.assert_close(projection.cpu(), expected, rtol=1e-5, atol=1e-6)
+
     def test_rank_limited_float32_gram_matches_svd_for_fewer_patches_than_dimensions(self):
         generator = torch.Generator().manual_seed(17)
         patches = torch.randn(4, 64, generator=generator)

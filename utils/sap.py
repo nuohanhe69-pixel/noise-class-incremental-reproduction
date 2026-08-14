@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Callable, Iterable, Mapping
 
 import torch
@@ -49,6 +50,11 @@ class SAPLayerProjectionStats:
     projection_max_eigenvalue: float
     projection_trace: float
     projection_effective_rank: int
+    gram_device: str
+    gram_dtype: str
+    decomposition_device: str
+    decomposition_dtype: str
+    decomposition_seconds: float
 
 
 def _unwrap_parallel_model(model: nn.Module) -> nn.Module:
@@ -115,14 +121,24 @@ def _sap_importance(energy: Tensor, scale: float) -> Tensor:
     return scale * ratios / ((scale - 1.0) * ratios + 1.0)
 
 
-def _build_sap_projection_and_spectrum_from_gram(
+def _build_sap_projection_spectrum_and_device_stats(
     gram: Tensor,
     scale: float,
     *,
     max_rank: int | None = None,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, str, float]:
     symmetric_gram = _validate_gram(gram, scale)
-    eigenvalues, eigenvectors = torch.linalg.eigh(symmetric_gram)
+    original_device = symmetric_gram.device
+    decomposition_gram = (
+        symmetric_gram.cpu() if original_device.type == 'mps' else symmetric_gram
+    )
+    decomposition_started = perf_counter()
+    eigenvalues, eigenvectors = torch.linalg.eigh(decomposition_gram)
+    decomposition_seconds = perf_counter() - decomposition_started
+    decomposition_device = str(decomposition_gram.device)
+    if decomposition_gram.device != original_device:
+        eigenvalues = eigenvalues.to(original_device)
+        eigenvectors = eigenvectors.to(original_device)
 
     # Round-off can produce tiny negative eigenvalues for a PSD Gram matrix.
     energy = eigenvalues.clamp_min(0)
@@ -134,7 +150,24 @@ def _build_sap_projection_and_spectrum_from_gram(
         eigenvectors = eigenvectors[:, -keep:]
     importance = _sap_importance(energy, scale)
     projection = (eigenvectors * importance.unsqueeze(0)) @ eigenvectors.transpose(0, 1)
-    return (projection + projection.transpose(0, 1)) * 0.5, importance
+    return (
+        (projection + projection.transpose(0, 1)) * 0.5,
+        importance,
+        decomposition_device,
+        decomposition_seconds,
+    )
+
+
+def _build_sap_projection_and_spectrum_from_gram(
+    gram: Tensor,
+    scale: float,
+    *,
+    max_rank: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    projection, spectrum, _, _ = _build_sap_projection_spectrum_and_device_stats(
+        gram, scale, max_rank=max_rank,
+    )
+    return projection, spectrum
 
 
 def build_sap_projection_from_gram(
@@ -345,7 +378,12 @@ def project_resnet18_from_reference_batches(
             max_patches=max_patches,
             seed=int(seed) + layer_index * total_images,
         )
-        projection, projection_spectrum = _build_sap_projection_and_spectrum_from_gram(
+        (
+            projection,
+            projection_spectrum,
+            decomposition_device,
+            decomposition_seconds,
+        ) = _build_sap_projection_spectrum_and_device_stats(
             gram_stats.gram,
             scale,
             max_rank=gram_stats.sampled_patches,
@@ -376,6 +414,11 @@ def project_resnet18_from_reference_batches(
             projection_max_eigenvalue=projection_spectrum.max().item(),
             projection_trace=projection_spectrum.sum().item(),
             projection_effective_rank=int((projection_spectrum > 1e-6).sum().item()),
+            gram_device=str(gram_stats.gram.device),
+            gram_dtype=str(gram_stats.gram.dtype),
+            decomposition_device=decomposition_device,
+            decomposition_dtype=str(gram_stats.gram.dtype),
+            decomposition_seconds=decomposition_seconds,
         )
         del gram_stats, projection, projection_spectrum, projected
 
