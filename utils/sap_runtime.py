@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, isfinite
 from typing import Callable, Sequence
 
 import numpy as np
@@ -92,13 +92,18 @@ class SAPCandidateDecision:
 
 
 def _comparison_accuracy(comparison: SAPModelComparison, *, after: bool) -> float:
-    total = sum(group.sample_count for group in comparison.loss_tertiles.values())
+    non_empty_groups = [
+        group
+        for group in comparison.loss_tertiles.values()
+        if group.sample_count > 0
+    ]
+    total = sum(group.sample_count for group in non_empty_groups)
     if total <= 0:
         raise ValueError('SAP comparison contains no samples')
     field = 'accuracy_after' if after else 'accuracy_before'
     return sum(
         group.sample_count * getattr(group, field)
-        for group in comparison.loss_tertiles.values()
+        for group in non_empty_groups
     ) / total
 
 
@@ -109,6 +114,8 @@ def assess_sap_candidate(
     minimum_weight_norm_ratio: float = 0.25,
     maximum_reference_accuracy_drop: float = 0.01,
     maximum_replay_task_accuracy_drop: float = 0.02,
+    minimum_diagnostic_samples: int = 3,
+    required_replay_task_names: set[str] | None = None,
 ) -> SAPCandidateDecision:
     """Gate a candidate using training-side trusted/replay evidence only."""
     minimum_ratio = min(
@@ -116,21 +123,31 @@ def assess_sap_candidate(
         default=1.0,
     )
     reasons = []
-    if minimum_ratio < minimum_weight_norm_ratio:
+    if not isfinite(minimum_ratio):
+        reasons.append('NON_FINITE_WEIGHT_NORM_RATIO')
+    elif minimum_ratio < minimum_weight_norm_ratio:
         reasons.append('WEIGHT_NORM_RATIO_BELOW_FLOOR')
     accuracy_deltas = {}
     for name, comparison in comparisons.items():
+        if comparison.sample_count < minimum_diagnostic_samples:
+            reasons.append(f'INSUFFICIENT_DIAGNOSTIC_SAMPLES:{name}')
         delta = _comparison_accuracy(comparison, after=True) - _comparison_accuracy(
             comparison, after=False,
         )
         accuracy_deltas[name] = delta
-        if name == 'reference' and delta < -maximum_reference_accuracy_drop:
+        if not isfinite(delta):
+            reasons.append(f'NON_FINITE_ACCURACY_DELTA:{name}')
+        elif name == 'reference' and delta < -maximum_reference_accuracy_drop:
             reasons.append('REFERENCE_ACCURACY_DROP')
+
+    required_replay_task_names = required_replay_task_names or set()
+    for name in sorted(required_replay_task_names - comparisons.keys()):
+        reasons.append(f'MISSING_REPLAY_TASK:{name}')
 
     replay_task_names = sorted(name for name in comparisons if name.startswith('replay_task_'))
     replay_names = replay_task_names or (['replay_buffer'] if 'replay_buffer' in comparisons else [])
     for name in replay_names:
-        if accuracy_deltas[name] < -maximum_replay_task_accuracy_drop:
+        if isfinite(accuracy_deltas[name]) and accuracy_deltas[name] < -maximum_replay_task_accuracy_drop:
             reasons.append(f'REPLAY_TASK_ACCURACY_DROP:{name}')
     return SAPCandidateDecision(
         accepted=not reasons,
@@ -233,6 +250,7 @@ def run_sap_projection_transaction(
     seen_classes: int | None = None,
     test_task_batch_factories: Sequence[Callable] | None = None,
     enforce_candidate_safety: bool = False,
+    required_replay_task_names: set[str] | None = None,
 ) -> SAPProjectionTransaction:
     """Project a candidate completely before optionally committing it to the source."""
     source_state = copy.deepcopy(source_model.state_dict())
@@ -275,7 +293,11 @@ def run_sap_projection_transaction(
             for task_id, factory in enumerate(test_task_batch_factories)
         ]
         if enforce_candidate_safety:
-            candidate_decision = assess_sap_candidate(layer_stats, comparisons)
+            candidate_decision = assess_sap_candidate(
+                layer_stats,
+                comparisons,
+                required_replay_task_names=required_replay_task_names,
+            )
         else:
             candidate_decision = SAPCandidateDecision(
                 accepted=True,
