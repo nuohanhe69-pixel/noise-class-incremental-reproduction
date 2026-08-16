@@ -37,7 +37,11 @@ import torch.nn as nn
 import torch.optim as optim
 from datasets import get_dataset
 
-from utils.buffer import Buffer
+from utils.buffer import (
+    BUFFER_CHECKPOINT_STATE_KEY,
+    BUFFER_CHECKPOINT_STATE_VERSION,
+    Buffer,
+)
 from utils.conf import get_device, warn_once
 from utils.kornia_utils import to_kornia_transform
 from utils.magic import persistent_locals
@@ -251,13 +255,76 @@ class ContinualModel(nn.Module):
                 self.args.buffer_size, buffer.examples.shape[0])
             self.buffer = buffer
         elif isinstance(buffer, dict):  # serialized buffer
-            assert 'examples' in buffer, "Buffer does not contain examples"
-            assert self.buffer.buffer_size == buffer['examples'].shape[0], "Buffer size mismatch. Expected {} got {}".format(
-                self.buffer.buffer_size, buffer['examples'].shape[0])
-            for k, v in buffer.items():
-                setattr(self.buffer, k, v)
-            self.buffer.attributes = list(buffer.keys())
-            self.buffer.num_seen_examples = buffer['examples'].shape[0]
+            checkpoint_state = buffer.get(BUFFER_CHECKPOINT_STATE_KEY)
+            buffer_attributes = {
+                key: value
+                for key, value in buffer.items()
+                if key != BUFFER_CHECKPOINT_STATE_KEY
+            }
+            if buffer_attributes:
+                assert 'examples' in buffer_attributes, "Buffer does not contain examples"
+                assert self.buffer.buffer_size == buffer_attributes['examples'].shape[0], "Buffer size mismatch. Expected {} got {}".format(
+                    self.buffer.buffer_size, buffer_attributes['examples'].shape[0])
+                for k, v in buffer_attributes.items():
+                    # Safe checkpoints serialize buffer tensors on CPU.  Restore
+                    # them to the buffer's configured runtime device so later
+                    # in-place replacement does not mix CPU and accelerator
+                    # tensors.
+                    setattr(
+                        self.buffer,
+                        k,
+                        v.to(self.buffer.device) if isinstance(v, torch.Tensor) else v,
+                    )
+                self.buffer.attributes = list(buffer_attributes.keys())
+
+            if checkpoint_state is None:
+                if not bool(getattr(self.args, 'inference_only', False)):
+                    raise ValueError(
+                        'Legacy safe checkpoint does not contain buffer '
+                        'num_seen_examples and cannot be used for training resume. '
+                        'It remains valid for inference-only evaluation.'
+                    )
+                self.buffer.num_seen_examples = (
+                    buffer_attributes['examples'].shape[0]
+                    if buffer_attributes
+                    else 0
+                )
+                self.buffer._checkpoint_selection_state_restored = False
+                logging.warning(
+                    'Loaded a legacy buffer without num_seen_examples for '
+                    'inference only; replay continuation is disabled.'
+                )
+                return
+
+            version = checkpoint_state.get('version')
+            if version != BUFFER_CHECKPOINT_STATE_VERSION:
+                raise ValueError(f'Unsupported buffer checkpoint state version: {version}')
+            strategy = checkpoint_state.get('sample_selection_strategy')
+            if strategy != self.buffer.sample_selection_strategy:
+                raise ValueError(
+                    'Buffer sample selection strategy mismatch: '
+                    f'checkpoint={strategy}, runtime={self.buffer.sample_selection_strategy}'
+                )
+            num_seen_examples = checkpoint_state.get('num_seen_examples')
+            if not isinstance(num_seen_examples, int) or num_seen_examples < 0:
+                raise ValueError('Invalid buffer num_seen_examples in checkpoint')
+            if num_seen_examples > 0 and not buffer_attributes:
+                raise ValueError(
+                    'Buffer checkpoint reports seen examples but contains no examples tensor'
+                )
+            self.buffer.num_seen_examples = num_seen_examples
+
+            selector_state = checkpoint_state.get('sample_selection_state', {})
+            for key, value in selector_state.items():
+                if not hasattr(self.buffer.sample_selection_fn, key):
+                    raise ValueError(f'Unsupported sample selection state field: {key}')
+                current_value = getattr(self.buffer.sample_selection_fn, key)
+                if isinstance(current_value, torch.Tensor):
+                    if not isinstance(value, torch.Tensor) or value.shape != current_value.shape:
+                        raise ValueError(f'Invalid sample selection state tensor: {key}')
+                    value = value.to(self.buffer.sample_selection_fn.device)
+                setattr(self.buffer.sample_selection_fn, key, value)
+            self.buffer._checkpoint_selection_state_restored = True
         else:
             raise ValueError("Buffer type not recognized")
 

@@ -21,6 +21,16 @@ if TYPE_CHECKING:
     from backbone import MammothBackbone
 
 
+BUFFER_CHECKPOINT_STATE_KEY = '__buffer_checkpoint_state__'
+BUFFER_CHECKPOINT_STATE_VERSION = 1
+_SAMPLE_SELECTION_STATE_FIELDS = (
+    'importance_scores',
+    'balance_scores',
+    'scores',
+    'unique_map',
+)
+
+
 def icarl_replay(self: 'ContinualModel', dataset: 'ContinualDataset', val_set_split=0):
     """
     Merge the replay buffer with the current task data.
@@ -183,8 +193,22 @@ class LARSSampling(BaseSampleSelection):
 
     def normalize_scores(self, values: torch.Tensor):
         if values.shape[0] > 0:
-            if values.max() - values.min() != 0:
-                values = (values - values.min()) / ((values.max() - values.min()) + 1e-9)
+            # Safe checkpoints historically did not serialize the selector's
+            # importance scores.  On resume, unvisited slots therefore still
+            # contain ``-inf`` while the first replay batch has finite values.
+            # Mixing both in min/max normalization produces NaNs and makes
+            # ``numpy.random.choice`` fail.  Give missing slots a neutral
+            # finite score; model-specific loaders may subsequently rebuild
+            # all scores from the restored model and buffer.
+            finite = torch.isfinite(values)
+            if not finite.any():
+                return torch.ones_like(values)
+            if not finite.all():
+                values = values.clone()
+                values[~finite] = values[finite].mean()
+            value_range = values.max() - values.min()
+            if value_range != 0:
+                values = (values - values.min()) / (value_range + 1e-9)
             return values
         else:
             return None
@@ -260,7 +284,7 @@ class ABSSampling(LARSSampling):
         current_scores, past_scores = None, None
         if past_importance is not None:
             past_importance = 1 - past_importance
-            past_scores = past_importance / past_importance.sum()
+            past_scores = past_importance / (past_importance.sum() + 1e-9)
         if current_importance is not None:
             if current_importance.sum() == 0:
                 current_importance += 1e-9
@@ -365,7 +389,28 @@ class Buffer:
         Returns:
             A dictionary containing the buffer attributes.
         """
-        return {attr_str: getattr(self, attr_str).to(out_device) for attr_str in self.attributes if hasattr(self, attr_str)}
+        serialized = {
+            attr_str: getattr(self, attr_str).to(out_device)
+            for attr_str in self.attributes
+            if hasattr(self, attr_str)
+        }
+        sample_selection_state = {}
+        for field in _SAMPLE_SELECTION_STATE_FIELDS:
+            if not hasattr(self.sample_selection_fn, field):
+                continue
+            value = getattr(self.sample_selection_fn, field)
+            if isinstance(value, torch.Tensor):
+                value = value.detach().to(out_device).clone()
+            elif isinstance(value, np.ndarray):
+                value = value.copy()
+            sample_selection_state[field] = value
+        serialized[BUFFER_CHECKPOINT_STATE_KEY] = {
+            'version': BUFFER_CHECKPOINT_STATE_VERSION,
+            'num_seen_examples': int(self.num_seen_examples),
+            'sample_selection_strategy': self.sample_selection_strategy,
+            'sample_selection_state': sample_selection_state,
+        }
+        return serialized
 
     def to(self, device):
         """

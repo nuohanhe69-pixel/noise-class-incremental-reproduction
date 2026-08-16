@@ -1,4 +1,5 @@
 from typing import Union
+import copy
 from sklearn.mixture import GaussianMixture
 import torch
 from torch import nn
@@ -392,6 +393,59 @@ class DGC(ErAceAerAbs):
 
         self.ogc_loss_weight = args.ogc_loss_weight
         self.current_batch_idx = 0
+
+    @torch.no_grad()
+    def load_buffer(self, buffer):
+        """Restore task-boundary state omitted by legacy safe checkpoints."""
+        super().load_buffer(buffer)
+
+        selector = getattr(self.buffer, 'sample_selection_fn', None)
+        selection_state_restored = bool(
+            getattr(self.buffer, '_checkpoint_selection_state_restored', False)
+        )
+        if (
+            selector is not None
+            and hasattr(selector, 'importance_scores')
+            and not self.buffer.is_empty()
+            and not selection_state_restored
+        ):
+            all_buffer_data = self.buffer.get_all_data(device=self.device)
+            images, labels = all_buffer_data[0], all_buffer_data[1]
+            rebuilt_scores = []
+            was_training = self.net.training
+            self.net.eval()
+            for start in range(0, len(images), self.args.batch_size):
+                normalized = apply_transform(
+                    images[start:start + self.args.batch_size],
+                    self.normalization_transform,
+                )
+                logits = self.net(normalized)
+                rebuilt_scores.append(
+                    self.loss(
+                        logits,
+                        labels[start:start + self.args.batch_size],
+                        reduction='none',
+                    ).detach()
+                )
+            self.net.train(was_training)
+
+            rebuilt_scores = torch.cat(rebuilt_scores)
+            selector.importance_scores.fill_(rebuilt_scores.mean())
+            selector.importance_scores[:len(rebuilt_scores)] = rebuilt_scores.to(
+                selector.importance_scores.device,
+            )
+            if not torch.isfinite(selector.importance_scores).all():
+                raise ValueError('failed to rebuild finite ABS importance scores from checkpoint')
+
+        # AER reloads this snapshot at fitting epochs.  It is not part of old
+        # checkpoints, so reconstruct it from the just-loaded task-boundary net.
+        self.past_model_ckpt = copy.deepcopy(self.net.state_dict())
+        if self.n_seen_classes > 0:
+            self.seen_so_far = torch.arange(
+                self.n_seen_classes,
+                dtype=torch.long,
+                device=self.device,
+            )
 
     @torch.no_grad() 
     def _reset_ogc_state_for_new_task(self): 

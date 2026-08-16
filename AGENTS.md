@@ -167,7 +167,7 @@ mammoth_code/
 | `utils/buffer.py` | replay buffer 和采样策略 | 是 | rehearsal models | 高 | 已阅读 | 支持 reservoir/lars/labrs/abs/balancoir |
 | `utils/loss_trace.py` | 可选的逐样本 loss 和四组 iteration 曲线记录 | 启用参数时 | AER/ABS、DGC | 中 | 单元与 debug 训练已验证 | 默认关闭；要求 synthetic noise 的 `true_labels` |
 | `scripts/plot_loss_trace.py` | 从 `iteration_curves.csv` 生成四线图 | 手工运行 | 用户/实验脚本 | 低 | 语法已验证 | 需要可选依赖 matplotlib |
-| `utils/checkpoints.py` | checkpoint 保存/加载 | 是 | `main.py`, `training.py` | 高 | 真实 debug checkpoint 已验证 | safe checkpoint 保存 args/results/buffer；`dgc-sap` 额外保存/恢复 `sap_state` |
+| `utils/checkpoints.py` | checkpoint 保存/加载 | 是 | `main.py`, `training.py` | 高 | 真实 CIFAR10 非空 buffer 跨 Task 恢复已验证 | safe checkpoint 保存 args/results/buffer；buffer 同时保存累计见样本数与采样器状态；`dgc-sap` 额外保存/恢复 `sap_state` |
 | `readme_latest.md` | 当前主要运行说明 | 是，文档参考 | 人/Agent | 中 | 已阅读 | 不得直接覆盖 |
 | `README.md` | 上游 Mammoth + 历史片段 | 辅助 | 人/Agent | 中 | 已阅读 | 有旧命令与当前代码差异 |
 | `checkpoints/1.py` | 硬编码权重转换脚本 | 否/辅助 | 手工运行 | 高 | 已阅读 | 不要直接执行或改源/目标路径 |
@@ -589,6 +589,14 @@ safe checkpoint 包含：
 model, optimizer, scheduler, args, results, buffer（若模型有 buffer_size）
 ```
 
+2026-08-14 起，新 safe checkpoint 的 `buffer` 还包含版本化恢复状态：
+
+```text
+num_seen_examples, sample_selection_strategy, sample_selection_state
+```
+
+其中 ABS/LARS 会保存 `importance_scores`，避免恢复后替换概率和采样权重被重置。旧 safe checkpoint 不含 `num_seen_examples`，只允许 `--inference_only 1` 评估；训练续跑会 fail-closed 并明确报错，不能再静默把累计计数设为 buffer 容量。
+
 加载流程：
 
 ```text
@@ -833,7 +841,7 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 | T2 | `main.py --help` 输出是否完整 | 已在 `nrgp-mammoth` 中确认 loss trace 及 `dgc-sap` 参数进入 parser | 后续新增参数时继续做 CLI smoke test | 已验证本次新增参数 |
 | T3 | CIFAR100 数据准备状态 | 未发现 `data/CIFAR100`，但有 CIFAR100 checkpoint | 检查服务器/外层数据包或运行只读数据路径检查 | 待确认 |
 | T4 | NTU60 是否可跑通 | `seq-ntu60` 存在，数据缺失；文档已改用注册模型 `dgc` | 准备 `data/NTU60_CS.npz` 后测试 DGC | 数据待准备 |
-| T7 | checkpoint 恢复训练是否能自动从正确 task 继续 | 代码需要 `start_from` 建 task 状态，未实测 | 用小型 debug checkpoint 验证恢复 | 尚未验证 |
+| T7 | checkpoint 恢复训练是否能自动从正确 task 继续 | `start_from` 建 task 状态；新 safe checkpoint 保存 buffer 累计计数和采样器状态 | 已用真实 CIFAR10 非空 ABS buffer 从 Task 1 checkpoint 恢复 Task 2，计数48→96且旧/新 Task 各48张 | 已验证；旧 safe checkpoint 仅允许推理 |
 | T8 | CIFAR10 asymmetric noisy label cache | 当前只发现 symmetric 20/40 cache | 检查运行日志或重新生成前先备份/记录 seed | 待确认 |
 | T9 | 多 seed 正式结果 | `readme_latest.md` 建议 seed 0/152，结果记录不完整 | 汇总 `logs.pyd` 和外层报告 | 待确认 |
 | T10 | `readme_latest.md` 是否需要同步修正 NTU60 命令 | 本次任务不允许修改 | 向用户建议单独授权更新 | 待确认 |
@@ -845,6 +853,7 @@ train(): 如有 --loadcheck，再加载 model/buffer/results
 
 | 日期 | 修改内容 | 修改原因 | 验证情况 |
 |---|---|---|---|
+| 2026-08-14 | safe checkpoint 增加版本化 buffer 累计计数/采样器状态；旧格式训练恢复 fail-closed；SAP candidate gate 对 NaN/Inf、诊断样本不足和已见 replay Task 缺失 fail-closed | 修复中断恢复后 `num_seen_examples` 重置导致旧 buffer 被覆盖，以及稀疏旧 Task 产生 NaN 后安全门错误放行 | 48 个 unittest、`py_compile`、真实 Task 2 历史 buffer 只读兼容检查、真实 CIFAR10 空/非空 buffer 跨 Task debug 恢复通过 |
 | 2026-08-14 | 新增独立 `dgc-sap`：论文式 SAP 数学、ResNet18 `layer3/layer4` pre-hook/Gram 投影、seen-class CE + Robust GMM、持久 reference、事务/dry-run/回滚、checkpoint、投影/replay 诊断和 CIFAR100 服务器脚本 | 在干净 Baseline+DGC 上重新接入可验证 SAP，且不恢复旧 CBP/旧 SAP | 31 个单元测试通过；真实 CIFAR10 数据验证 10 层 patch/投影、Symm40 checkpoint GMM（30 references、fallback=0、诊断纯度1.0）、dry-run/提交/回滚、500张 replay 三档诊断、5个 test Task 即时准确率 delta 和 safe checkpoint恢复；CIFAR100 smoke/full 待 RTX4090 运行 |
 | 2026-08-12 | 删除旧 CBP/SAP 活跃与历史代码，将原主模型重构为注册名 `dgc` 的纯 Baseline+DGC | 用户审核通过完整删除范围，先建立可验证的干净 DGC 基线，再重新接入 SAP | `py_compile`、注册/CLI 检查、3 个 loss trace unittest、Seq-CIFAR10 两任务 debug smoke 通过；结果与删除前 `ogc-sap --enable_sap 0` 完全一致 |
 | 2026-07-31 | 新增 iteration 级逐样本 CE loss、动态 noisy/hard-old/easy-old/new 聚合、CSV 输出和绘图脚本 | 用户要求将 Figure 1 扩展为四线图，并保留 task/epoch/iteration/sample/buffer/class/loss 级数据 | 3 个 unittest 通过；`er-ace-aer-abs` 与当时的旧主模型均完成 Seq-CIFAR10 两任务 debug 端到端验证；绘图脚本因当前环境缺 matplotlib 仅完成语法/CLI 验证 |

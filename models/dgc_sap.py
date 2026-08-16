@@ -287,6 +287,10 @@ class DgcSap(DGC):
                 seen_classes=self.n_seen_classes,
                 test_task_batch_factories=self._test_task_batch_factories(dataset),
                 enforce_candidate_safety=True,
+                required_replay_task_names={
+                    f'replay_task_{task_id}'
+                    for task_id in range(self.current_task + 1)
+                },
             )
             if transaction.committed:
                 self.past_model_ckpt = copy.deepcopy(self.net.state_dict())

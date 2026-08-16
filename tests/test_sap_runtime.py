@@ -72,6 +72,116 @@ class SAPRuntimeTests(unittest.TestCase):
 
         self.assertTrue(decision.accepted)
 
+    def test_candidate_safety_gate_rejects_insufficient_replay_samples(self):
+        empty_group = SAPLossGroupComparison(
+            sample_count=0,
+            mean_loss_before=float('nan'),
+            mean_loss_after=float('nan'),
+            mean_loss_delta=float('nan'),
+            accuracy_before=float('nan'),
+            accuracy_after=float('nan'),
+            accuracy_delta=float('nan'),
+            prediction_flip_rate=float('nan'),
+        )
+        one_sample_group = SAPLossGroupComparison(
+            sample_count=1,
+            mean_loss_before=0.1,
+            mean_loss_after=0.1,
+            mean_loss_delta=0.0,
+            accuracy_before=1.0,
+            accuracy_after=1.0,
+            accuracy_delta=0.0,
+            prediction_flip_rate=0.0,
+        )
+        sparse = SAPModelComparison(
+            sample_count=1,
+            mean_abs_logits_delta=0.1,
+            max_abs_logits_delta=0.2,
+            prediction_flip_rate=0.0,
+            loss_tertiles={
+                'low': one_sample_group,
+                'mid': empty_group,
+                'high': empty_group,
+            },
+        )
+
+        decision = assess_sap_candidate(
+            {'layer': SimpleNamespace(weight_norm_ratio=0.8)},
+            {'reference': self._comparison(1.0, 1.0), 'replay_task_0': sparse},
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertIn(
+            'INSUFFICIENT_DIAGNOSTIC_SAMPLES:replay_task_0',
+            decision.rejection_reasons,
+        )
+
+    def test_candidate_safety_gate_rejects_non_finite_replay_delta(self):
+        finite_group = SAPLossGroupComparison(
+            sample_count=1,
+            mean_loss_before=0.1,
+            mean_loss_after=0.1,
+            mean_loss_delta=0.0,
+            accuracy_before=1.0,
+            accuracy_after=1.0,
+            accuracy_delta=0.0,
+            prediction_flip_rate=0.0,
+        )
+        non_finite_group = SAPLossGroupComparison(
+            sample_count=1,
+            mean_loss_before=0.2,
+            mean_loss_after=0.2,
+            mean_loss_delta=0.0,
+            accuracy_before=float('nan'),
+            accuracy_after=float('nan'),
+            accuracy_delta=float('nan'),
+            prediction_flip_rate=0.0,
+        )
+        comparison = SAPModelComparison(
+            sample_count=3,
+            mean_abs_logits_delta=0.1,
+            max_abs_logits_delta=0.2,
+            prediction_flip_rate=0.0,
+            loss_tertiles={
+                'low': finite_group,
+                'mid': non_finite_group,
+                'high': finite_group,
+            },
+        )
+
+        decision = assess_sap_candidate(
+            {'layer': SimpleNamespace(weight_norm_ratio=0.8)},
+            {
+                'reference': self._comparison(1.0, 1.0),
+                'replay_task_0': comparison,
+            },
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertIn(
+            'NON_FINITE_ACCURACY_DELTA:replay_task_0',
+            decision.rejection_reasons,
+        )
+
+    def test_candidate_safety_gate_rejects_missing_seen_replay_task(self):
+        decision = assess_sap_candidate(
+            {'layer': SimpleNamespace(weight_norm_ratio=0.8)},
+            {
+                'reference': self._comparison(1.0, 1.0),
+                'replay_task_0': self._comparison(0.9, 0.9),
+                'replay_task_2': self._comparison(0.9, 0.9),
+            },
+            required_replay_task_names={
+                'replay_task_0', 'replay_task_1', 'replay_task_2',
+            },
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertIn(
+            'MISSING_REPLAY_TASK:replay_task_1',
+            decision.rejection_reasons,
+        )
+
     def _memory_with_two_classes(self, source='GMM_MAIN'):
         memory = SAPReferenceMemory()
         count = 240
