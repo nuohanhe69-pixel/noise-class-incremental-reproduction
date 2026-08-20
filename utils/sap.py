@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -423,3 +423,202 @@ def project_resnet18_from_reference_batches(
         del gram_stats, projection, projection_spectrum, projected
 
     return stats
+
+
+# -----------------------------------------------------------------------------
+# Linear (e.g. classifier) primitives used by the oracle task-boundary SAP.
+#
+# Oracle mode bypasses Robust GMM / promotion / safety gates and projects a
+# single ``nn.Linear`` whose layer is the official ``pre`` location (the input
+# fed into the classifier after global average pooling + flatten, i.e. one
+# feature vector per image). These primitives mirror the existing conv path:
+# stream the activation Gram from a forward pre-hook, then apply the official
+# input-side projection ``W' = W @ Mᵀ`` while leaving the bias untouched.
+# -----------------------------------------------------------------------------
+
+
+def _resolve_classifier_module(model: nn.Module) -> nn.Linear:
+    """Find the classifier Linear submodule under the (possibly Data)) backbone.
+
+    Supports the Mammoth ResNet naming (``classifier``) and the official SAP
+    ResNet_cifar naming (``fc``). Returns the first matching nn.Linear.
+    """
+    backbone = _unwrap_parallel_model(model)
+    for name in ('classifier', 'fc'):
+        try:
+            module = backbone.get_submodule(name)
+        except AttributeError:
+            continue
+        if isinstance(module, nn.Linear):
+            return module
+    raise ValueError('model does not provide an nn.Linear classifier or fc module')
+
+
+def collect_classifier_input_gram(
+    model: nn.Module,
+    batches: Iterable[Tensor],
+    *,
+    total_images: int,
+) -> Tensor:
+    """Return the streaming input Gram matrix of the classifier's input.
+
+    Equivalent to ``XᵀX`` where ``X`` stacks every captured feature vector, but
+    never materialises ``X`` (one feature per image; ~10k vectors of dimension
+    in_features). Returns a tensor of shape ``[in_features, in_features]`` on
+    the model's device.
+
+    Args:
+        model: the network containing the classifier (or fc) module.
+        batches: iterable of already-normalized input tensors of shape
+            ``[N, C, H, W]``; typically obtained from
+            ``model._normalized_batches`` or equivalent.
+        total_images: exact number of images expected across all batches
+            (used as a sanity check).
+    """
+    if total_images <= 0:
+        raise ValueError('total_images must be positive')
+
+    target_module = _resolve_classifier_module(model)
+
+    captured: list[Tensor] = []
+
+    def capture_inputs(_module: nn.Module, args: tuple) -> None:
+        if not args:
+            raise RuntimeError('classifier received no positional input')
+        feats = args[0].detach()
+        if not feats.is_floating_point():
+            raise TypeError('classifier input must be a floating-point tensor')
+        captured.append(feats)
+
+    handle = target_module.register_forward_pre_hook(capture_inputs)
+    training_states = {module: module.training for module in model.modules()}
+    try:
+        model.eval()
+        seen = 0
+        with torch.no_grad():
+            for batch in batches:
+                if not isinstance(batch, Tensor):
+                    raise TypeError('each batch must be a prepared input Tensor')
+                model(batch)
+                seen += batch.shape[0]
+        if seen != total_images:
+            raise ValueError(
+                f'batches contain {seen} images but total_images is {total_images}'
+            )
+    finally:
+        handle.remove()
+        for module, was_training in training_states.items():
+            module.training = was_training
+
+    if not captured:
+        raise ValueError('no classifier input was captured')
+
+    features = torch.cat(captured, dim=0)
+    gram = features.transpose(0, 1) @ features
+    if not torch.isfinite(gram).all():
+        raise ValueError('classifier input Gram contains NaN or Inf')
+    return gram
+
+
+def collect_classifier_input_features(
+    model: nn.Module,
+    batches: Iterable[Tensor],
+    *,
+    total_images: int,
+) -> Tensor:
+    """Capture the classifier input feature tensor for every image.
+
+    Returns a single tensor of shape ``[total_images, in_features]``. Use this
+    when the caller also needs the per-image features (for example, to compute
+    before/after logit diagnostics on the reference set).
+    """
+    if total_images <= 0:
+        raise ValueError('total_images must be positive')
+
+    target_module = _resolve_classifier_module(model)
+
+    captured: list[Tensor] = []
+
+    def capture_inputs(_module: nn.Module, args: tuple) -> None:
+        if not args:
+            raise RuntimeError('classifier received no positional input')
+        feats = args[0].detach()
+        if not feats.is_floating_point():
+            raise TypeError('classifier input must be a floating-point tensor')
+        captured.append(feats)
+
+    handle = target_module.register_forward_pre_hook(capture_inputs)
+    training_states = {module: module.training for module in model.modules()}
+    try:
+        model.eval()
+        seen = 0
+        with torch.no_grad():
+            for batch in batches:
+                if not isinstance(batch, Tensor):
+                    raise TypeError('each batch must be a prepared input Tensor')
+                model(batch)
+                seen += batch.shape[0]
+        if seen != total_images:
+            raise ValueError(
+                f'batches contain {seen} images but total_images is {total_images}'
+            )
+    finally:
+        handle.remove()
+        for module, was_training in training_states.items():
+            module.training = was_training
+
+    if not captured:
+        raise ValueError('no classifier input was captured')
+    features = torch.cat(captured, dim=0)
+    if features.shape[0] != total_images:
+        raise ValueError(
+            f'collected {features.shape[0]} features but total_images is {total_images}'
+        )
+    if not torch.isfinite(features).all():
+        raise ValueError('classifier input features contain NaN or Inf')
+    return features
+
+
+def project_linear_weight(
+    weight: Tensor,
+    projection: Tensor,
+) -> Tuple[Tensor, dict]:
+    """Apply the official SAP input-side projection ``W' = W @ Mᵀ``.
+
+    Mirrors the math in ``project_conv2d_weight`` for an ``nn.Linear`` weight
+    ``W`` of shape ``[out_features, in_features]``. The bias (if any) is
+    intentionally **not** touched here — it lives in the output space and is
+    unaffected by input-side projection.
+
+    Returns the projected weight and a small stats dict:
+    ``relative_weight_delta`` (||W'-W||/||W||) and ``weight_norm_ratio``
+    (||W'||/||W||).
+    """
+    if weight.ndim != 2:
+        raise ValueError(f'Linear weight must be 2-D, got shape {tuple(weight.shape)}')
+    if projection.ndim != 2:
+        raise ValueError(f'projection must be 2-D, got shape {tuple(projection.shape)}')
+    expected_dim = (weight.shape[1], weight.shape[1])
+    if projection.shape != expected_dim:
+        raise ValueError(
+            f'projection shape {tuple(projection.shape)} does not match '
+            f'flattened Linear input dimension {expected_dim[0]}'
+        )
+    if projection.device != weight.device:
+        raise ValueError('projection and weight must be on the same device')
+    if not projection.is_floating_point():
+        raise TypeError('projection must use a floating-point dtype')
+    if not torch.isfinite(projection).all():
+        raise ValueError('projection contains NaN or Inf')
+
+    projected = weight @ projection.to(dtype=weight.dtype).transpose(0, 1)
+    if not torch.isfinite(projected).all():
+        raise ValueError('SAP projection produced NaN or Inf')
+
+    denominator = weight.norm().clamp_min(torch.finfo(weight.dtype).eps)
+    delta = ((projected - weight).norm() / denominator).item()
+    ratio = (projected.norm() / denominator).item()
+    return projected, {
+        'relative_weight_delta': delta,
+        'weight_norm_ratio': ratio,
+    }
