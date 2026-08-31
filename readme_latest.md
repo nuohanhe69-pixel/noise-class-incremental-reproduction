@@ -270,6 +270,42 @@ python main.py --model er-ace-aer-abs --savecheck last --seed 0 ${COMMON_ARGS}
 python main.py --model dgc --ogc_loss_weight 0.3 --ogc_low_conf_weight 0.3 --ogc_buffer_penalty_coeff 2.0 --savecheck last --seed 0 ${COMMON_ARGS}
 ```
 
+## Oracle Task-Boundary SAP（上限实验）
+
+测试 SAP **选样环节**的理论上限：参考集换成 oracle（当前 task 真干净样本 + buffer 中旧 task 真干净样本），仅对最终 classifier（`nn.Linear`）做输入侧投影；完全跳过 Robust GMM / promotion / reference 门控 / 安全检查。投影目标仅为 classifier，依赖 `task_dataset.true_labels` 和 `buffer.true_labels`（synthetic noise 路径下默认会存）。
+
+> 与 v3（layer3/layer4 十个 conv 投影）相比，本实验同时改变了参考集（oracle 化）与投影层（conv → Linear）。解读时需注意归因；如需分离可后续补"conv + oracle"臂。
+
+### 命令
+
+```bash
+# 推荐 scale 默认 100（512 维 Gram 能量比 conv 集中得多，30000 会近似恒等）
+python main.py --dataset seq-cifar10 --model dgc-sap --noise_rate 0.2 --noise_type symm \
+  --sap_oracle_reference 1 --sap_oracle_scale 100 \
+  --savecheck last --seed 0 --backbone resnet18 --n_epochs 50 --batch_size 32 \
+  --lr 0.03 --buffer_size 500 --num_workers 4
+```
+
+### 参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--sap_oracle_reference` | 0 | 总开关：oracle 任务边界模式 |
+| `--sap_oracle_scale` | 100 | SAP 缩放 α（512 维 Gram 下 30000 近似恒等，强烈建议 ≤1000） |
+
+### 参考集构成
+
+- 当前 task 训练样本：`observed == true_labels`（CIFAR10 symm20% ≈ 8000 张）；
+- buffer 样本：`task_id != current_task` 且 `observed == true_labels`（CIFAR10 symm20% ≈ 几百张旧干净样本）。
+
+### 结果解读
+
+- 与 v3（Class-IL 65.15）基本持平 → 选样不是瓶颈，机制/超参是；
+- 明显高于 v3 → 选样有改进空间；
+- 低于 v3 → Linear-only 投影本身可能弱于 conv 投影，需重新审视层选择。
+
+事件日志状态记为 `SAP_ORACLE_EXECUTED`，记录参考集规模、buffer 过滤前后数量、谱统计、权重范数比与相对变化、参考集前后准确率。
+
 ## Ablation Commands
 
 以下命令用于保持同一组超参数，只切换 Baseline 与 DGC。
