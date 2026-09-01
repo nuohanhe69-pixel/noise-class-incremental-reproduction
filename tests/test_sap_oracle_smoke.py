@@ -13,7 +13,7 @@ import torch
 from torch import nn
 
 from backbone.ResNetBlock import resnet18
-from models.dgc_sap import DgcSap, SAP_FAILED, SAP_ORACLE_EXECUTED
+from models.dgc_sap import DgcSap, SAP_ORACLE_EXECUTED
 
 
 class _FakeTrainDataset:
@@ -128,8 +128,8 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
 
         # The classifier weight must have changed (projection is non-identity).
         weight_after = backbone.classifier.weight.detach()
-        self.assertFalse(torch.equal(weight_before[:2], weight_after[:2]))
-        self.assertTrue(torch.equal(weight_before[2:], weight_after[2:]))
+        self.assertFalse(torch.equal(weight_before, weight_after))
+        self.assertFalse(torch.equal(weight_before[2:], weight_after[2:]))
         # Bias must be untouched (oracle mode projects only the input side).
         bias_after = backbone.classifier.bias.detach()
         torch.testing.assert_close(bias_after, bias_before)
@@ -143,28 +143,33 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
         # All 32 task samples are clean after the 80% filter (we flipped 7 of 32).
         self.assertEqual(event['current_task_clean_count'], 25)
         self.assertEqual(event['total_reference_count'], 25)
-        self.assertEqual(event['per_class_reference_count'], [12, 13])
         self.assertEqual(event['buffer_total_count'], 0)
-        self.assertEqual(event['old_buffer_clean_count'], 0)
+        self.assertEqual(event['buffer_clean_count'], 0)
         self.assertEqual(event['gram_shape'], [backbone.classifier.in_features] * 2)
         self.assertGreater(event['gram_trace'], 0.0)
+        for statistic in ('min', 'median', 'mean', 'max'):
+            self.assertGreater(event[f'feature_norm_before_{statistic}'], 0.0)
+            self.assertAlmostEqual(
+                event[f'feature_norm_after_{statistic}'], 1.0, places=5,
+            )
         self.assertEqual(event['sap_alpha'], 100.0)
         self.assertEqual(event['n_seen_classes'], 2)
         self.assertEqual(event['total_classifier_rows'], 10)
-        self.assertEqual(event['max_future_row_delta'], 0.0)
         self.assertEqual(event['max_bias_delta'], 0.0)
         self.assertEqual(len(event['seen_task_accuracy_comparisons']), 1)
         self.assertIsNotNone(event['seen_average_accuracy_before'])
         self.assertIsNotNone(event['seen_average_accuracy_after'])
         # Weight stats should be sensible.
-        self.assertGreater(event['seen_relative_weight_delta'], 0.0)
-        self.assertGreater(event['seen_weight_norm_ratio'], 0.0)
+        self.assertGreater(event['relative_weight_delta'], 0.0)
+        self.assertGreater(event['weight_norm_ratio'], 0.0)
+        self.assertLessEqual(event['importance_min'], event['importance_median'])
+        self.assertLessEqual(event['importance_median'], event['importance_max'])
 
         # The AER restore snapshot must be the post-SAP task-boundary model.
         for name, value in backbone.state_dict().items():
             torch.testing.assert_close(model.past_model_ckpt[name], value)
 
-    def test_missing_seen_class_aborts_without_modifying_classifier(self):
+    def test_reference_set_is_not_rejected_when_a_seen_class_is_absent(self):
         true_labels = torch.zeros(8, dtype=torch.long)
         fake_train = _FakeTrainDataset(8, 2, true_labels, true_labels.clone())
 
@@ -203,10 +208,49 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
 
         model._run_oracle_classifier_sap(model.dataset)
 
-        self.assertTrue(torch.equal(before, backbone.classifier.weight))
-        self.assertEqual(model.sap_history[-1]['status'], SAP_FAILED)
-        self.assertEqual(model.sap_history[-1]['oracle_stage'], 'class_balanced_gram')
-        self.assertIn('missing seen classes: [1]', model.sap_history[-1]['error_message'])
+        self.assertFalse(torch.equal(before, backbone.classifier.weight))
+        self.assertEqual(model.sap_history[-1]['status'], SAP_ORACLE_EXECUTED)
+        self.assertEqual(model.sap_history[-1]['total_reference_count'], 8)
+
+    def test_reference_builder_keeps_every_oracle_clean_buffer_sample(self):
+        true_labels = torch.arange(8, dtype=torch.long) % 2
+        fake_train = _FakeTrainDataset(8, 2, true_labels, true_labels.clone())
+
+        class _Loader:
+            dataset = fake_train
+
+        class _Dataset:
+            train_loader = _Loader()
+
+        buffer_images = torch.randint(0, 256, (4, 3, 32, 32), dtype=torch.uint8)
+        buffer_labels = torch.tensor([0, 1, 2, 3])
+
+        class _Buffer:
+            true_labels = torch.tensor([0, 9, 2, 3])
+
+            @staticmethod
+            def is_empty():
+                return False
+
+            @staticmethod
+            def get_all_data(device='cpu'):
+                return buffer_images, buffer_labels
+
+        model = DgcSap.__new__(DgcSap)
+        nn.Module.__init__(model)
+        model.buffer = _Buffer()
+        model.dataset = _Dataset()
+        model._current_task = 1
+        model._n_classes_current_task = 2
+
+        images, labels, task_count, buffer_total, buffer_clean_count = \
+            model._build_oracle_reference_batches(model.dataset)
+
+        self.assertEqual(task_count, 8)
+        self.assertEqual(buffer_total, 4)
+        self.assertEqual(buffer_clean_count, 3)
+        self.assertEqual(len(images), 11)
+        self.assertEqual(len(labels), 11)
 
 
 if __name__ == '__main__':

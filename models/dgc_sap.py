@@ -12,7 +12,8 @@ import torch
 from models.dgc import DGC
 from utils.augmentations import apply_transform
 from utils.sap import (
-    collect_class_balanced_classifier_input_gram,
+    collect_classifier_input_features,
+    normalize_classifier_input_features,
     project_linear_weight,
     resolve_classifier_module,
 )
@@ -215,14 +216,11 @@ class DgcSap(DGC):
         label equals the true label (oracle cleanliness). For a CIFAR-10 task
         with symm-20% noise this gives ~8000 samples (10,000 × (1-noise_rate)).
 
-        Buffer: only samples whose ``task_id != current_task`` AND whose
-        observed label equals the true label. ``buffer.task_labels`` may be
-        absent when loss-trace is disabled; in that case we infer the task id
-        via ``labels // n_classes_per_task`` (same fallback as
-        ``_buffer_diagnostic_factories``).
+        Buffer: every sample whose observed label equals the true label. No
+        clean current-task or prior-task buffer reference is dropped.
 
-        True labels are returned with the images because the class-balanced
-        Gram groups every captured classifier-input feature by seen class.
+        Labels are returned purely for diagnostics; the projection itself
+        only consumes images.
         """
         task_dataset = dataset.train_loader.dataset
         images, observed_labels, sample_ids = extract_cifar_task_tensors(task_dataset)
@@ -241,7 +239,7 @@ class DgcSap(DGC):
         buffer_images = None
         buffer_true = None
         buffer_total = 0
-        buffer_old_count = 0
+        buffer_clean_count = 0
 
         if not self.buffer.is_empty():
             buf = self.buffer.get_all_data(device='cpu')
@@ -252,37 +250,29 @@ class DgcSap(DGC):
                 else:
                     raise ValueError('oracle mode requires buffer.true_labels to be set')
 
-                if hasattr(self.buffer, 'task_labels') and self.buffer.task_labels is not None:
-                    buf_task_id = self.buffer.task_labels[:len(buf_labels)].detach().cpu().long()
-                else:
-                    n_per_task = getattr(self.dataset, 'N_CLASSES_PER_TASK', None) \
-                        or max(1, self.n_classes_current_task)
-                    buf_task_id = (buf_labels.detach().cpu().long() // n_per_task)
-
                 buf_labels_cpu = buf_labels.detach().cpu().long()
                 clean = buf_labels_cpu == buf_true
-                old = buf_task_id != int(self.current_task)
-                keep = clean & old
+                keep = clean
                 buffer_images = buf_images[keep]
                 buffer_true = buf_true[keep]
                 buffer_total = int(buf_images.shape[0])
-                buffer_old_count = int(buffer_images.shape[0])
+                buffer_clean_count = int(buffer_images.shape[0])
 
-        if buffer_images is not None and buffer_old_count > 0:
+        if buffer_images is not None and buffer_clean_count > 0:
             all_images = torch.cat([task_images, buffer_images], dim=0)
             all_true_labels = torch.cat([task_true_labels, buffer_true], dim=0)
         else:
             all_images = task_images
             all_true_labels = task_true_labels
 
-        return all_images, all_true_labels, task_count, buffer_total, buffer_old_count
+        return all_images, all_true_labels, task_count, buffer_total, buffer_clean_count
 
     def _run_oracle_classifier_sap(self, dataset) -> None:
         """Oracle task-boundary SAP: project only the final classifier Linear.
 
         Procedure:
 
-        1. Build the oracle reference set (current task clean + buffer old clean).
+        1. Build the oracle reference set (current task clean + all buffer clean).
         2. Stream the classifier-input Gram matrix via the pre-hook.
         3. Build the input-side SAP projection matrix ``Mr`` (no truncation).
         4. Project the classifier weight in place; bias is untouched.
@@ -291,7 +281,7 @@ class DgcSap(DGC):
         6. Log a SAP_ORACLE_EXECUTED event with stats.
         """
         try:
-            all_images, all_true_labels, task_count, buffer_total, buffer_old_count = \
+            all_images, all_true_labels, task_count, buffer_total, buffer_clean_count = \
                 self._build_oracle_reference_batches(dataset)
         except Exception as error:
             self._record_sap_event(
@@ -311,24 +301,35 @@ class DgcSap(DGC):
             )
             return
 
+        batches_with_labels = list(self._normalized_batches(all_images, all_true_labels))
+
+        def image_batches():
+            for images, _labels in batches_with_labels:
+                yield images
+
         try:
-            gram_stats = collect_class_balanced_classifier_input_gram(
-                self.net,
-                self._normalized_batches(all_images, all_true_labels),
-                total_images=total_images,
-                seen_classes=self.n_seen_classes,
+            features = collect_classifier_input_features(
+                self.net, image_batches(), total_images=total_images,
             )
+            normalized_features, feature_norm_stats = \
+                normalize_classifier_input_features(features)
         except Exception as error:
             self._record_sap_event(
                 status=SAP_FAILED,
-                oracle_stage='class_balanced_gram',
+                oracle_stage='feature_collection',
                 error_type=type(error).__name__,
                 error_message=str(error),
             )
-            logging.exception('Oracle SAP: class-balanced Gram construction failed.')
+            logging.exception('Oracle SAP: classifier-input feature collection failed.')
             return
 
-        gram = gram_stats.gram
+        gram = normalized_features.transpose(0, 1) @ normalized_features
+        if not torch.isfinite(gram).all():
+            self._record_sap_event(
+                status=SAP_FAILED,
+                oracle_stage='non_finite_gram',
+            )
+            return
 
         try:
             projection, energy, normalized_energy, importance = \
@@ -369,11 +370,7 @@ class DgcSap(DGC):
             logging.exception('Oracle SAP: pre-projection seen-task evaluation failed.')
             return
         try:
-            projected_weight, weight_stats = project_linear_weight(
-                weight_before,
-                projection,
-                n_seen_classes=self.n_seen_classes,
-            )
+            projected_weight, weight_stats = project_linear_weight(weight_before, projection)
         except Exception as error:
             self._record_sap_event(
                 status=SAP_FAILED,
@@ -435,11 +432,18 @@ class DgcSap(DGC):
             projection_target='classifier',
             total_reference_count=total_images,
             current_task_clean_count=task_count,
-            old_buffer_clean_count=buffer_old_count,
-            per_class_reference_count=list(gram_stats.per_class_counts),
+            buffer_clean_count=buffer_clean_count,
             buffer_total_count=buffer_total,
             gram_shape=list(gram.shape),
             gram_trace=gram.trace().item(),
+            feature_norm_before_min=feature_norm_stats['before']['min'],
+            feature_norm_before_median=feature_norm_stats['before']['median'],
+            feature_norm_before_mean=feature_norm_stats['before']['mean'],
+            feature_norm_before_max=feature_norm_stats['before']['max'],
+            feature_norm_after_min=feature_norm_stats['after']['min'],
+            feature_norm_after_median=feature_norm_stats['after']['median'],
+            feature_norm_after_mean=feature_norm_stats['after']['mean'],
+            feature_norm_after_max=feature_norm_stats['after']['max'],
             gram_eigenvalue_min=energy.min().item(),
             gram_eigenvalue_max=energy.max().item(),
             normalized_energy_min=normalized_energy.min().item(),
@@ -452,11 +456,8 @@ class DgcSap(DGC):
             importance_trace=importance.sum().item(),
             n_seen_classes=int(self.n_seen_classes),
             total_classifier_rows=int(classifier.weight.shape[0]),
-            seen_weight_norm_before=weight_stats['seen_weight_norm_before'],
-            seen_weight_norm_after=weight_stats['seen_weight_norm_after'],
-            seen_relative_weight_delta=weight_stats['relative_weight_delta'],
-            seen_weight_norm_ratio=weight_stats['weight_norm_ratio'],
-            max_future_row_delta=weight_stats['max_future_row_delta'],
+            relative_weight_delta=weight_stats['relative_weight_delta'],
+            weight_norm_ratio=weight_stats['weight_norm_ratio'],
             max_bias_delta=max_bias_delta,
             seen_task_accuracy_comparisons=task_accuracy_comparisons,
             seen_average_accuracy_before=seen_average_before,

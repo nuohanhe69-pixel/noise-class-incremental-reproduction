@@ -57,12 +57,6 @@ class SAPLayerProjectionStats:
     decomposition_seconds: float
 
 
-@dataclass(frozen=True)
-class SAPClassBalancedGramStats:
-    gram: Tensor
-    per_class_counts: tuple[int, ...]
-
-
 def _unwrap_parallel_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, (nn.DataParallel, nn.parallel.DistributedDataParallel)) else model
 
@@ -460,34 +454,20 @@ def resolve_classifier_module(model: nn.Module) -> nn.Linear:
     raise ValueError('model does not provide an nn.Linear classifier or fc module')
 
 
-def collect_class_balanced_classifier_input_gram(
+def collect_classifier_input_features(
     model: nn.Module,
-    batches: Iterable[tuple[Tensor, Tensor]],
+    batches: Iterable[Tensor],
     *,
     total_images: int,
-    seen_classes: int,
-) -> SAPClassBalancedGramStats:
-    """Stream the equally class-weighted Gram of classifier-input features.
-
-    For each seen class ``c``, this accumulates every available feature outer
-    product and returns ``mean_c(X_c.T @ X_c / N_c)``. Feature batches are
-    released after their forward pass; no sampling or long-lived concatenated
-    feature tensor is used.
-    """
+) -> Tensor:
+    """Capture every classifier-input feature without changing normal forward."""
     if total_images <= 0:
         raise ValueError('total_images must be positive')
-    if seen_classes <= 0:
-        raise ValueError('seen_classes must be positive')
 
     target_module = resolve_classifier_module(model)
-
-    gram_sums: list[Tensor | None] = [None] * seen_classes
-    per_class_counts = [0] * seen_classes
-    current_labels = None
-    captures_in_batch = 0
+    captured: list[Tensor] = []
 
     def capture_inputs(_module: nn.Module, args: tuple) -> None:
-        nonlocal captures_in_batch
         if not args:
             raise RuntimeError('classifier received no positional input')
         feats = args[0].detach()
@@ -498,26 +478,7 @@ def collect_class_balanced_classifier_input_gram(
                 'classifier input must have shape '
                 f'[batch, {target_module.in_features}], got {tuple(feats.shape)}'
             )
-        if current_labels is None or len(current_labels) != len(feats):
-            raise ValueError('classifier feature and label batch sizes do not match')
-        captures_in_batch += 1
-        if captures_in_batch != 1:
-            raise RuntimeError('classifier was invoked more than once for one reference batch')
-
-        labels = current_labels.to(feats.device).long().reshape(-1)
-        invalid = labels[(labels < 0) | (labels >= seen_classes)].unique().tolist()
-        if invalid:
-            raise ValueError(
-                f'oracle reference labels outside seen class range: {invalid}'
-            )
-        for class_id in labels.unique(sorted=True).tolist():
-            class_features = feats[labels == class_id]
-            batch_gram = class_features.transpose(0, 1) @ class_features
-            gram_sums[class_id] = (
-                batch_gram if gram_sums[class_id] is None
-                else gram_sums[class_id] + batch_gram
-            )
-            per_class_counts[class_id] += int(class_features.shape[0])
+        captured.append(feats)
 
     handle = target_module.register_forward_pre_hook(capture_inputs)
     training_states = {module: module.training for module in model.modules()}
@@ -525,14 +486,10 @@ def collect_class_balanced_classifier_input_gram(
         model.eval()
         seen = 0
         with torch.no_grad():
-            for batch, labels in batches:
-                if not isinstance(batch, Tensor) or not isinstance(labels, Tensor):
-                    raise TypeError('each batch must contain input and label tensors')
-                current_labels = labels
-                captures_in_batch = 0
+            for batch in batches:
+                if not isinstance(batch, Tensor):
+                    raise TypeError('each batch must be a prepared input Tensor')
                 model(batch)
-                if captures_in_batch != 1:
-                    raise RuntimeError('classifier input hook did not run exactly once')
                 seen += int(batch.shape[0])
         if seen != total_images:
             raise ValueError(
@@ -543,34 +500,52 @@ def collect_class_balanced_classifier_input_gram(
         for module, was_training in training_states.items():
             module.training = was_training
 
-    missing_classes = [
-        class_id for class_id, count in enumerate(per_class_counts) if count == 0
-    ]
-    if missing_classes:
+    if not captured:
+        raise ValueError('no classifier input was captured')
+    features = torch.cat(captured, dim=0)
+    if features.shape[0] != total_images:
         raise ValueError(
-            f'oracle reference is missing seen classes: {missing_classes}'
+            f'collected {features.shape[0]} features but total_images is {total_images}'
         )
+    if not torch.isfinite(features).all():
+        raise ValueError('classifier input features contain NaN or Inf')
+    return features
 
-    class_grams = [
-        gram_sum / per_class_counts[class_id]
-        for class_id, gram_sum in enumerate(gram_sums)
-    ]
-    gram = torch.stack(class_grams).mean(dim=0)
-    if not torch.isfinite(gram).all():
-        raise ValueError('classifier input Gram contains NaN or Inf')
-    return SAPClassBalancedGramStats(
-        gram=gram,
-        per_class_counts=tuple(per_class_counts),
-    )
+
+def normalize_classifier_input_features(features: Tensor) -> tuple[Tensor, dict]:
+    """L2-normalize each Linear input solely for Oracle SAP Gram construction."""
+    if features.ndim != 2:
+        raise ValueError(
+            f'classifier features must be 2-D, got shape {tuple(features.shape)}'
+        )
+    if not features.is_floating_point():
+        raise TypeError('classifier features must use a floating-point dtype')
+    if not torch.isfinite(features).all():
+        raise ValueError('classifier input features contain NaN or Inf')
+
+    norms_before = features.norm(p=2, dim=1)
+    normalized = F.normalize(features, p=2, dim=1)
+    norms_after = normalized.norm(p=2, dim=1)
+
+    def summarize(values: Tensor) -> dict[str, float]:
+        return {
+            'min': values.min().item(),
+            'median': values.median().item(),
+            'mean': values.mean().item(),
+            'max': values.max().item(),
+        }
+
+    return normalized, {
+        'before': summarize(norms_before),
+        'after': summarize(norms_after),
+    }
 
 
 def project_linear_weight(
     weight: Tensor,
     projection: Tensor,
-    *,
-    n_seen_classes: int,
 ) -> tuple[Tensor, dict]:
-    """Apply ``W_seen' = W_seen @ Mᵀ`` and preserve future rows exactly.
+    """Apply the original SAP input-side projection ``W' = W @ Mᵀ``.
 
     Mirrors the math in ``project_conv2d_weight`` for an ``nn.Linear`` weight
     ``W`` of shape ``[out_features, in_features]``. The bias (if any) is
@@ -583,10 +558,6 @@ def project_linear_weight(
     """
     if weight.ndim != 2:
         raise ValueError(f'Linear weight must be 2-D, got shape {tuple(weight.shape)}')
-    if not 0 < n_seen_classes <= weight.shape[0]:
-        raise ValueError(
-            f'n_seen_classes must be in [1, {weight.shape[0]}], got {n_seen_classes}'
-        )
     if projection.ndim != 2:
         raise ValueError(f'projection must be 2-D, got shape {tuple(projection.shape)}')
     expected_dim = (weight.shape[1], weight.shape[1])
@@ -602,23 +573,14 @@ def project_linear_weight(
     if not torch.isfinite(projection).all():
         raise ValueError('projection contains NaN or Inf')
 
-    seen_before = weight[:n_seen_classes]
-    seen_projected = seen_before @ projection.to(dtype=weight.dtype).transpose(0, 1)
-    projected = weight.clone()
-    projected[:n_seen_classes] = seen_projected
+    projected = weight @ projection.to(dtype=weight.dtype).transpose(0, 1)
     if not torch.isfinite(projected).all():
         raise ValueError('SAP projection produced NaN or Inf')
 
-    denominator = seen_before.norm().clamp_min(torch.finfo(weight.dtype).eps)
-    delta = ((seen_projected - seen_before).norm() / denominator).item()
-    ratio = (seen_projected.norm() / denominator).item()
-    future_delta = projected[n_seen_classes:] - weight[n_seen_classes:]
+    denominator = weight.norm().clamp_min(torch.finfo(weight.dtype).eps)
+    delta = ((projected - weight).norm() / denominator).item()
+    ratio = (projected.norm() / denominator).item()
     return projected, {
         'relative_weight_delta': delta,
         'weight_norm_ratio': ratio,
-        'seen_weight_norm_before': seen_before.norm().item(),
-        'seen_weight_norm_after': seen_projected.norm().item(),
-        'max_future_row_delta': (
-            future_delta.abs().max().item() if future_delta.numel() else 0.0
-        ),
     }

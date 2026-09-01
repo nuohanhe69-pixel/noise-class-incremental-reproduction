@@ -6,7 +6,8 @@ import torch
 from torch import nn
 
 from utils.sap import (
-    collect_class_balanced_classifier_input_gram,
+    collect_classifier_input_features,
+    normalize_classifier_input_features,
     project_linear_weight,
 )
 
@@ -25,70 +26,45 @@ class _TinyClassifierNet(nn.Module):
         return self.classifier(inputs)
 
 
-class CollectClassBalancedClassifierInputGramTests(unittest.TestCase):
-    def test_matches_explicit_class_balanced_gram_with_unequal_class_counts(self):
-        model = _TinyClassifierNet(in_features=3, out_features=2)
-        class_zero = torch.tensor([[1.0, 2.0, 0.0], [0.0, 1.0, 3.0]])
-        class_one = torch.tensor([
-            [4.0, 0.0, 1.0], [3.0, 1.0, 0.0], [2.0, 2.0, 1.0],
-            [1.0, 3.0, 2.0], [0.0, 4.0, 3.0],
+class NormalizeClassifierInputFeaturesTests(unittest.TestCase):
+    def test_normalizes_each_sample_and_builds_ordinary_gram_from_all_rows(self):
+        features = torch.tensor([
+            [3.0, 4.0, 0.0],
+            [0.0, 0.0, 2.0],
+            [1.0, 2.0, 2.0],
+            [8.0, 0.0, 6.0],
         ])
-        features = torch.cat([class_zero, class_one])
-        labels = torch.tensor([0, 0, 1, 1, 1, 1, 1])
 
-        stats = collect_class_balanced_classifier_input_gram(
-            model, [(features[:3], labels[:3]), (features[3:], labels[3:])],
-            total_images=7, seen_classes=2,
-        )
+        normalized, norm_stats = normalize_classifier_input_features(features)
+        expected = features / features.norm(p=2, dim=1, keepdim=True)
+        gram = normalized.T @ normalized
 
-        expected = 0.5 * (
-            class_zero.T @ class_zero / len(class_zero)
-            + class_one.T @ class_one / len(class_one)
-        )
-        ordinary = features.T @ features
-        torch.testing.assert_close(stats.gram, expected)
-        self.assertFalse(torch.allclose(stats.gram, ordinary))
-        self.assertEqual(stats.per_class_counts, (2, 5))
-        self.assertEqual(sum(stats.per_class_counts), len(features))
-        self.assertEqual(stats.gram.shape, (3, 3))
+        torch.testing.assert_close(normalized, expected)
+        torch.testing.assert_close(gram, expected.T @ expected)
+        torch.testing.assert_close(normalized.norm(p=2, dim=1), torch.ones(4))
+        self.assertEqual(norm_stats['before']['min'], 2.0)
+        self.assertAlmostEqual(norm_stats['after']['mean'], 1.0, places=6)
 
-    def test_all_samples_across_batches_contribute_without_sampling(self):
+    def test_feature_collection_keeps_all_samples_across_batches(self):
         model = _TinyClassifierNet(in_features=2, out_features=2)
         features = torch.tensor([
             [1.0, 0.0], [2.0, 0.0], [3.0, 0.0],
             [0.0, 1.0], [0.0, 2.0], [0.0, 3.0], [0.0, 4.0],
         ])
-        labels = torch.tensor([0, 0, 0, 1, 1, 1, 1])
 
-        stats = collect_class_balanced_classifier_input_gram(
-            model, [(features[:2], labels[:2]), (features[2:5], labels[2:5]),
-                    (features[5:], labels[5:])],
-            total_images=7, seen_classes=2,
+        collected = collect_classifier_input_features(
+            model, [features[:2], features[2:5], features[5:]],
+            total_images=7,
         )
 
-        expected = 0.5 * (
-            features[:3].T @ features[:3] / 3
-            + features[3:].T @ features[3:] / 4
-        )
-        torch.testing.assert_close(stats.gram, expected)
-        self.assertEqual(stats.per_class_counts, (3, 4))
+        torch.testing.assert_close(collected, features)
 
     def test_total_images_mismatch_raises(self):
         model = _TinyClassifierNet(in_features=3, out_features=2)
         features = torch.randn(4, 3)
         with self.assertRaises(ValueError):
-            collect_class_balanced_classifier_input_gram(
-                model, [(features, torch.tensor([0, 0, 1, 1]))],
-                total_images=5, seen_classes=2,
-            )
-
-    def test_missing_seen_class_fails_closed(self):
-        model = _TinyClassifierNet(in_features=3, out_features=3)
-        features = torch.randn(4, 3)
-        with self.assertRaisesRegex(ValueError, r'missing.*\[2\]'):
-            collect_class_balanced_classifier_input_gram(
-                model, [(features, torch.tensor([0, 0, 1, 1]))],
-                total_images=4, seen_classes=3,
+            collect_classifier_input_features(
+                model, [features], total_images=5,
             )
 
     def test_missing_classifier_module_raises(self):
@@ -100,9 +76,8 @@ class CollectClassBalancedClassifierInputGramTests(unittest.TestCase):
                 return self.conv(x)
 
         with self.assertRaises(ValueError):
-            collect_class_balanced_classifier_input_gram(
-                _Headless(), [(torch.randn(2, 1, 4, 4), torch.tensor([0, 1]))],
-                total_images=2, seen_classes=2,
+            collect_classifier_input_features(
+                _Headless(), [torch.randn(2, 1, 4, 4)], total_images=2,
             )
 
     def test_restores_training_state_after_collection(self):
@@ -111,9 +86,8 @@ class CollectClassBalancedClassifierInputGramTests(unittest.TestCase):
         self.assertTrue(model.training)
         self.assertTrue(model.classifier.training)
 
-        collect_class_balanced_classifier_input_gram(
-            model, [(torch.randn(2, 3), torch.tensor([0, 1]))],
-            total_images=2, seen_classes=2,
+        collect_classifier_input_features(
+            model, [torch.randn(2, 3)], total_images=2,
         )
 
         # Training state must be restored after the hook runs.
@@ -129,12 +103,9 @@ class ProjectLinearWeightTests(unittest.TestCase):
         projection = torch.eye(in_features) + 0.01 * torch.randn(in_features, in_features,
                                                                   generator=generator)
 
-        projected, stats = project_linear_weight(
-            weight, projection, n_seen_classes=2,
-        )
+        projected, stats = project_linear_weight(weight, projection)
 
-        torch.testing.assert_close(projected[:2], weight[:2] @ projection.T)
-        torch.testing.assert_close(projected[2:], weight[2:], rtol=0, atol=0)
+        torch.testing.assert_close(projected, weight @ projection.T)
         self.assertIn('relative_weight_delta', stats)
         self.assertIn('weight_norm_ratio', stats)
         self.assertGreater(stats['relative_weight_delta'], 0.0)
@@ -144,9 +115,7 @@ class ProjectLinearWeightTests(unittest.TestCase):
         weight = torch.randn(4, 6)
         projection = torch.eye(6)
 
-        projected, stats = project_linear_weight(
-            weight, projection, n_seen_classes=3,
-        )
+        projected, stats = project_linear_weight(weight, projection)
 
         torch.testing.assert_close(projected, weight)
         self.assertAlmostEqual(stats['relative_weight_delta'], 0.0, places=7)
@@ -155,40 +124,30 @@ class ProjectLinearWeightTests(unittest.TestCase):
     def test_wrong_projection_shape_raises(self):
         weight = torch.randn(2, 4)
         with self.assertRaises(ValueError):
-            project_linear_weight(weight, torch.eye(5), n_seen_classes=2)
+            project_linear_weight(weight, torch.eye(5))
 
     def test_non_finite_projection_raises(self):
         weight = torch.randn(2, 3)
         bad = torch.eye(3)
         bad[0, 0] = float('nan')
         with self.assertRaises(ValueError):
-            project_linear_weight(weight, bad, n_seen_classes=2)
+            project_linear_weight(weight, bad)
 
     def test_dimension_mismatch_in_projection_raises(self):
         weight = torch.randn(2, 3)
         with self.assertRaises(ValueError):
-            project_linear_weight(weight, torch.zeros(3, 4), n_seen_classes=2)
+            project_linear_weight(weight, torch.zeros(3, 4))
 
-    def test_only_seen_rows_change_and_future_rows_are_bitwise_identical(self):
+    def test_projection_applies_to_all_classifier_rows(self):
         generator = torch.Generator().manual_seed(19)
         weight = torch.randn(10, 512, generator=generator)
         projection = 0.5 * torch.eye(512)
 
-        projected, stats = project_linear_weight(
-            weight, projection, n_seen_classes=4,
-        )
+        projected, stats = project_linear_weight(weight, projection)
 
-        self.assertFalse(torch.equal(projected[:4], weight[:4]))
-        self.assertTrue(torch.equal(projected[4:], weight[4:]))
-        self.assertEqual(stats['max_future_row_delta'], 0.0)
-        self.assertEqual(stats['seen_weight_norm_before'], weight[:4].norm().item())
-
-    def test_invalid_seen_class_count_raises(self):
-        weight = torch.randn(3, 4)
-        with self.assertRaises(ValueError):
-            project_linear_weight(weight, torch.eye(4), n_seen_classes=0)
-        with self.assertRaises(ValueError):
-            project_linear_weight(weight, torch.eye(4), n_seen_classes=4)
+        torch.testing.assert_close(projected, 0.5 * weight)
+        self.assertFalse(torch.equal(projected[4:], weight[4:]))
+        self.assertAlmostEqual(stats['weight_norm_ratio'], 0.5, places=6)
 
 
 class OracleScaleConsistencyTests(unittest.TestCase):
@@ -229,27 +188,6 @@ class OracleScaleConsistencyTests(unittest.TestCase):
         eigvals = torch.linalg.eigvalsh(projection)
         self.assertGreaterEqual(eigvals.min().item(), -1e-5)
         self.assertLessEqual(eigvals.max().item(), 1.0 + 1e-5)
-
-    def test_alpha_changes_projection_strength_but_not_experiment_command(self):
-        from scripts.run_linear_sap_alpha_sweep import build_sweep_commands
-        from utils.sap import build_sap_projection_from_gram
-
-        base_command = [
-            'python', 'main.py', '--dataset', 'seq-cifar10', '--model', 'dgc-sap',
-            '--seed', '0', '--ogc_loss_weight', '0.3', '--sap_oracle_reference', '1',
-        ]
-        commands = build_sweep_commands(base_command, [100.0, 300.0])
-
-        self.assertEqual(commands[0][:-2], base_command)
-        self.assertEqual(commands[1][:-2], base_command)
-        self.assertEqual(commands[0][-2:], ['--sap_oracle_scale', '100'])
-        self.assertEqual(commands[1][-2:], ['--sap_oracle_scale', '300'])
-
-        gram = torch.diag(torch.tensor([1.0, 2.0, 4.0]))
-        projection_100 = build_sap_projection_from_gram(gram, scale=100.0)
-        projection_300 = build_sap_projection_from_gram(gram, scale=300.0)
-        self.assertFalse(torch.allclose(projection_100, projection_300))
-
 
 if __name__ == '__main__':
     unittest.main()
