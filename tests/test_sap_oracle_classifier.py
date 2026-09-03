@@ -6,7 +6,8 @@ import torch
 from torch import nn
 
 from utils.sap import (
-    collect_classifier_input_gram,
+    collect_classifier_input_features,
+    normalize_classifier_input_features,
     project_linear_weight,
 )
 
@@ -25,36 +26,46 @@ class _TinyClassifierNet(nn.Module):
         return self.classifier(inputs)
 
 
-class CollectClassifierInputGramTests(unittest.TestCase):
-    def test_streaming_gram_matches_explicit_X_T_X(self):
-        generator = torch.Generator().manual_seed(3)
-        in_features = 4
-        model = _TinyClassifierNet(in_features=in_features, out_features=3)
-        features = torch.randn(7, in_features, generator=generator)
-        gram = collect_classifier_input_gram(model, [features], total_images=7)
+class NormalizeClassifierInputFeaturesTests(unittest.TestCase):
+    def test_normalizes_each_sample_and_builds_ordinary_gram_from_all_rows(self):
+        features = torch.tensor([
+            [3.0, 4.0, 0.0],
+            [0.0, 0.0, 2.0],
+            [1.0, 2.0, 2.0],
+            [8.0, 0.0, 6.0],
+        ])
 
-        torch.testing.assert_close(gram, features.T @ features)
-        self.assertEqual(gram.shape, (in_features, in_features))
+        normalized, norm_stats = normalize_classifier_input_features(features)
+        expected = features / features.norm(p=2, dim=1, keepdim=True)
+        gram = normalized.T @ normalized
 
-    def test_streaming_gram_accumulates_across_multiple_batches(self):
-        generator = torch.Generator().manual_seed(5)
-        in_features = 5
-        model = _TinyClassifierNet(in_features=in_features, out_features=2)
-        batch_a = torch.randn(3, in_features, generator=generator)
-        batch_b = torch.randn(4, in_features, generator=generator)
-        all_features = torch.cat([batch_a, batch_b], dim=0)
+        torch.testing.assert_close(normalized, expected)
+        torch.testing.assert_close(gram, expected.T @ expected)
+        torch.testing.assert_close(normalized.norm(p=2, dim=1), torch.ones(4))
+        self.assertEqual(norm_stats['before']['min'], 2.0)
+        self.assertAlmostEqual(norm_stats['after']['mean'], 1.0, places=6)
 
-        gram = collect_classifier_input_gram(
-            model, [batch_a, batch_b], total_images=all_features.shape[0],
+    def test_feature_collection_keeps_all_samples_across_batches(self):
+        model = _TinyClassifierNet(in_features=2, out_features=2)
+        features = torch.tensor([
+            [1.0, 0.0], [2.0, 0.0], [3.0, 0.0],
+            [0.0, 1.0], [0.0, 2.0], [0.0, 3.0], [0.0, 4.0],
+        ])
+
+        collected = collect_classifier_input_features(
+            model, [features[:2], features[2:5], features[5:]],
+            total_images=7,
         )
 
-        torch.testing.assert_close(gram, all_features.T @ all_features)
+        torch.testing.assert_close(collected, features)
 
     def test_total_images_mismatch_raises(self):
         model = _TinyClassifierNet(in_features=3, out_features=2)
         features = torch.randn(4, 3)
         with self.assertRaises(ValueError):
-            collect_classifier_input_gram(model, [features], total_images=5)
+            collect_classifier_input_features(
+                model, [features], total_images=5,
+            )
 
     def test_missing_classifier_module_raises(self):
         class _Headless(nn.Module):
@@ -65,7 +76,9 @@ class CollectClassifierInputGramTests(unittest.TestCase):
                 return self.conv(x)
 
         with self.assertRaises(ValueError):
-            collect_classifier_input_gram(_Headless(), [torch.randn(2, 1, 4, 4)], total_images=2)
+            collect_classifier_input_features(
+                _Headless(), [torch.randn(2, 1, 4, 4)], total_images=2,
+            )
 
     def test_restores_training_state_after_collection(self):
         model = _TinyClassifierNet(in_features=3, out_features=2)
@@ -73,7 +86,7 @@ class CollectClassifierInputGramTests(unittest.TestCase):
         self.assertTrue(model.training)
         self.assertTrue(model.classifier.training)
 
-        collect_classifier_input_gram(
+        collect_classifier_input_features(
             model, [torch.randn(2, 3)], total_images=2,
         )
 
@@ -125,6 +138,17 @@ class ProjectLinearWeightTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             project_linear_weight(weight, torch.zeros(3, 4))
 
+    def test_projection_applies_to_all_classifier_rows(self):
+        generator = torch.Generator().manual_seed(19)
+        weight = torch.randn(10, 512, generator=generator)
+        projection = 0.5 * torch.eye(512)
+
+        projected, stats = project_linear_weight(weight, projection)
+
+        torch.testing.assert_close(projected, 0.5 * weight)
+        self.assertFalse(torch.equal(projected[4:], weight[4:]))
+        self.assertAlmostEqual(stats['weight_norm_ratio'], 0.5, places=6)
+
 
 class OracleScaleConsistencyTests(unittest.TestCase):
     """Sanity checks on the official SAP importance formula.
@@ -164,7 +188,6 @@ class OracleScaleConsistencyTests(unittest.TestCase):
         eigvals = torch.linalg.eigvalsh(projection)
         self.assertGreaterEqual(eigvals.min().item(), -1e-5)
         self.assertLessEqual(eigvals.max().item(), 1.0 + 1e-5)
-
 
 if __name__ == '__main__':
     unittest.main()

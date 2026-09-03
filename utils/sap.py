@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Callable, Iterable, Mapping, Tuple
+from typing import Callable, Iterable, Mapping
 
 import torch
 import torch.nn.functional as F
@@ -437,7 +437,7 @@ def project_resnet18_from_reference_batches(
 # -----------------------------------------------------------------------------
 
 
-def _resolve_classifier_module(model: nn.Module) -> nn.Linear:
+def resolve_classifier_module(model: nn.Module) -> nn.Linear:
     """Find the classifier Linear submodule under the (possibly Data)) backbone.
 
     Supports the Mammoth ResNet naming (``classifier``) and the official SAP
@@ -454,89 +454,17 @@ def _resolve_classifier_module(model: nn.Module) -> nn.Linear:
     raise ValueError('model does not provide an nn.Linear classifier or fc module')
 
 
-def collect_classifier_input_gram(
-    model: nn.Module,
-    batches: Iterable[Tensor],
-    *,
-    total_images: int,
-) -> Tensor:
-    """Return the streaming input Gram matrix of the classifier's input.
-
-    Equivalent to ``XᵀX`` where ``X`` stacks every captured feature vector, but
-    never materialises ``X`` (one feature per image; ~10k vectors of dimension
-    in_features). Returns a tensor of shape ``[in_features, in_features]`` on
-    the model's device.
-
-    Args:
-        model: the network containing the classifier (or fc) module.
-        batches: iterable of already-normalized input tensors of shape
-            ``[N, C, H, W]``; typically obtained from
-            ``model._normalized_batches`` or equivalent.
-        total_images: exact number of images expected across all batches
-            (used as a sanity check).
-    """
-    if total_images <= 0:
-        raise ValueError('total_images must be positive')
-
-    target_module = _resolve_classifier_module(model)
-
-    captured: list[Tensor] = []
-
-    def capture_inputs(_module: nn.Module, args: tuple) -> None:
-        if not args:
-            raise RuntimeError('classifier received no positional input')
-        feats = args[0].detach()
-        if not feats.is_floating_point():
-            raise TypeError('classifier input must be a floating-point tensor')
-        captured.append(feats)
-
-    handle = target_module.register_forward_pre_hook(capture_inputs)
-    training_states = {module: module.training for module in model.modules()}
-    try:
-        model.eval()
-        seen = 0
-        with torch.no_grad():
-            for batch in batches:
-                if not isinstance(batch, Tensor):
-                    raise TypeError('each batch must be a prepared input Tensor')
-                model(batch)
-                seen += batch.shape[0]
-        if seen != total_images:
-            raise ValueError(
-                f'batches contain {seen} images but total_images is {total_images}'
-            )
-    finally:
-        handle.remove()
-        for module, was_training in training_states.items():
-            module.training = was_training
-
-    if not captured:
-        raise ValueError('no classifier input was captured')
-
-    features = torch.cat(captured, dim=0)
-    gram = features.transpose(0, 1) @ features
-    if not torch.isfinite(gram).all():
-        raise ValueError('classifier input Gram contains NaN or Inf')
-    return gram
-
-
 def collect_classifier_input_features(
     model: nn.Module,
     batches: Iterable[Tensor],
     *,
     total_images: int,
 ) -> Tensor:
-    """Capture the classifier input feature tensor for every image.
-
-    Returns a single tensor of shape ``[total_images, in_features]``. Use this
-    when the caller also needs the per-image features (for example, to compute
-    before/after logit diagnostics on the reference set).
-    """
+    """Capture every classifier-input feature without changing normal forward."""
     if total_images <= 0:
         raise ValueError('total_images must be positive')
 
-    target_module = _resolve_classifier_module(model)
-
+    target_module = resolve_classifier_module(model)
     captured: list[Tensor] = []
 
     def capture_inputs(_module: nn.Module, args: tuple) -> None:
@@ -545,6 +473,11 @@ def collect_classifier_input_features(
         feats = args[0].detach()
         if not feats.is_floating_point():
             raise TypeError('classifier input must be a floating-point tensor')
+        if feats.ndim != 2 or feats.shape[1] != target_module.in_features:
+            raise ValueError(
+                'classifier input must have shape '
+                f'[batch, {target_module.in_features}], got {tuple(feats.shape)}'
+            )
         captured.append(feats)
 
     handle = target_module.register_forward_pre_hook(capture_inputs)
@@ -557,7 +490,7 @@ def collect_classifier_input_features(
                 if not isinstance(batch, Tensor):
                     raise TypeError('each batch must be a prepared input Tensor')
                 model(batch)
-                seen += batch.shape[0]
+                seen += int(batch.shape[0])
         if seen != total_images:
             raise ValueError(
                 f'batches contain {seen} images but total_images is {total_images}'
@@ -579,11 +512,40 @@ def collect_classifier_input_features(
     return features
 
 
+def normalize_classifier_input_features(features: Tensor) -> tuple[Tensor, dict]:
+    """L2-normalize each Linear input solely for Oracle SAP Gram construction."""
+    if features.ndim != 2:
+        raise ValueError(
+            f'classifier features must be 2-D, got shape {tuple(features.shape)}'
+        )
+    if not features.is_floating_point():
+        raise TypeError('classifier features must use a floating-point dtype')
+    if not torch.isfinite(features).all():
+        raise ValueError('classifier input features contain NaN or Inf')
+
+    norms_before = features.norm(p=2, dim=1)
+    normalized = F.normalize(features, p=2, dim=1)
+    norms_after = normalized.norm(p=2, dim=1)
+
+    def summarize(values: Tensor) -> dict[str, float]:
+        return {
+            'min': values.min().item(),
+            'median': values.median().item(),
+            'mean': values.mean().item(),
+            'max': values.max().item(),
+        }
+
+    return normalized, {
+        'before': summarize(norms_before),
+        'after': summarize(norms_after),
+    }
+
+
 def project_linear_weight(
     weight: Tensor,
     projection: Tensor,
-) -> Tuple[Tensor, dict]:
-    """Apply the official SAP input-side projection ``W' = W @ Mᵀ``.
+) -> tuple[Tensor, dict]:
+    """Apply the original SAP input-side projection ``W' = W @ Mᵀ``.
 
     Mirrors the math in ``project_conv2d_weight`` for an ``nn.Linear`` weight
     ``W`` of shape ``[out_features, in_features]``. The bias (if any) is

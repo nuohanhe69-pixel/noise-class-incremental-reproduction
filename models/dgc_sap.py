@@ -12,9 +12,10 @@ import torch
 from models.dgc import DGC
 from utils.augmentations import apply_transform
 from utils.sap import (
-    build_sap_projection_from_gram,
     collect_classifier_input_features,
+    normalize_classifier_input_features,
     project_linear_weight,
+    resolve_classifier_module,
 )
 from utils.sap_reference import (
     SAPReferenceMemory,
@@ -215,11 +216,8 @@ class DgcSap(DGC):
         label equals the true label (oracle cleanliness). For a CIFAR-10 task
         with symm-20% noise this gives ~8000 samples (10,000 × (1-noise_rate)).
 
-        Buffer: only samples whose ``task_id != current_task`` AND whose
-        observed label equals the true label. ``buffer.task_labels`` may be
-        absent when loss-trace is disabled; in that case we infer the task id
-        via ``labels // n_classes_per_task`` (same fallback as
-        ``_buffer_diagnostic_factories``).
+        Buffer: every sample whose observed label equals the true label. No
+        clean current-task or prior-task buffer reference is dropped.
 
         Labels are returned purely for diagnostics; the projection itself
         only consumes images.
@@ -241,48 +239,40 @@ class DgcSap(DGC):
         buffer_images = None
         buffer_true = None
         buffer_total = 0
-        buffer_old_count = 0
+        buffer_clean_count = 0
 
         if not self.buffer.is_empty():
             buf = self.buffer.get_all_data(device='cpu')
             buf_images, buf_labels = buf[0], buf[1]
             if buf_images is not None and buf_labels is not None and buf_images.numel():
                 if hasattr(self.buffer, 'true_labels') and self.buffer.true_labels is not None:
-                    buf_true = self.buffer.true_labels.detach().cpu().long()
+                    buf_true = self.buffer.true_labels[:len(buf_labels)].detach().cpu().long()
                 else:
                     raise ValueError('oracle mode requires buffer.true_labels to be set')
 
-                if hasattr(self.buffer, 'task_labels') and self.buffer.task_labels is not None:
-                    buf_task_id = self.buffer.task_labels.detach().cpu().long()
-                else:
-                    n_per_task = getattr(self.dataset, 'N_CLASSES_PER_TASK', None) \
-                        or max(1, self.n_classes_current_task)
-                    buf_task_id = (buf_labels.detach().cpu().long() // n_per_task)
-
                 buf_labels_cpu = buf_labels.detach().cpu().long()
                 clean = buf_labels_cpu == buf_true
-                old = buf_task_id != int(self.current_task)
-                keep = clean & old
+                keep = clean
                 buffer_images = buf_images[keep]
                 buffer_true = buf_true[keep]
                 buffer_total = int(buf_images.shape[0])
-                buffer_old_count = int(buffer_images.shape[0])
+                buffer_clean_count = int(buffer_images.shape[0])
 
-        if buffer_images is not None and buffer_old_count > 0:
+        if buffer_images is not None and buffer_clean_count > 0:
             all_images = torch.cat([task_images, buffer_images], dim=0)
             all_true_labels = torch.cat([task_true_labels, buffer_true], dim=0)
         else:
             all_images = task_images
             all_true_labels = task_true_labels
 
-        return all_images, all_true_labels, task_count, buffer_total, buffer_old_count
+        return all_images, all_true_labels, task_count, buffer_total, buffer_clean_count
 
     def _run_oracle_classifier_sap(self, dataset) -> None:
         """Oracle task-boundary SAP: project only the final classifier Linear.
 
         Procedure:
 
-        1. Build the oracle reference set (current task clean + buffer old clean).
+        1. Build the oracle reference set (current task clean + all buffer clean).
         2. Stream the classifier-input Gram matrix via the pre-hook.
         3. Build the input-side SAP projection matrix ``Mr`` (no truncation).
         4. Project the classifier weight in place; bias is untouched.
@@ -291,7 +281,7 @@ class DgcSap(DGC):
         6. Log a SAP_ORACLE_EXECUTED event with stats.
         """
         try:
-            all_images, all_true_labels, task_count, buffer_total, buffer_old_count = \
+            all_images, all_true_labels, task_count, buffer_total, buffer_clean_count = \
                 self._build_oracle_reference_batches(dataset)
         except Exception as error:
             self._record_sap_event(
@@ -311,7 +301,6 @@ class DgcSap(DGC):
             )
             return
 
-        # Build batches of normalized inputs.
         batches_with_labels = list(self._normalized_batches(all_images, all_true_labels))
 
         def image_batches():
@@ -320,10 +309,10 @@ class DgcSap(DGC):
 
         try:
             features = collect_classifier_input_features(
-                self.net,
-                image_batches(),
-                total_images=total_images,
+                self.net, image_batches(), total_images=total_images,
             )
+            normalized_features, feature_norm_stats = \
+                normalize_classifier_input_features(features)
         except Exception as error:
             self._record_sap_event(
                 status=SAP_FAILED,
@@ -334,8 +323,7 @@ class DgcSap(DGC):
             logging.exception('Oracle SAP: classifier-input feature collection failed.')
             return
 
-        # Build the streaming Gram from the captured features.
-        gram = features.transpose(0, 1) @ features
+        gram = normalized_features.transpose(0, 1) @ normalized_features
         if not torch.isfinite(gram).all():
             self._record_sap_event(
                 status=SAP_FAILED,
@@ -344,7 +332,8 @@ class DgcSap(DGC):
             return
 
         try:
-            projection, spectrum = self._build_oracle_projection(gram)
+            projection, energy, normalized_energy, importance = \
+                self._build_oracle_projection(gram)
         except Exception as error:
             self._record_sap_event(
                 status=SAP_FAILED,
@@ -356,9 +345,9 @@ class DgcSap(DGC):
             return
 
         # Locate the classifier module and project its weight in place.
-        classifier = self.net.classifier if hasattr(self.net, 'classifier') \
-            else self.net.get_submodule('fc')
-        if not isinstance(classifier, torch.nn.Linear):
+        try:
+            classifier = resolve_classifier_module(self.net)
+        except ValueError:
             self._record_sap_event(
                 status=SAP_FAILED,
                 oracle_stage='classifier_not_found',
@@ -366,6 +355,20 @@ class DgcSap(DGC):
             return
 
         weight_before = classifier.weight.detach().clone()
+        bias_before = (
+            classifier.bias.detach().clone() if classifier.bias is not None else None
+        )
+        try:
+            accuracy_before = self._evaluate_seen_task_accuracies(dataset)
+        except Exception as error:
+            self._record_sap_event(
+                status=SAP_FAILED,
+                oracle_stage='seen_accuracy_before',
+                error_type=type(error).__name__,
+                error_message=str(error),
+            )
+            logging.exception('Oracle SAP: pre-projection seen-task evaluation failed.')
+            return
         try:
             projected_weight, weight_stats = project_linear_weight(weight_before, projection)
         except Exception as error:
@@ -378,55 +381,118 @@ class DgcSap(DGC):
             logging.exception('Oracle SAP: linear weight projection failed.')
             return
 
-        with torch.no_grad():
-            classifier.weight.copy_(projected_weight.to(classifier.weight.dtype))
+        try:
+            with torch.no_grad():
+                classifier.weight.copy_(projected_weight.to(classifier.weight.dtype))
+            accuracy_after = self._evaluate_seen_task_accuracies(dataset)
+        except Exception as error:
+            with torch.no_grad():
+                classifier.weight.copy_(weight_before)
+            self._record_sap_event(
+                status=SAP_FAILED,
+                oracle_stage='seen_accuracy_after',
+                error_type=type(error).__name__,
+                error_message=str(error),
+            )
+            logging.exception(
+                'Oracle SAP: post-projection seen-task evaluation failed; weight restored.'
+            )
+            return
 
         # Mirror the existing committed SAP behaviour: refresh the AER snapshot
         # so the next task's fitting epoch restores the projected weights.
         self.past_model_ckpt = copy.deepcopy(self.net.state_dict())
 
-        # Free-form accuracy diagnostics on the reference set using the
-        # captured features (no extra forward pass needed).
-        ref_accuracy_before = None
-        ref_accuracy_after = None
-        try:
-            ref_labels = torch.cat(
-                [_labels for _b_images, _labels in batches_with_labels], dim=0
-            )
-            with torch.no_grad():
-                logits_before = features.to(weight_before.device) @ weight_before.transpose(0, 1) \
-                    + classifier.bias.detach()
-                logits_after = features.to(projected_weight.device) @ projected_weight.transpose(0, 1) \
-                    + classifier.bias.detach()
-                ref_labels = ref_labels.to(logits_before.device)
-                ref_accuracy_before = (
-                    (logits_before.argmax(dim=1) == ref_labels).float().mean().item()
-                )
-                ref_accuracy_after = (
-                    (logits_after.argmax(dim=1) == ref_labels).float().mean().item()
-                )
-        except Exception:
-            logging.exception('Oracle SAP: reference accuracy diagnostics failed.')
-
-        spectrum_np = spectrum.detach().cpu().numpy() if isinstance(spectrum, torch.Tensor) \
-            else spectrum
+        bias_after = classifier.bias.detach() if classifier.bias is not None else None
+        max_bias_delta = (
+            0.0 if bias_before is None
+            else (bias_after - bias_before).abs().max().item()
+        )
+        task_accuracy_comparisons = [
+            {
+                'task_id': before['task_id'],
+                'sample_count': before['sample_count'],
+                'accuracy_before': before['accuracy'],
+                'accuracy_after': after['accuracy'],
+                'accuracy_delta': after['accuracy'] - before['accuracy'],
+            }
+            for before, after in zip(accuracy_before, accuracy_after)
+        ]
+        seen_average_before = (
+            sum(item['accuracy'] for item in accuracy_before) / len(accuracy_before)
+            if accuracy_before else None
+        )
+        seen_average_after = (
+            sum(item['accuracy'] for item in accuracy_after) / len(accuracy_after)
+            if accuracy_after else None
+        )
         self._record_sap_event(
             status=SAP_ORACLE_EXECUTED,
             projection_location='pre',
             projection_target='classifier',
+            total_reference_count=total_images,
             current_task_clean_count=task_count,
+            buffer_clean_count=buffer_clean_count,
             buffer_total_count=buffer_total,
-            buffer_old_clean_count=buffer_old_count,
-            total_reference_images=total_images,
-            projection_min_eigenvalue=float(spectrum_np.min()),
-            projection_max_eigenvalue=float(spectrum_np.max()),
-            projection_trace=float(spectrum_np.sum()),
-            projection_effective_rank=int((spectrum_np > 1e-6).sum()),
-            reference_accuracy_before=ref_accuracy_before,
-            reference_accuracy_after=ref_accuracy_after,
+            gram_shape=list(gram.shape),
+            gram_trace=gram.trace().item(),
+            feature_norm_before_min=feature_norm_stats['before']['min'],
+            feature_norm_before_median=feature_norm_stats['before']['median'],
+            feature_norm_before_mean=feature_norm_stats['before']['mean'],
+            feature_norm_before_max=feature_norm_stats['before']['max'],
+            feature_norm_after_min=feature_norm_stats['after']['min'],
+            feature_norm_after_median=feature_norm_stats['after']['median'],
+            feature_norm_after_mean=feature_norm_stats['after']['mean'],
+            feature_norm_after_max=feature_norm_stats['after']['max'],
+            gram_eigenvalue_min=energy.min().item(),
+            gram_eigenvalue_max=energy.max().item(),
+            normalized_energy_min=normalized_energy.min().item(),
+            normalized_energy_max=normalized_energy.max().item(),
+            normalized_energy_median=normalized_energy.median().item(),
+            sap_alpha=float(self.args.sap_oracle_scale),
+            importance_min=importance.min().item(),
+            importance_max=importance.max().item(),
+            importance_median=importance.median().item(),
+            importance_trace=importance.sum().item(),
+            n_seen_classes=int(self.n_seen_classes),
+            total_classifier_rows=int(classifier.weight.shape[0]),
             relative_weight_delta=weight_stats['relative_weight_delta'],
             weight_norm_ratio=weight_stats['weight_norm_ratio'],
+            max_bias_delta=max_bias_delta,
+            seen_task_accuracy_comparisons=task_accuracy_comparisons,
+            seen_average_accuracy_before=seen_average_before,
+            seen_average_accuracy_after=seen_average_after,
         )
+
+    def _evaluate_seen_task_accuracies(self, dataset) -> list[dict]:
+        """Evaluate the same already-seen test tasks for SAP diagnostics only."""
+        task_accuracies = []
+        training_states = {module: module.training for module in self.net.modules()}
+        try:
+            self.net.eval()
+            with torch.no_grad():
+                for task_id, test_loader in enumerate(dataset.test_loaders):
+                    correct = 0
+                    sample_count = 0
+                    for data in test_loader:
+                        inputs = data[0].to(self.device)
+                        labels = data[1].to(self.device)
+                        predictions = self.net(inputs)[:, :self.n_seen_classes].argmax(dim=1)
+                        correct += (predictions == labels).sum().item()
+                        sample_count += labels.numel()
+                    if sample_count == 0:
+                        raise ValueError(
+                            f'seen test task {task_id} contains no diagnostic samples'
+                        )
+                    task_accuracies.append({
+                        'task_id': task_id,
+                        'sample_count': sample_count,
+                        'accuracy': correct / sample_count,
+                    })
+        finally:
+            for module, was_training in training_states.items():
+                module.training = was_training
+        return task_accuracies
 
     def _build_oracle_projection(self, gram: torch.Tensor):
         """Build the SAP input-side projection Mr from the classifier-input Gram.
@@ -453,7 +519,8 @@ class DgcSap(DGC):
         importance = self._sap_importance_from_energy(energy)
         projection = (eigenvectors * importance.unsqueeze(0)) @ eigenvectors.transpose(0, 1)
         projection = (projection + projection.transpose(0, 1)) * 0.5
-        return projection, energy
+        normalized_energy = energy / energy.sum()
+        return projection, energy, normalized_energy, importance
 
     def _sap_importance_from_energy(self, energy: torch.Tensor) -> torch.Tensor:
         """Official SAP importance scaled to [0,1] over normalized energies.
