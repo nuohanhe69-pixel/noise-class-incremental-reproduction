@@ -138,6 +138,10 @@ class ErAceAerAbs(ContinualModel):
             return False
         return self.args.loss_trace_end_epoch < 0 or epoch <= self.args.loss_trace_end_epoch
 
+    def _should_store_buffer_metadata(self) -> bool:
+        """Whether buffer entries need oracle/debug metadata alongside training data."""
+        return self.loss_trace_recorder is not None
+
     def _record_loss_trace(self, *, epoch: int, not_aug_inputs: torch.Tensor, labels: torch.Tensor,
                            true_labels: torch.Tensor, sample_ids: torch.Tensor, source_task_ids: torch.Tensor,
                            memory_inputs=None, memory_labels=None, memory_indexes=None) -> None:
@@ -286,7 +290,7 @@ class ErAceAerAbs(ContinualModel):
                 # sample insertion
                 _, clean_mask = torch.topk(loss_not_aug_ext, round((1 - self.args.alpha_sample_insertion) * inputs.shape[0]), largest=False)
 
-                trace_enabled = self.loss_trace_recorder is not None
+                trace_enabled = self._should_store_buffer_metadata()
                 self.buffer.add_data(examples=not_aug_inputs[clean_mask],
                                      labels=labels[clean_mask],
                                      true_labels=true_labels[clean_mask] if trace_enabled and true_labels is not None else None,
