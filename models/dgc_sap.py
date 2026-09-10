@@ -210,17 +210,12 @@ class DgcSap(DGC):
             self._record_current_task_trajectory(dataset, epoch_number)
 
     def _build_oracle_reference_batches(self, dataset):
-        """Build the list of (images, true_labels) batches for the oracle ref set.
+        """Build the balanced oracle reference set used by Linear SAP.
 
-        Current task: every training image, but only those whose observed
-        label equals the true label (oracle cleanliness). For a CIFAR-10 task
-        with symm-20% noise this gives ~8000 samples (10,000 × (1-noise_rate)).
-
-        Buffer: every sample whose observed label equals the true label. No
-        clean current-task or prior-task buffer reference is dropped.
-
-        Labels are returned purely for diagnostics; the projection itself
-        only consumes images.
+        Task 1 keeps every oracle-clean current-task sample and ignores the
+        buffer. Later tasks keep every historical oracle-clean buffer sample
+        as ``Old`` and sample the same number of oracle-clean current-task
+        samples as ``New``, balanced across the sorted current classes.
         """
         task_dataset = dataset.train_loader.dataset
         images, observed_labels, sample_ids = extract_cifar_task_tensors(task_dataset)
@@ -231,17 +226,22 @@ class DgcSap(DGC):
         true_labels_cpu = torch.as_tensor(true_labels, dtype=torch.long).reshape(-1)
         observed_cpu = observed_labels.detach().cpu().long()
         sample_ids_cpu = sample_ids.detach().cpu().long()
-        clean_mask = observed_cpu == true_labels_cpu[sample_ids_cpu]
-        task_images = images[clean_mask]
-        task_true_labels = true_labels_cpu[sample_ids_cpu][clean_mask]
-        task_count = int(task_images.shape[0])
+        task_true_labels_all = true_labels_cpu[sample_ids_cpu]
+        clean_mask = observed_cpu == task_true_labels_all
+        clean_task_images = images[clean_mask]
+        clean_task_labels = task_true_labels_all[clean_mask]
+        current_classes = task_true_labels_all.unique(sorted=True)
+        current_task_clean_total = int(clean_task_images.shape[0])
+        sampling_seed = int(getattr(self.args, 'seed', 0) or 0) + int(self.current_task)
 
         buffer_images = None
         buffer_true = None
         buffer_total = 0
-        buffer_clean_count = 0
+        historical_buffer_clean_count = 0
 
-        if not self.buffer.is_empty():
+        # Task 1 has no historical task, so its reference never consumes the
+        # buffer even if a caller provides one.
+        if self.current_task > 0 and not self.buffer.is_empty():
             buf = self.buffer.get_all_data(device='cpu')
             buf_images, buf_labels = buf[0], buf[1]
             if buf_images is not None and buf_labels is not None and buf_images.numel():
@@ -252,20 +252,93 @@ class DgcSap(DGC):
 
                 buf_labels_cpu = buf_labels.detach().cpu().long()
                 clean = buf_labels_cpu == buf_true
-                keep = clean
+                belongs_to_current_task = torch.isin(buf_true, current_classes)
+                keep = clean & ~belongs_to_current_task
                 buffer_images = buf_images[keep]
                 buffer_true = buf_true[keep]
                 buffer_total = int(buf_images.shape[0])
-                buffer_clean_count = int(buffer_images.shape[0])
+                historical_buffer_clean_count = int(buffer_images.shape[0])
 
-        if buffer_images is not None and buffer_clean_count > 0:
-            all_images = torch.cat([task_images, buffer_images], dim=0)
-            all_true_labels = torch.cat([task_true_labels, buffer_true], dim=0)
+        if self.current_task == 0:
+            selected_task_images = clean_task_images
+            selected_task_labels = clean_task_labels
         else:
-            all_images = task_images
-            all_true_labels = task_true_labels
+            new_target = historical_buffer_clean_count
+            class_count = int(current_classes.numel())
+            if class_count == 0 and new_target > 0:
+                raise ValueError('oracle mode found no clean current-task classes')
 
-        return all_images, all_true_labels, task_count, buffer_total, buffer_clean_count
+            base = new_target // class_count if class_count else 0
+            remainder = new_target % class_count if class_count else 0
+            generator = torch.Generator(device='cpu').manual_seed(sampling_seed)
+            class_indices_by_label = {
+                class_label: torch.nonzero(
+                    clean_task_labels == class_label, as_tuple=False,
+                ).flatten()
+                for class_label in current_classes.tolist()
+            }
+            if sum(len(indices) for indices in class_indices_by_label.values()) < new_target:
+                raise ValueError(
+                    f'oracle mode needs {new_target} clean current-task samples, '
+                    f'but only {current_task_clean_total} are available'
+                )
+            class_targets = {
+                class_label: min(
+                    base + int(class_position < remainder),
+                    len(class_indices_by_label[class_label]),
+                )
+                for class_position, class_label in enumerate(current_classes.tolist())
+            }
+            deficit = new_target - sum(class_targets.values())
+            while deficit:
+                eligible = [
+                    class_label for class_label in current_classes.tolist()
+                    if class_targets[class_label] < len(class_indices_by_label[class_label])
+                ]
+                class_label = min(eligible, key=lambda label: (class_targets[label], label))
+                class_targets[class_label] += 1
+                deficit -= 1
+
+            selected_indices = []
+            for class_label in current_classes.tolist():
+                class_indices = class_indices_by_label[class_label]
+                class_target = class_targets[class_label]
+                permutation = torch.randperm(len(class_indices), generator=generator)
+                selected_indices.append(class_indices[permutation[:class_target]])
+
+            selected_indices = (
+                torch.cat(selected_indices)
+                if selected_indices else torch.empty(0, dtype=torch.long)
+            )
+            selected_task_images = clean_task_images[selected_indices]
+            selected_task_labels = clean_task_labels[selected_indices]
+
+        current_class_selected_counts = {
+            int(class_label): int((selected_task_labels == class_label).sum().item())
+            for class_label in current_classes.tolist()
+        }
+        reference_new_count = int(selected_task_images.shape[0])
+        reference_old_count = historical_buffer_clean_count
+
+        if reference_old_count > 0:
+            all_images = torch.cat([selected_task_images, buffer_images], dim=0)
+            all_true_labels = torch.cat([selected_task_labels, buffer_true], dim=0)
+        else:
+            all_images = selected_task_images
+            all_true_labels = selected_task_labels
+
+        stats = {
+            'current_task_clean_total': current_task_clean_total,
+            'current_task_clean_selected': reference_new_count,
+            'historical_buffer_clean_count': historical_buffer_clean_count,
+            'reference_new_count': reference_new_count,
+            'reference_old_count': reference_old_count,
+            'total_reference_count': int(all_images.shape[0]),
+            'current_class_selected_counts': current_class_selected_counts,
+            'reference_sampling_seed': sampling_seed,
+            'buffer_total_count': buffer_total,
+        }
+        return all_images, all_true_labels, stats
 
     def _run_oracle_classifier_sap(self, dataset) -> None:
         """Oracle task-boundary SAP: project only the final classifier Linear.
@@ -281,7 +354,7 @@ class DgcSap(DGC):
         6. Log a SAP_ORACLE_EXECUTED event with stats.
         """
         try:
-            all_images, all_true_labels, task_count, buffer_total, buffer_clean_count = \
+            all_images, all_true_labels, reference_stats = \
                 self._build_oracle_reference_batches(dataset)
         except Exception as error:
             self._record_sap_event(
@@ -431,9 +504,16 @@ class DgcSap(DGC):
             projection_location='pre',
             projection_target='classifier',
             total_reference_count=total_images,
-            current_task_clean_count=task_count,
-            buffer_clean_count=buffer_clean_count,
-            buffer_total_count=buffer_total,
+            current_task_clean_count=reference_stats['current_task_clean_selected'],
+            buffer_clean_count=reference_stats['historical_buffer_clean_count'],
+            current_task_clean_total=reference_stats['current_task_clean_total'],
+            current_task_clean_selected=reference_stats['current_task_clean_selected'],
+            historical_buffer_clean_count=reference_stats['historical_buffer_clean_count'],
+            reference_new_count=reference_stats['reference_new_count'],
+            reference_old_count=reference_stats['reference_old_count'],
+            current_class_selected_counts=reference_stats['current_class_selected_counts'],
+            reference_sampling_seed=reference_stats['reference_sampling_seed'],
+            buffer_total_count=reference_stats['buffer_total_count'],
             gram_shape=list(gram.shape),
             gram_trace=gram.trace().item(),
             feature_norm_before_min=feature_norm_stats['before']['min'],

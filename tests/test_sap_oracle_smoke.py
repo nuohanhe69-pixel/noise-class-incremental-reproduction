@@ -8,6 +8,7 @@ DgcSap, and runs the oracle boundary function directly. Validates:
 """
 
 import unittest
+from argparse import Namespace
 
 import torch
 from torch import nn
@@ -27,6 +28,36 @@ class _FakeTrainDataset:
         self.targets = list(observed_labels.tolist())
         self.indexes = _np.arange(num_samples)
         self.true_labels = true_labels.tolist()
+
+
+class _FakeBuffer:
+    def __init__(self, images, observed_labels, true_labels):
+        self.images = images
+        self.observed_labels = observed_labels
+        self.true_labels = true_labels
+
+    def is_empty(self):
+        return len(self.images) == 0
+
+    def get_all_data(self, device='cpu'):
+        return self.images.to(device), self.observed_labels.to(device)
+
+
+def _reference_model(train_dataset, buffer, current_task, seed=0):
+    class _Loader:
+        dataset = train_dataset
+
+    class _Dataset:
+        train_loader = _Loader()
+
+    model = DgcSap.__new__(DgcSap)
+    nn.Module.__init__(model)
+    model.buffer = buffer
+    model.dataset = _Dataset()
+    model._current_task = current_task
+    model._n_classes_current_task = len(set(train_dataset.true_labels))
+    model.args = Namespace(seed=seed)
+    return model, model.dataset
 
 
 class OracleEndToEndSmokeTests(unittest.TestCase):
@@ -142,6 +173,13 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
         self.assertEqual(event['projection_location'], 'pre')
         # All 32 task samples are clean after the 80% filter (we flipped 7 of 32).
         self.assertEqual(event['current_task_clean_count'], 25)
+        self.assertEqual(event['current_task_clean_total'], 25)
+        self.assertEqual(event['current_task_clean_selected'], 25)
+        self.assertEqual(event['historical_buffer_clean_count'], 0)
+        self.assertEqual(event['reference_new_count'], 25)
+        self.assertEqual(event['reference_old_count'], 0)
+        self.assertEqual(event['current_class_selected_counts'], {0: 12, 1: 13})
+        self.assertEqual(event['reference_sampling_seed'], 0)
         self.assertEqual(event['total_reference_count'], 25)
         self.assertEqual(event['buffer_total_count'], 0)
         self.assertEqual(event['buffer_clean_count'], 0)
@@ -212,45 +250,86 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
         self.assertEqual(model.sap_history[-1]['status'], SAP_ORACLE_EXECUTED)
         self.assertEqual(model.sap_history[-1]['total_reference_count'], 8)
 
-    def test_reference_builder_keeps_every_oracle_clean_buffer_sample(self):
-        true_labels = torch.arange(8, dtype=torch.long) % 2
-        fake_train = _FakeTrainDataset(8, 2, true_labels, true_labels.clone())
+    def test_task1_ignores_buffer_and_keeps_all_current_clean_samples(self):
+        true_labels = torch.tensor([0, 0, 1, 1])
+        observed_labels = torch.tensor([0, 1, 1, 1])
+        train = _FakeTrainDataset(4, 2, true_labels, observed_labels)
+        buffer = _FakeBuffer(
+            torch.randint(0, 256, (3, 3, 32, 32), dtype=torch.uint8),
+            torch.tensor([4, 5, 6]),
+            torch.tensor([4, 5, 6]),
+        )
+        model, dataset = _reference_model(train, buffer, current_task=0)
 
-        class _Loader:
-            dataset = fake_train
+        images, labels, stats = model._build_oracle_reference_batches(dataset)
 
-        class _Dataset:
-            train_loader = _Loader()
+        self.assertEqual(len(images), 3)
+        self.assertEqual(labels.tolist(), [0, 1, 1])
+        self.assertEqual(stats['current_task_clean_total'], 3)
+        self.assertEqual(stats['current_task_clean_selected'], 3)
+        self.assertEqual(stats['reference_new_count'], 3)
+        self.assertEqual(stats['reference_old_count'], 0)
+        self.assertEqual(stats['historical_buffer_clean_count'], 0)
 
-        buffer_images = torch.randint(0, 256, (4, 3, 32, 32), dtype=torch.uint8)
-        buffer_labels = torch.tensor([0, 1, 2, 3])
+    def test_later_tasks_balance_new_old_and_exclude_current_classes_from_old(self):
+        true_labels = torch.tensor([2] * 8 + [3] * 8)
+        train = _FakeTrainDataset(16, 2, true_labels, true_labels.clone())
+        buffer_true = torch.tensor([0, 0, 1, 1, 1, 2, 3, 0])
+        buffer_observed = torch.tensor([0, 0, 1, 1, 1, 2, 3, 9])
+        buffer = _FakeBuffer(
+            torch.randint(0, 256, (8, 3, 32, 32), dtype=torch.uint8),
+            buffer_observed,
+            buffer_true,
+        )
+        model, dataset = _reference_model(train, buffer, current_task=1, seed=17)
 
-        class _Buffer:
-            true_labels = torch.tensor([0, 9, 2, 3])
+        images, labels, stats = model._build_oracle_reference_batches(dataset)
 
-            @staticmethod
-            def is_empty():
-                return False
+        self.assertEqual(stats['reference_new_count'], 5)
+        self.assertEqual(stats['reference_old_count'], 5)
+        self.assertEqual(stats['historical_buffer_clean_count'], 5)
+        self.assertEqual(stats['total_reference_count'], 10)
+        self.assertEqual(len(images), 10)
+        self.assertEqual(labels[5:].tolist(), [0, 0, 1, 1, 1])
+        self.assertNotIn(2, labels[5:].tolist())
+        self.assertNotIn(3, labels[5:].tolist())
 
-            @staticmethod
-            def get_all_data(device='cpu'):
-                return buffer_images, buffer_labels
+    def test_current_class_sampling_is_balanced_and_remainder_goes_to_first_classes(self):
+        true_labels = torch.tensor([20] * 8 + [21] * 8 + [22] * 8)
+        train = _FakeTrainDataset(24, 3, true_labels, true_labels.clone())
+        old_count = 8
+        buffer = _FakeBuffer(
+            torch.randint(0, 256, (old_count, 3, 32, 32), dtype=torch.uint8),
+            torch.arange(old_count) % 2,
+            torch.arange(old_count) % 2,
+        )
+        model, dataset = _reference_model(train, buffer, current_task=2, seed=0)
 
-        model = DgcSap.__new__(DgcSap)
-        nn.Module.__init__(model)
-        model.buffer = _Buffer()
-        model.dataset = _Dataset()
-        model._current_task = 1
-        model._n_classes_current_task = 2
+        _, _, stats = model._build_oracle_reference_batches(dataset)
 
-        images, labels, task_count, buffer_total, buffer_clean_count = \
-            model._build_oracle_reference_batches(model.dataset)
+        selected_counts = stats['current_class_selected_counts']
+        self.assertLessEqual(max(selected_counts.values()) - min(selected_counts.values()), 1)
+        self.assertEqual(selected_counts, {20: 3, 21: 3, 22: 2})
+        self.assertEqual(stats['reference_sampling_seed'], 2)
 
-        self.assertEqual(task_count, 8)
-        self.assertEqual(buffer_total, 4)
-        self.assertEqual(buffer_clean_count, 3)
-        self.assertEqual(len(images), 11)
-        self.assertEqual(len(labels), 11)
+    def test_sampling_is_reproducible_for_same_seed_and_task(self):
+        true_labels = torch.tensor([2] * 10 + [3] * 10)
+        train = _FakeTrainDataset(20, 2, true_labels, true_labels.clone())
+        buffer = _FakeBuffer(
+            torch.randint(0, 256, (7, 3, 32, 32), dtype=torch.uint8),
+            torch.tensor([0, 0, 0, 1, 1, 1, 1]),
+            torch.tensor([0, 0, 0, 1, 1, 1, 1]),
+        )
+        model_a, dataset_a = _reference_model(train, buffer, current_task=1, seed=9)
+        model_b, dataset_b = _reference_model(train, buffer, current_task=1, seed=9)
+
+        images_a, labels_a, stats_a = model_a._build_oracle_reference_batches(dataset_a)
+        torch.rand(1000)  # perturb global RNG; local sampling must remain unchanged
+        images_b, labels_b, stats_b = model_b._build_oracle_reference_batches(dataset_b)
+
+        torch.testing.assert_close(images_a, images_b)
+        torch.testing.assert_close(labels_a, labels_b)
+        self.assertEqual(stats_a, stats_b)
 
 
 if __name__ == '__main__':
