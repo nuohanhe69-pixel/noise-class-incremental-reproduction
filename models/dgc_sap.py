@@ -237,11 +237,10 @@ class DgcSap(DGC):
         buffer_images = None
         buffer_true = None
         buffer_total = 0
+        buffer_clean_count = 0
         historical_buffer_clean_count = 0
 
-        # Task 1 has no historical task, so its reference never consumes the
-        # buffer even if a caller provides one.
-        if self.current_task > 0 and not self.buffer.is_empty():
+        if not self.buffer.is_empty():
             buf = self.buffer.get_all_data(device='cpu')
             buf_images, buf_labels = buf[0], buf[1]
             if buf_images is not None and buf_labels is not None and buf_images.numel():
@@ -252,12 +251,17 @@ class DgcSap(DGC):
 
                 buf_labels_cpu = buf_labels.detach().cpu().long()
                 clean = buf_labels_cpu == buf_true
-                belongs_to_current_task = torch.isin(buf_true, current_classes)
-                keep = clean & ~belongs_to_current_task
-                buffer_images = buf_images[keep]
-                buffer_true = buf_true[keep]
                 buffer_total = int(buf_images.shape[0])
-                historical_buffer_clean_count = int(buffer_images.shape[0])
+                buffer_clean_count = int(clean.sum().item())
+
+                # Task 1 records the real buffer diagnostics but never uses
+                # buffer samples as references because no historical task exists.
+                if self.current_task > 0:
+                    belongs_to_current_task = torch.isin(buf_true, current_classes)
+                    keep = clean & ~belongs_to_current_task
+                    buffer_images = buf_images[keep]
+                    buffer_true = buf_true[keep]
+                    historical_buffer_clean_count = int(buffer_images.shape[0])
 
         if self.current_task == 0:
             selected_task_images = clean_task_images
@@ -329,7 +333,9 @@ class DgcSap(DGC):
 
         stats = {
             'current_task_clean_total': current_task_clean_total,
+            'current_task_clean_count': current_task_clean_total,
             'current_task_clean_selected': reference_new_count,
+            'buffer_clean_count': buffer_clean_count,
             'historical_buffer_clean_count': historical_buffer_clean_count,
             'reference_new_count': reference_new_count,
             'reference_old_count': reference_old_count,
@@ -345,7 +351,9 @@ class DgcSap(DGC):
 
         Procedure:
 
-        1. Build the oracle reference set (current task clean + all buffer clean).
+        1. Build the oracle reference set: all current-task clean samples on
+           Task 1; historical-buffer clean samples plus an equal, class-balanced
+           current-task clean subset on later tasks.
         2. Stream the classifier-input Gram matrix via the pre-hook.
         3. Build the input-side SAP projection matrix ``Mr`` (no truncation).
         4. Project the classifier weight in place; bias is untouched.
@@ -504,8 +512,8 @@ class DgcSap(DGC):
             projection_location='pre',
             projection_target='classifier',
             total_reference_count=total_images,
-            current_task_clean_count=reference_stats['current_task_clean_selected'],
-            buffer_clean_count=reference_stats['historical_buffer_clean_count'],
+            current_task_clean_count=reference_stats['current_task_clean_count'],
+            buffer_clean_count=reference_stats['buffer_clean_count'],
             current_task_clean_total=reference_stats['current_task_clean_total'],
             current_task_clean_selected=reference_stats['current_task_clean_selected'],
             historical_buffer_clean_count=reference_stats['historical_buffer_clean_count'],

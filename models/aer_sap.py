@@ -25,7 +25,9 @@ class AerSap(ErAceAerAbs):
         group.add_argument('--sap_batch_size', type=int, default=32)
         group.add_argument(
             '--sap_oracle_reference', type=int, default=1, choices=[1],
-            help='Use all oracle-clean current-task and final-buffer samples.',
+            help='Task 1 uses all current-task oracle-clean samples; later tasks '
+                 'use all historical-buffer oracle-clean samples plus an equal, '
+                 'class-balanced current-task oracle-clean subset.',
         )
         group.add_argument(
             '--sap_oracle_scale', type=float, default=100.0,

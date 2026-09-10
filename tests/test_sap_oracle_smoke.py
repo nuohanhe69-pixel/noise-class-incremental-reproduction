@@ -116,10 +116,13 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
         model._current_task = 0
         model._n_classes_current_task = 1
         model._n_seen_classes = 2
-        # An empty buffer (this is task 0 boundary; no old samples yet).
-        from utils.buffer import Buffer
-        model.buffer = Buffer(buffer_size=4, device=torch.device('cpu'),
-                              sample_selection_strategy='reservoir')
+        # Task 1 must report real buffer diagnostics while excluding the
+        # buffer from its reference set.
+        model.buffer = _FakeBuffer(
+            torch.randint(0, 256, (3, 3, 32, 32), dtype=torch.uint8),
+            torch.tensor([4, 5, 6]),
+            torch.tensor([4, 5, 6]),
+        )
         model.dataset = fake_dataset
         model.normalization_transform = lambda x: x  # identity in this smoke test
         model.ogc_loss_fn = None
@@ -181,8 +184,8 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
         self.assertEqual(event['current_class_selected_counts'], {0: 12, 1: 13})
         self.assertEqual(event['reference_sampling_seed'], 0)
         self.assertEqual(event['total_reference_count'], 25)
-        self.assertEqual(event['buffer_total_count'], 0)
-        self.assertEqual(event['buffer_clean_count'], 0)
+        self.assertEqual(event['buffer_total_count'], 3)
+        self.assertEqual(event['buffer_clean_count'], 3)
         self.assertEqual(event['gram_shape'], [backbone.classifier.in_features] * 2)
         self.assertGreater(event['gram_trace'], 0.0)
         for statistic in ('min', 'median', 'mean', 'max'):
@@ -266,7 +269,10 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
         self.assertEqual(len(images), 3)
         self.assertEqual(labels.tolist(), [0, 1, 1])
         self.assertEqual(stats['current_task_clean_total'], 3)
+        self.assertEqual(stats['current_task_clean_count'], 3)
         self.assertEqual(stats['current_task_clean_selected'], 3)
+        self.assertEqual(stats['buffer_total_count'], 3)
+        self.assertEqual(stats['buffer_clean_count'], 3)
         self.assertEqual(stats['reference_new_count'], 3)
         self.assertEqual(stats['reference_old_count'], 0)
         self.assertEqual(stats['historical_buffer_clean_count'], 0)
@@ -287,7 +293,17 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
 
         self.assertEqual(stats['reference_new_count'], 5)
         self.assertEqual(stats['reference_old_count'], 5)
+        self.assertGreaterEqual(
+            stats['current_task_clean_count'], stats['current_task_clean_selected'],
+        )
+        self.assertGreaterEqual(
+            stats['buffer_clean_count'], stats['historical_buffer_clean_count'],
+        )
         self.assertEqual(stats['historical_buffer_clean_count'], 5)
+        self.assertEqual(
+            stats['total_reference_count'],
+            stats['reference_new_count'] + stats['reference_old_count'],
+        )
         self.assertEqual(stats['total_reference_count'], 10)
         self.assertEqual(len(images), 10)
         self.assertEqual(labels[5:].tolist(), [0, 0, 1, 1, 1])
