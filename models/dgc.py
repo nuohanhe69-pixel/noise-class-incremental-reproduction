@@ -668,11 +668,15 @@ class DGC(ErAceAerAbs):
                                          round((1 - self.args.alpha_sample_insertion) * inputs.shape[0]),
                                          largest=False)
 
-                trace_enabled = self.loss_trace_recorder is not None
+                trace_enabled = self._should_store_buffer_metadata()
+                buffer_source_task_ids = (
+                    self._buffer_source_task_ids(source_task_ids, labels)
+                    if trace_enabled else None
+                )
                 self.buffer.add_data(examples=not_aug_inputs[clean_mask],
                                      labels=labels[clean_mask],
                                      true_labels=true_labels[clean_mask] if true_labels is not None else None,
-                                     task_labels=source_task_ids[clean_mask] if trace_enabled and source_task_ids is not None else None,
+                                     task_labels=buffer_source_task_ids[clean_mask] if buffer_source_task_ids is not None else None,
                                      sample_ids=sample_ids[clean_mask] if trace_enabled and sample_ids is not None else None,
                                      sample_selection_scores=loss_not_aug_ext_for_buffer[clean_mask] if self.args.sample_selection_strategy != 'reservoir' else None)
 

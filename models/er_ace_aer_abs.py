@@ -142,6 +142,12 @@ class ErAceAerAbs(ContinualModel):
         """Whether buffer entries need oracle/debug metadata alongside training data."""
         return self.loss_trace_recorder is not None
 
+    def _buffer_source_task_ids(self, source_task_ids, labels):
+        """Return stable source-task metadata for samples inserted in the buffer."""
+        if source_task_ids is not None:
+            return source_task_ids
+        return torch.full_like(labels, int(self.current_task))
+
     def _record_loss_trace(self, *, epoch: int, not_aug_inputs: torch.Tensor, labels: torch.Tensor,
                            true_labels: torch.Tensor, sample_ids: torch.Tensor, source_task_ids: torch.Tensor,
                            memory_inputs=None, memory_labels=None, memory_indexes=None) -> None:
@@ -291,10 +297,14 @@ class ErAceAerAbs(ContinualModel):
                 _, clean_mask = torch.topk(loss_not_aug_ext, round((1 - self.args.alpha_sample_insertion) * inputs.shape[0]), largest=False)
 
                 trace_enabled = self._should_store_buffer_metadata()
+                buffer_source_task_ids = (
+                    self._buffer_source_task_ids(source_task_ids, labels)
+                    if trace_enabled else None
+                )
                 self.buffer.add_data(examples=not_aug_inputs[clean_mask],
                                      labels=labels[clean_mask],
                                      true_labels=true_labels[clean_mask] if trace_enabled and true_labels is not None else None,
-                                     task_labels=source_task_ids[clean_mask] if trace_enabled and source_task_ids is not None else None,
+                                     task_labels=buffer_source_task_ids[clean_mask] if buffer_source_task_ids is not None else None,
                                      sample_ids=sample_ids[clean_mask] if trace_enabled and sample_ids is not None else None,
                                      sample_selection_scores=loss_not_aug_ext[clean_mask] if self.args.sample_selection_strategy != 'reservoir' else None)
 

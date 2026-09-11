@@ -91,6 +91,9 @@ class DgcSap(DGC):
         self.sap_trajectory_history = {}
         self.sap_history = []
 
+    def _should_store_buffer_metadata(self) -> bool:
+        return bool(getattr(self.args, 'sap_oracle_reference', 0)) or super()._should_store_buffer_metadata()
+
     def _normalized_batches(self, images, labels=None):
         for start in range(0, len(images), self.args.sap_batch_size):
             batch_images = images[start:start + self.args.sap_batch_size].to(self.device)
@@ -230,7 +233,7 @@ class DgcSap(DGC):
         clean_mask = observed_cpu == task_true_labels_all
         clean_task_images = images[clean_mask]
         clean_task_labels = task_true_labels_all[clean_mask]
-        current_classes = task_true_labels_all.unique(sorted=True)
+        current_classes = clean_task_labels.unique(sorted=True)
         current_task_clean_total = int(clean_task_images.shape[0])
         sampling_seed = int(getattr(self.args, 'seed', 0) or 0) + int(self.current_task)
 
@@ -257,8 +260,11 @@ class DgcSap(DGC):
                 # Task 1 records the real buffer diagnostics but never uses
                 # buffer samples as references because no historical task exists.
                 if self.current_task > 0:
-                    belongs_to_current_task = torch.isin(buf_true, current_classes)
-                    keep = clean & ~belongs_to_current_task
+                    if not hasattr(self.buffer, 'task_labels') or self.buffer.task_labels is None:
+                        raise ValueError('oracle mode requires buffer.task_labels to be set')
+                    buf_source_task_ids = self.buffer.task_labels[:len(buf_labels)].detach().cpu().long()
+                    historical = buf_source_task_ids < int(self.current_task)
+                    keep = clean & historical
                     buffer_images = buf_images[keep]
                     buffer_true = buf_true[keep]
                     historical_buffer_clean_count = int(buffer_images.shape[0])

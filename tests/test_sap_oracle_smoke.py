@@ -31,10 +31,11 @@ class _FakeTrainDataset:
 
 
 class _FakeBuffer:
-    def __init__(self, images, observed_labels, true_labels):
+    def __init__(self, images, observed_labels, true_labels, source_task_ids):
         self.images = images
         self.observed_labels = observed_labels
         self.true_labels = true_labels
+        self.task_labels = source_task_ids
 
     def is_empty(self):
         return len(self.images) == 0
@@ -122,6 +123,7 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
             torch.randint(0, 256, (3, 3, 32, 32), dtype=torch.uint8),
             torch.tensor([4, 5, 6]),
             torch.tensor([4, 5, 6]),
+            torch.tensor([0, 0, 0]),
         )
         model.dataset = fake_dataset
         model.normalization_transform = lambda x: x  # identity in this smoke test
@@ -261,6 +263,7 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
             torch.randint(0, 256, (3, 3, 32, 32), dtype=torch.uint8),
             torch.tensor([4, 5, 6]),
             torch.tensor([4, 5, 6]),
+            torch.tensor([0, 0, 0]),
         )
         model, dataset = _reference_model(train, buffer, current_task=0)
 
@@ -277,7 +280,7 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
         self.assertEqual(stats['reference_old_count'], 0)
         self.assertEqual(stats['historical_buffer_clean_count'], 0)
 
-    def test_later_tasks_balance_new_old_and_exclude_current_classes_from_old(self):
+    def test_later_tasks_balance_new_old_and_select_history_by_source_task(self):
         true_labels = torch.tensor([2] * 8 + [3] * 8)
         train = _FakeTrainDataset(16, 2, true_labels, true_labels.clone())
         buffer_true = torch.tensor([0, 0, 1, 1, 1, 2, 3, 0])
@@ -286,6 +289,7 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
             torch.randint(0, 256, (8, 3, 32, 32), dtype=torch.uint8),
             buffer_observed,
             buffer_true,
+            torch.tensor([0, 0, 0, 0, 0, 1, 1, 0]),
         )
         model, dataset = _reference_model(train, buffer, current_task=1, seed=17)
 
@@ -299,6 +303,7 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
         self.assertGreaterEqual(
             stats['buffer_clean_count'], stats['historical_buffer_clean_count'],
         )
+        self.assertEqual(stats['buffer_clean_count'], 7)
         self.assertEqual(stats['historical_buffer_clean_count'], 5)
         self.assertEqual(
             stats['total_reference_count'],
@@ -318,6 +323,7 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
             torch.randint(0, 256, (old_count, 3, 32, 32), dtype=torch.uint8),
             torch.arange(old_count) % 2,
             torch.arange(old_count) % 2,
+            torch.zeros(old_count, dtype=torch.long),
         )
         model, dataset = _reference_model(train, buffer, current_task=2, seed=0)
 
@@ -335,6 +341,7 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
             torch.randint(0, 256, (7, 3, 32, 32), dtype=torch.uint8),
             torch.tensor([0, 0, 0, 1, 1, 1, 1]),
             torch.tensor([0, 0, 0, 1, 1, 1, 1]),
+            torch.zeros(7, dtype=torch.long),
         )
         model_a, dataset_a = _reference_model(train, buffer, current_task=1, seed=9)
         model_b, dataset_b = _reference_model(train, buffer, current_task=1, seed=9)
@@ -346,6 +353,38 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
         torch.testing.assert_close(images_a, images_b)
         torch.testing.assert_close(labels_a, labels_b)
         self.assertEqual(stats_a, stats_b)
+
+    def test_noisy_foreign_true_label_does_not_hide_historical_buffer_samples(self):
+        true_labels = torch.tensor([2, 2, 3, 3, 0])
+        observed_labels = torch.tensor([2, 2, 3, 3, 2])
+        train = _FakeTrainDataset(5, 3, true_labels, observed_labels)
+        buffer = _FakeBuffer(
+            torch.randint(0, 256, (2, 3, 32, 32), dtype=torch.uint8),
+            torch.tensor([0, 1]),
+            torch.tensor([0, 1]),
+            torch.tensor([0, 0]),
+        )
+        model, dataset = _reference_model(train, buffer, current_task=1, seed=0)
+
+        _, labels, stats = model._build_oracle_reference_batches(dataset)
+
+        self.assertEqual(stats['reference_new_count'], 2)
+        self.assertEqual(stats['reference_old_count'], 2)
+        self.assertEqual(labels[-2:].tolist(), [0, 1])
+        self.assertEqual(set(stats['current_class_selected_counts']), {2, 3})
+
+    def test_oracle_dgc_requests_stable_source_task_metadata(self):
+        model = DgcSap.__new__(DgcSap)
+        nn.Module.__init__(model)
+        model.args = Namespace(sap_oracle_reference=1)
+        model.loss_trace_recorder = None
+        model._current_task = 3
+
+        self.assertTrue(model._should_store_buffer_metadata())
+        torch.testing.assert_close(
+            model._buffer_source_task_ids(None, torch.tensor([4, 5])),
+            torch.tensor([3, 3]),
+        )
 
 
 if __name__ == '__main__':

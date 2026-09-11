@@ -66,6 +66,11 @@ class AerSapContractTests(unittest.TestCase):
         self.assertTrue(model._should_store_buffer_metadata())
         self.assertIsNone(model.loss_trace_recorder)
 
+        labels = torch.tensor([2, 3, 2])
+        model._current_task = 4
+        source_task_ids = model._buffer_source_task_ids(None, labels)
+        torch.testing.assert_close(source_task_ids, torch.tensor([4, 4, 4]))
+
     def test_oracle_boundary_projects_full_linear_and_refreshes_aer_checkpoint(self):
         from argparse import Namespace
         from models.aer_sap import AerSap
