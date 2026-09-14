@@ -12,6 +12,9 @@ from models.dgc_sap import (
 from models.er_ace_aer_abs import ErAceAerAbs
 
 
+SAP_SKIPPED_FINAL_ONLY = 'SAP_SKIPPED_FINAL_ONLY'
+
+
 class AerSap(ErAceAerAbs):
     """AER/ABS + Oracle Linear SAP, without DGC/OGC."""
 
@@ -74,4 +77,7 @@ class AerSap(ErAceAerAbs):
 
     def end_task(self, dataset):
         super().end_task(dataset)
+        if self.current_task != int(dataset.N_TASKS) - 1:
+            self._record_sap_event(status=SAP_SKIPPED_FINAL_ONLY)
+            return
         self._run_task_boundary_sap(dataset)
