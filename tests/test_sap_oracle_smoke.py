@@ -9,6 +9,7 @@ DgcSap, and runs the oracle boundary function directly. Validates:
 
 import unittest
 from argparse import Namespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -314,6 +315,46 @@ class OracleEndToEndSmokeTests(unittest.TestCase):
         self.assertEqual(labels[5:].tolist(), [0, 0, 1, 1, 1])
         self.assertNotIn(2, labels[5:].tolist())
         self.assertNotIn(3, labels[5:].tolist())
+
+    def test_optional_task_ids_are_aligned_without_resampling_reference(self):
+        true_labels = torch.tensor([2] * 8 + [3] * 8)
+        train = _FakeTrainDataset(16, 2, true_labels, true_labels.clone())
+        buffer_true = torch.tensor([0, 0, 1, 1, 1, 2, 3, 0])
+        buffer_observed = torch.tensor([0, 0, 1, 1, 1, 2, 3, 9])
+        buffer = _FakeBuffer(
+            torch.randint(0, 256, (8, 3, 32, 32), dtype=torch.uint8),
+            buffer_observed,
+            buffer_true,
+            torch.tensor([0, 0, 0, 0, 0, 1, 1, 0]),
+        )
+        model, dataset = _reference_model(train, buffer, current_task=1, seed=17)
+
+        with patch('models.dgc_sap.torch.randperm', wraps=torch.randperm) as randperm:
+            images, labels, task_ids, stats = model._build_oracle_reference_batches(
+                dataset, return_task_ids=True,
+            )
+
+        self.assertEqual(randperm.call_count, 2)
+        self.assertEqual(len(images), len(labels))
+        self.assertEqual(len(labels), len(task_ids))
+        self.assertEqual(task_ids[:stats['reference_new_count']].tolist(), [1] * 5)
+        self.assertEqual(task_ids[stats['reference_new_count']:].tolist(), [0] * 5)
+        self.assertEqual(labels[stats['reference_new_count']:].tolist(), [0, 0, 1, 1, 1])
+
+    def test_reference_builder_default_return_contract_is_unchanged(self):
+        true_labels = torch.tensor([0, 0, 1, 1])
+        train = _FakeTrainDataset(4, 2, true_labels, true_labels.clone())
+        buffer = _FakeBuffer(
+            torch.empty(0, 3, 32, 32, dtype=torch.uint8),
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.long),
+        )
+        model, dataset = _reference_model(train, buffer, current_task=0)
+
+        result = model._build_oracle_reference_batches(dataset)
+
+        self.assertEqual(len(result), 3)
 
     def test_current_class_sampling_is_balanced_and_remainder_goes_to_first_classes(self):
         true_labels = torch.tensor([20] * 8 + [21] * 8 + [22] * 8)

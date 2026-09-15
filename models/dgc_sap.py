@@ -212,7 +212,7 @@ class DgcSap(DGC):
         if epoch_number in self.args.sap_score_epochs:
             self._record_current_task_trajectory(dataset, epoch_number)
 
-    def _build_oracle_reference_batches(self, dataset):
+    def _build_oracle_reference_batches(self, dataset, *, return_task_ids=False):
         """Build the balanced oracle reference set used by Linear SAP.
 
         Task 1 keeps every oracle-clean current-task sample and ignores the
@@ -239,6 +239,7 @@ class DgcSap(DGC):
 
         buffer_images = None
         buffer_true = None
+        buffer_task_ids = None
         buffer_total = 0
         buffer_clean_count = 0
         historical_buffer_clean_count = 0
@@ -267,6 +268,7 @@ class DgcSap(DGC):
                     keep = clean & historical
                     buffer_images = buf_images[keep]
                     buffer_true = buf_true[keep]
+                    buffer_task_ids = buf_source_task_ids[keep]
                     historical_buffer_clean_count = int(buffer_images.shape[0])
 
         if self.current_task == 0:
@@ -329,13 +331,18 @@ class DgcSap(DGC):
         }
         reference_new_count = int(selected_task_images.shape[0])
         reference_old_count = historical_buffer_clean_count
+        selected_task_ids = torch.full(
+            (reference_new_count,), int(self.current_task), dtype=torch.long,
+        )
 
         if reference_old_count > 0:
             all_images = torch.cat([selected_task_images, buffer_images], dim=0)
             all_true_labels = torch.cat([selected_task_labels, buffer_true], dim=0)
+            all_task_ids = torch.cat([selected_task_ids, buffer_task_ids], dim=0)
         else:
             all_images = selected_task_images
             all_true_labels = selected_task_labels
+            all_task_ids = selected_task_ids
 
         stats = {
             'current_task_clean_total': current_task_clean_total,
@@ -350,6 +357,8 @@ class DgcSap(DGC):
             'reference_sampling_seed': sampling_seed,
             'buffer_total_count': buffer_total,
         }
+        if return_task_ids:
+            return all_images, all_true_labels, all_task_ids, stats
         return all_images, all_true_labels, stats
 
     def _run_oracle_classifier_sap(self, dataset) -> None:
