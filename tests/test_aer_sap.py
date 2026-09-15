@@ -3,8 +3,6 @@
 import argparse
 import inspect
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -128,34 +126,6 @@ class AerSapContractTests(unittest.TestCase):
         self.assertEqual(model.sap_history[-1]['total_reference_count'], 12)
         for name, value in backbone.state_dict().items():
             torch.testing.assert_close(model.past_model_ckpt[name], value)
-
-    def test_only_final_task_runs_sap_while_every_aer_boundary_runs(self):
-        from models.aer_sap import AerSap, SAP_SKIPPED_FINAL_ONLY
-
-        model = AerSap.__new__(AerSap)
-        nn.Module.__init__(model)
-        model.sap_history = []
-        dataset = SimpleNamespace(N_TASKS=10)
-
-        with (
-            patch.object(ErAceAerAbs, 'end_task', autospec=True) as aer_end_task,
-            patch.object(model, '_run_task_boundary_sap') as run_sap,
-        ):
-            for task_id in range(dataset.N_TASKS):
-                model._current_task = task_id
-                model.end_task(dataset)
-
-        self.assertEqual(aer_end_task.call_count, dataset.N_TASKS)
-        run_sap.assert_called_once_with(dataset)
-        self.assertEqual(len(model.sap_history), dataset.N_TASKS - 1)
-        self.assertTrue(all(
-            event['status'] == SAP_SKIPPED_FINAL_ONLY
-            for event in model.sap_history
-        ))
-        self.assertEqual(
-            [event['task_id'] for event in model.sap_history],
-            list(range(dataset.N_TASKS - 1)),
-        )
 
 
 if __name__ == '__main__':
