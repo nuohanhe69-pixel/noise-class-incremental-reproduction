@@ -198,6 +198,20 @@ class CurrentBlockHybridTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             e1.validate_source_provenance(args)
 
+    def test_source_provenance_accepts_symmetric_alias_and_rejects_other_noise_types(self):
+        args = SimpleNamespace(
+            dataset='seq-cifar100', model='aer-sap', backbone='resnet18',
+            seed=0, noise_rate=0.2, noise_type='symmetric', sap_oracle_scale=3000.0,
+            debug_mode=0, eval_future=False,
+        )
+
+        provenance = e1.validate_source_provenance(args)
+        self.assertEqual(provenance['noise_type'], 'symmetric')
+
+        args.noise_type = 'asymmetric'
+        with self.assertRaises(ValueError):
+            e1.validate_source_provenance(args)
+
     def test_output_directory_is_non_overwriting_and_artifacts_are_minimal(self):
         candidates = {
             'current_local': self.weight_before.clone(),

@@ -59,8 +59,8 @@ def validate_source_provenance(args) -> dict:
         failures.append('model must be aer-sap')
     if provenance['seed'] != 0:
         failures.append('seed must be 0')
-    if provenance['noise_type'] != 'symm':
-        failures.append('noise_type must be symm')
+    if provenance['noise_type'] not in {'symm', 'symmetric'}:
+        failures.append('noise_type must be symm or symmetric')
     if provenance['noise_rate'] is None or abs(float(provenance['noise_rate']) - 0.2) > 1e-12:
         failures.append('noise_rate must be 0.2')
     if provenance['sap_oracle_scale'] is None or abs(
