@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -228,6 +229,48 @@ class Task10CenteringTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             e3.build_centered_projection(gram, scale=2999.0)
 
+    def test_gram_spectrum_diagnostics_match_known_diagonal_spectrum(self):
+        eigenvalues = torch.arange(12, 0, -1, dtype=torch.float64)
+        diagnostics = e3._gram_spectrum_diagnostics(torch.diag(eigenvalues))
+        probabilities = eigenvalues / eigenvalues.sum()
+        expected_effective_rank = torch.exp(
+            -(probabilities * probabilities.log()).sum(),
+        ).item()
+
+        self.assertEqual(
+            set(diagnostics),
+            {'trace', 'top1_energy_ratio', 'top10_energy_ratio', 'effective_rank'},
+        )
+        self.assertAlmostEqual(diagnostics['trace'], 78.0)
+        self.assertAlmostEqual(diagnostics['top1_energy_ratio'], 12.0 / 78.0)
+        self.assertAlmostEqual(diagnostics['top10_energy_ratio'], 75.0 / 78.0)
+        self.assertAlmostEqual(
+            diagnostics['effective_rank'], expected_effective_rank,
+        )
+        self.assertTrue(all(math.isfinite(value) for value in diagnostics.values()))
+
+    def test_projection_diagnostics_match_known_diagonal_spectrum(self):
+        projection = torch.diag(torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64))
+        diagnostics = e3._projection_spectrum_diagnostics(projection)
+
+        self.assertEqual(
+            set(diagnostics),
+            {
+                'trace',
+                'mean_eigenvalue',
+                'median_eigenvalue',
+                'frobenius_distance_to_identity_ratio',
+            },
+        )
+        self.assertAlmostEqual(diagnostics['trace'], 6.0)
+        self.assertAlmostEqual(diagnostics['mean_eigenvalue'], 2.0)
+        self.assertAlmostEqual(diagnostics['median_eigenvalue'], 2.0)
+        self.assertAlmostEqual(
+            diagnostics['frobenius_distance_to_identity_ratio'],
+            math.sqrt(5.0 / 3.0),
+        )
+        self.assertTrue(all(math.isfinite(value) for value in diagnostics.values()))
+
     def test_treatment_clones_control_and_replaces_only_last_task_from_w_before(self):
         dataset = _TenTaskDataset()
         weight_before = torch.arange(60, dtype=torch.float32).reshape(15, 4) + 1
@@ -416,6 +459,33 @@ class Task10CenteringTests(unittest.TestCase):
                 torch.load(output / 'task10_mean.pt', weights_only=True),
                 fixture['task10_features'].mean(dim=0, keepdim=True),
             )
+            for filename, expected_keys in (
+                (
+                    'gram_diagnostics.json',
+                    {
+                        'trace', 'top1_energy_ratio',
+                        'top10_energy_ratio', 'effective_rank',
+                    },
+                ),
+                (
+                    'projection_diagnostics.json',
+                    {
+                        'trace', 'mean_eigenvalue', 'median_eigenvalue',
+                        'frobenius_distance_to_identity_ratio',
+                    },
+                ),
+            ):
+                diagnostics = json.loads(
+                    (output / filename).read_text(encoding='utf-8'),
+                )
+                for state in ('uncentered', 'centered'):
+                    self.assertEqual(
+                        set(diagnostics[state]), expected_keys,
+                    )
+                    self.assertTrue(all(
+                        math.isfinite(value)
+                        for value in diagnostics[state].values()
+                    ))
 
     def test_run_e3_control_accuracy_mismatch_stops_before_treatment_and_save(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

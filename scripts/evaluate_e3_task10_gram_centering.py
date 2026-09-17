@@ -66,6 +66,66 @@ def _delta_stats(actual: Tensor, expected: Tensor) -> dict[str, float | bool]:
     }
 
 
+def _gram_spectrum_diagnostics(gram: Tensor) -> dict[str, float]:
+    if gram.ndim != 2 or gram.shape[0] != gram.shape[1] or gram.shape[0] == 0:
+        raise ValueError('Gram diagnostics require a non-empty square matrix')
+    if not gram.is_floating_point() or not torch.isfinite(gram).all():
+        raise ValueError('Gram diagnostics require a finite floating-point matrix')
+    symmetric_gram = (gram + gram.transpose(0, 1)) * 0.5
+    energy = torch.linalg.eigvalsh(symmetric_gram).clamp_min(0)
+    total_energy = energy.sum()
+    if total_energy <= 0:
+        raise ValueError('Gram diagnostics require positive spectral energy')
+    energy_ratios = energy / total_energy
+    positive_ratios = energy_ratios[energy_ratios > 0]
+    effective_rank = torch.exp(
+        -(positive_ratios * positive_ratios.log()).sum(),
+    )
+    top_count = min(10, energy_ratios.numel())
+    diagnostics = {
+        'trace': float(gram.trace().item()),
+        'top1_energy_ratio': float(energy_ratios[-1].item()),
+        'top10_energy_ratio': float(energy_ratios[-top_count:].sum().item()),
+        'effective_rank': float(effective_rank.item()),
+    }
+    if not torch.isfinite(torch.tensor(list(diagnostics.values()))).all():
+        raise ValueError('Gram diagnostics contain NaN or Inf')
+    return diagnostics
+
+
+def _projection_spectrum_diagnostics(projection: Tensor) -> dict[str, float]:
+    if (
+        projection.ndim != 2
+        or projection.shape[0] != projection.shape[1]
+        or projection.shape[0] == 0
+    ):
+        raise ValueError('projection diagnostics require a non-empty square matrix')
+    if not projection.is_floating_point() or not torch.isfinite(projection).all():
+        raise ValueError(
+            'projection diagnostics require a finite floating-point matrix'
+        )
+    symmetric_projection = (
+        projection + projection.transpose(0, 1)
+    ) * 0.5
+    eigenvalues = torch.linalg.eigvalsh(symmetric_projection)
+    identity = torch.eye(
+        projection.shape[0],
+        device=projection.device,
+        dtype=projection.dtype,
+    )
+    diagnostics = {
+        'trace': float(projection.trace().item()),
+        'mean_eigenvalue': float(eigenvalues.mean().item()),
+        'median_eigenvalue': float(eigenvalues.median().item()),
+        'frobenius_distance_to_identity_ratio': float(
+            ((projection - identity).norm() / identity.norm()).item()
+        ),
+    }
+    if not torch.isfinite(torch.tensor(list(diagnostics.values()))).all():
+        raise ValueError('projection diagnostics contain NaN or Inf')
+    return diagnostics
+
+
 def build_task10_centered_geometry(
     x_global: Tensor,
     trusted_task_ids: Tensor,
@@ -155,6 +215,8 @@ def build_task10_centered_geometry(
         'centered_mean_abs_max': centered_mean_abs_max,
         'uncentered_gram_trace': float(saved_uncentered_gram.trace().item()),
         'centered_gram_trace': float(centered_gram.trace().item()),
+        'uncentered': _gram_spectrum_diagnostics(saved_uncentered_gram),
+        'centered': _gram_spectrum_diagnostics(centered_gram),
         'trace_identity_abs_delta': float(
             (centered_gram.trace() - expected_centered_trace).abs().item()
         ),
@@ -318,6 +380,8 @@ def _projection_diagnostics(
         'uncentered_projection_shape': list(uncentered_projection.shape),
         'centered_projection_shape': list(centered_projection.shape),
         'centered_projection_symmetry_max_abs_delta': float(symmetry_delta.item()),
+        'uncentered': _projection_spectrum_diagnostics(uncentered_projection),
+        'centered': _projection_spectrum_diagnostics(centered_projection),
         'centered_vs_uncentered': _delta_stats(
             centered_projection,
             uncentered_projection,
