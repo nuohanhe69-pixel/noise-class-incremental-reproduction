@@ -27,7 +27,7 @@ from utils.sap import (
 )
 
 
-SAP_SKIPPED_FINAL_ONLY = 'SAP_SKIPPED_FINAL_ONLY'
+SAP_SKIPPED_FIRST_SESSION_ONLY = 'SAP_SKIPPED_FIRST_SESSION_ONLY'
 TASKWISE_SAP_STARTED = 'TASKWISE_SAP_STARTED'
 TASK_REFERENCE_EMPTY = 'TASK_REFERENCE_EMPTY'
 
@@ -46,8 +46,7 @@ class AerSap(ErAceAerAbs):
         group.add_argument(
             '--sap_oracle_reference', type=int, default=1, choices=[1],
             help='Task 1 uses all current-task oracle-clean samples; later tasks '
-                 'use all historical-buffer oracle-clean samples plus an equal, '
-                 'class-balanced current-task oracle-clean subset.',
+                 'skip the SAP pipeline.',
         )
         group.add_argument(
             '--sap_oracle_scale', type=float, default=100.0,
@@ -113,7 +112,7 @@ class AerSap(ErAceAerAbs):
         per_task_class_il = [float(value) for value in per_task_class_il]
         per_task_task_il = [float(value) for value in per_task_task_il]
         if not per_task_class_il or not per_task_task_il:
-            raise ValueError('final SAP evaluation returned no task accuracies')
+            raise ValueError('SAP evaluation returned no task accuracies')
         return {
             'class_il': sum(per_task_class_il) / len(per_task_class_il),
             'task_il': sum(per_task_task_il) / len(per_task_task_il),
@@ -122,20 +121,34 @@ class AerSap(ErAceAerAbs):
         }
 
     @staticmethod
-    def _build_reference_coverage(dataset, trusted_labels, trusted_task_ids) -> dict:
+    def _build_reference_coverage(
+        dataset, trusted_labels, trusted_task_ids, seen_tasks,
+    ) -> dict:
         labels_cpu = trusted_labels.detach().cpu().long()
         task_ids_cpu = trusted_task_ids.detach().cpu().long()
+        seen_tasks = [int(task_id) for task_id in seen_tasks]
+        unexpected_task_ids = sorted(
+            set(task_ids_cpu.unique().tolist()).difference(seen_tasks)
+        )
+        if unexpected_task_ids:
+            raise ValueError(
+                f'trusted references contain unseen task ids: {unexpected_task_ids}'
+            )
+        seen_classes = []
+        for task_id in seen_tasks:
+            start_c, end_c = dataset.get_offsets(task_id)
+            seen_classes.extend(range(int(start_c), int(end_c)))
         class_counts = {
             str(class_id): int((labels_cpu == class_id).sum().item())
-            for class_id in range(int(dataset.N_CLASSES))
+            for class_id in seen_classes
         }
         task_counts = {
             str(task_id): int((task_ids_cpu == task_id).sum().item())
-            for task_id in range(int(dataset.N_TASKS))
+            for task_id in seen_tasks
         }
         tasks = {}
         empty_tasks = []
-        for task_id in range(int(dataset.N_TASKS)):
+        for task_id in seen_tasks:
             start_c, end_c = dataset.get_offsets(task_id)
             expected_classes = list(range(int(start_c), int(end_c)))
             present_classes = sorted(
@@ -175,7 +188,7 @@ class AerSap(ErAceAerAbs):
             / dataset.SETTING
             / dataset.NAME
             / self.NAME
-            / 'final_only_taskwise_sap'
+            / 'first_session_only_taskwise_sap_v1'
             / str(run_id)
         )
 
@@ -184,29 +197,25 @@ class AerSap(ErAceAerAbs):
         dataset,
         *,
         weight_before,
-        x_global,
+        x_task1,
         trusted_labels,
         trusted_task_ids,
+        reference_stats,
         coverage,
-        global_gram,
         task_grams,
-        global_projection,
         task_projections,
-        weight_after_global,
-        weight_after_taskwise,
+        weight_after,
         accuracy,
+        manifest,
     ) -> Path:
         output_directory = self._taskwise_artifact_directory(dataset)
         output_directory.mkdir(parents=True, exist_ok=True)
         tensors = {
             'W_before.pt': weight_before,
-            'X_global.pt': x_global,
+            'X_task1.pt': x_task1,
             'trusted_labels.pt': trusted_labels,
             'trusted_task_ids.pt': trusted_task_ids,
-            'G_global.pt': global_gram,
-            'M_global.pt': global_projection,
-            'W_after_global.pt': weight_after_global,
-            'W_after_taskwise.pt': weight_after_taskwise,
+            'W_after.pt': weight_after,
         }
         for filename, tensor in tensors.items():
             torch.save(tensor.detach().cpu(), output_directory / filename)
@@ -221,13 +230,19 @@ class AerSap(ErAceAerAbs):
         (output_directory / 'coverage.json').write_text(
             json.dumps(coverage, indent=2, sort_keys=True), encoding='utf-8',
         )
+        (output_directory / 'reference_stats.json').write_text(
+            json.dumps(reference_stats, indent=2, sort_keys=True), encoding='utf-8',
+        )
         (output_directory / 'accuracy.json').write_text(
             json.dumps(accuracy, indent=2, sort_keys=True), encoding='utf-8',
         )
+        (output_directory / 'manifest.json').write_text(
+            json.dumps(manifest, indent=2, sort_keys=True), encoding='utf-8',
+        )
         return output_directory
 
-    def _run_final_taskwise_sap(self, dataset) -> None:
-        """Evaluate Identity/Global/Task-wise SAP from one final-task snapshot."""
+    def _run_first_session_taskwise_sap(self, dataset) -> None:
+        """Apply Task-wise SAP once after Task 1's complete AER boundary."""
         self._record_sap_event(status=TASKWISE_SAP_STARTED)
         classifier = None
         weight_before = None
@@ -244,12 +259,13 @@ class AerSap(ErAceAerAbs):
             )
             total_images = int(all_images.shape[0])
             if total_images == 0:
-                raise ValueError('final task-wise SAP reference set is empty')
+                raise ValueError('first-session task-wise SAP reference set is empty')
             if not (
                 len(trusted_labels) == total_images
                 and len(trusted_task_ids) == total_images
             ):
                 raise ValueError('trusted images, labels, and task ids are not aligned')
+            seen_tasks = list(range(int(self.current_task) + 1))
 
             stage = 'classifier_snapshot'
             classifier = resolve_classifier_module(self.net)
@@ -271,10 +287,10 @@ class AerSap(ErAceAerAbs):
             features = collect_classifier_input_features(
                 self.net, image_batches(), total_images=total_images,
             )
-            x_global, feature_norm_stats = normalize_classifier_input_features(features)
-            if x_global.shape[0] != total_images:
+            x_task1, feature_norm_stats = normalize_classifier_input_features(features)
+            if x_task1.shape[0] != total_images:
                 raise ValueError('normalized features are not aligned with the reference set')
-            if x_global.shape[1] != weight_before.shape[1]:
+            if x_task1.shape[1] != weight_before.shape[1]:
                 raise ValueError(
                     'classifier input dimension does not match normalized features'
                 )
@@ -283,7 +299,7 @@ class AerSap(ErAceAerAbs):
 
             stage = 'coverage'
             coverage = self._build_reference_coverage(
-                dataset, trusted_labels, trusted_task_ids,
+                dataset, trusted_labels, trusted_task_ids, seen_tasks,
             )
             logging.info(
                 'Task-wise SAP reference: total=%d task_counts=%s missing_classes=%s '
@@ -307,26 +323,17 @@ class AerSap(ErAceAerAbs):
                     f"empty trusted task references: {coverage['empty_tasks']}"
                 )
 
-            stage = 'global_projection'
-            global_gram = x_global.transpose(0, 1) @ x_global
-            (
-                global_projection,
-                global_energy,
-                global_normalized_energy,
-                global_importance,
-            ) = self._build_oracle_projection(global_gram)
-            weight_after_global, global_weight_stats = project_linear_weight(
-                weight_before, global_projection,
-            )
-
             stage = 'taskwise_projection'
             weight_after_taskwise = weight_before.clone()
             task_grams = {}
             task_projections = {}
             task_projection_stats = {}
-            task_ids_device = trusted_task_ids.to(x_global.device)
-            for task_id in range(int(dataset.N_TASKS)):
-                task_features = x_global[task_ids_device == task_id]
+            task_ids_device = trusted_task_ids.to(x_task1.device)
+            projected_row_mask = torch.zeros(
+                weight_before.shape[0], dtype=torch.bool, device=weight_before.device,
+            )
+            for task_id in seen_tasks:
+                task_features = x_task1[task_ids_device == task_id]
                 task_gram = task_features.transpose(0, 1) @ task_features
                 (
                     task_projection,
@@ -336,10 +343,12 @@ class AerSap(ErAceAerAbs):
                 ) = self._build_oracle_projection(task_gram)
                 task_grams[task_id] = task_gram
                 start_c, end_c = dataset.get_offsets(task_id)
+                start_c, end_c = int(start_c), int(end_c)
                 task_weight, task_weight_stats = project_linear_weight(
-                    weight_before[int(start_c):int(end_c), :], task_projection,
+                    weight_before[start_c:end_c, :], task_projection,
                 )
-                weight_after_taskwise[int(start_c):int(end_c), :] = task_weight
+                weight_after_taskwise[start_c:end_c, :] = task_weight
+                projected_row_mask[start_c:end_c] = True
                 task_projections[task_id] = task_projection
                 task_projection_stats[str(task_id)] = {
                     'reference_count': int(task_features.shape[0]),
@@ -350,24 +359,28 @@ class AerSap(ErAceAerAbs):
                     'importance_min': task_importance.min().item(),
                     'importance_median': task_importance.median().item(),
                     'importance_max': task_importance.max().item(),
+                    'importance_trace': task_importance.sum().item(),
                     'relative_weight_delta': task_weight_stats['relative_weight_delta'],
                     'weight_norm_ratio': task_weight_stats['weight_norm_ratio'],
                     'projection_shape': list(task_projection.shape),
                     'gram_eigenvalue_min': task_energy.min().item(),
                     'gram_eigenvalue_max': task_energy.max().item(),
                 }
+            if not torch.equal(
+                weight_after_taskwise[~projected_row_mask],
+                weight_before[~projected_row_mask],
+            ):
+                raise AssertionError('Task-wise SAP changed unseen classifier rows')
             taskwise_weight_stats = self._weight_stats(
                 weight_before, weight_after_taskwise,
             )
 
             stage = 'candidate_evaluation'
-            candidates = {
-                'identity': weight_before,
-                'global': weight_after_global,
-                'taskwise': weight_after_taskwise,
-            }
             accuracy = {}
-            for candidate_name, candidate_weight in candidates.items():
+            for candidate_name, candidate_weight in (
+                ('pre_sap', weight_before),
+                ('post_sap', weight_after_taskwise),
+            ):
                 self._install_classifier_candidate(
                     classifier, candidate_weight, bias_before,
                 )
@@ -377,21 +390,29 @@ class AerSap(ErAceAerAbs):
                     candidate_name, accuracy[candidate_name],
                 )
 
+            manifest = {
+                'experiment_name': 'first_session_only_taskwise_sap_v1',
+                'task_id': int(self.current_task),
+                'seen_tasks': seen_tasks,
+                'sap_alpha': float(self.args.sap_oracle_scale),
+                'projection_target': 'classifier',
+                'projection_scope': 'taskwise_seen_tasks',
+                'global_candidate_built': False,
+            }
             stage = 'artifact_save'
             output_directory = self._save_taskwise_artifacts(
                 dataset,
                 weight_before=weight_before,
-                x_global=x_global,
+                x_task1=x_task1,
                 trusted_labels=trusted_labels,
                 trusted_task_ids=trusted_task_ids,
+                reference_stats=reference_stats,
                 coverage=coverage,
-                global_gram=global_gram,
                 task_grams=task_grams,
-                global_projection=global_projection,
                 task_projections=task_projections,
-                weight_after_global=weight_after_global,
-                weight_after_taskwise=weight_after_taskwise,
+                weight_after=weight_after_taskwise,
                 accuracy=accuracy,
+                manifest=manifest,
             )
 
             stage = 'taskwise_commit'
@@ -400,14 +421,14 @@ class AerSap(ErAceAerAbs):
             )
             self.past_model_ckpt = copy.deepcopy(self.net.state_dict())
             logging.info(
-                'Task-wise SAP final selected candidate=taskwise artifacts=%s',
+                'First-session Task-wise SAP selected candidate=taskwise artifacts=%s',
                 output_directory,
             )
 
             task_accuracy_comparisons = []
             for task_id, (before, after) in enumerate(zip(
-                accuracy['identity']['per_task_class_il'],
-                accuracy['taskwise']['per_task_class_il'],
+                accuracy['pre_sap']['per_task_class_il'],
+                accuracy['post_sap']['per_task_class_il'],
             )):
                 test_loader = dataset.test_loaders[task_id] \
                     if task_id < len(dataset.test_loaders) else None
@@ -425,11 +446,15 @@ class AerSap(ErAceAerAbs):
                 0.0 if bias_before is None
                 else (classifier.bias.detach() - bias_before).abs().max().item()
             )
+            primary_task_id = seen_tasks[-1]
+            primary_gram = task_grams[primary_task_id]
+            primary_stats = task_projection_stats[str(primary_task_id)]
             self._record_sap_event(
                 status=SAP_ORACLE_EXECUTED,
                 projection_location='pre',
                 projection_target='classifier',
-                projection_scope='taskwise',
+                projection_scope='taskwise_seen_tasks',
+                seen_tasks=seen_tasks,
                 total_reference_count=total_images,
                 current_task_clean_count=reference_stats['current_task_clean_count'],
                 buffer_clean_count=reference_stats['buffer_clean_count'],
@@ -441,8 +466,8 @@ class AerSap(ErAceAerAbs):
                 current_class_selected_counts=reference_stats['current_class_selected_counts'],
                 reference_sampling_seed=reference_stats['reference_sampling_seed'],
                 buffer_total_count=reference_stats['buffer_total_count'],
-                gram_shape=list(global_gram.shape),
-                gram_trace=global_gram.trace().item(),
+                gram_shape=list(primary_gram.shape),
+                gram_trace=primary_gram.trace().item(),
                 feature_norm_before_min=feature_norm_stats['before']['min'],
                 feature_norm_before_median=feature_norm_stats['before']['median'],
                 feature_norm_before_mean=feature_norm_stats['before']['mean'],
@@ -451,26 +476,24 @@ class AerSap(ErAceAerAbs):
                 feature_norm_after_median=feature_norm_stats['after']['median'],
                 feature_norm_after_mean=feature_norm_stats['after']['mean'],
                 feature_norm_after_max=feature_norm_stats['after']['max'],
-                gram_eigenvalue_min=global_energy.min().item(),
-                gram_eigenvalue_max=global_energy.max().item(),
-                normalized_energy_min=global_normalized_energy.min().item(),
-                normalized_energy_median=global_normalized_energy.median().item(),
-                normalized_energy_max=global_normalized_energy.max().item(),
+                gram_eigenvalue_min=primary_stats['gram_eigenvalue_min'],
+                gram_eigenvalue_max=primary_stats['gram_eigenvalue_max'],
+                normalized_energy_min=primary_stats['normalized_energy_min'],
+                normalized_energy_median=primary_stats['normalized_energy_median'],
+                normalized_energy_max=primary_stats['normalized_energy_max'],
                 sap_alpha=float(self.args.sap_oracle_scale),
-                importance_min=global_importance.min().item(),
-                importance_median=global_importance.median().item(),
-                importance_max=global_importance.max().item(),
-                importance_trace=global_importance.sum().item(),
+                importance_min=primary_stats['importance_min'],
+                importance_median=primary_stats['importance_median'],
+                importance_max=primary_stats['importance_max'],
+                importance_trace=primary_stats['importance_trace'],
                 n_seen_classes=int(self.n_seen_classes),
                 total_classifier_rows=int(classifier.weight.shape[0]),
                 relative_weight_delta=taskwise_weight_stats['relative_weight_delta'],
                 weight_norm_ratio=taskwise_weight_stats['weight_norm_ratio'],
-                global_relative_weight_delta=global_weight_stats['relative_weight_delta'],
-                global_weight_norm_ratio=global_weight_stats['weight_norm_ratio'],
                 max_bias_delta=max_bias_delta,
                 seen_task_accuracy_comparisons=task_accuracy_comparisons,
-                seen_average_accuracy_before=accuracy['identity']['class_il'] / 100.0,
-                seen_average_accuracy_after=accuracy['taskwise']['class_il'] / 100.0,
+                seen_average_accuracy_before=accuracy['pre_sap']['class_il'] / 100.0,
+                seen_average_accuracy_after=accuracy['post_sap']['class_il'] / 100.0,
                 task_projection_stats=task_projection_stats,
                 accuracy=accuracy,
                 coverage=coverage,
@@ -489,7 +512,7 @@ class AerSap(ErAceAerAbs):
                 error_message=str(error),
             )
             logging.exception(
-                'Final task-wise Oracle SAP failed; pre-SAP classifier was restored.'
+                'First-session Task-wise Oracle SAP failed; pre-SAP classifier was restored.'
             )
 
     def _run_task_boundary_sap(self, dataset) -> None:
@@ -504,11 +527,11 @@ class AerSap(ErAceAerAbs):
         if getattr(self.args, 'inference_only', False):
             self._record_sap_event(status=SAP_SKIPPED_INFERENCE)
             return
-        self._run_final_taskwise_sap(dataset)
+        self._run_first_session_taskwise_sap(dataset)
 
     def end_task(self, dataset):
         super().end_task(dataset)
-        if self.current_task != int(dataset.N_TASKS) - 1:
-            self._record_sap_event(status=SAP_SKIPPED_FINAL_ONLY)
+        if self.current_task != 0:
+            self._record_sap_event(status=SAP_SKIPPED_FIRST_SESSION_ONLY)
             return
         self._run_task_boundary_sap(dataset)

@@ -132,17 +132,29 @@ class AerSapContractTests(unittest.TestCase):
         for name, value in backbone.state_dict().items():
             torch.testing.assert_close(model.past_model_ckpt[name], value)
 
-    def test_only_final_task_runs_taskwise_sap_after_every_aer_boundary(self):
-        from models.aer_sap import AerSap, SAP_SKIPPED_FINAL_ONLY
+    def test_only_first_task_runs_taskwise_sap_after_every_aer_boundary(self):
+        from models.aer_sap import AerSap, SAP_SKIPPED_FIRST_SESSION_ONLY
 
         model = AerSap.__new__(AerSap)
         nn.Module.__init__(model)
         model.sap_history = []
         dataset = SimpleNamespace(N_TASKS=10)
+        boundary_order = []
+
+        def finish_aer_boundary(instance, _dataset):
+            boundary_order.append(('aer', instance.current_task))
+
+        def run_first_session_sap(_dataset):
+            boundary_order.append(('sap', model.current_task))
 
         with (
-            patch.object(ErAceAerAbs, 'end_task', autospec=True) as aer_end_task,
-            patch.object(model, '_run_task_boundary_sap') as run_sap,
+            patch.object(
+                ErAceAerAbs, 'end_task', autospec=True,
+                side_effect=finish_aer_boundary,
+            ) as aer_end_task,
+            patch.object(
+                model, '_run_task_boundary_sap', side_effect=run_first_session_sap,
+            ) as run_sap,
         ):
             for task_id in range(dataset.N_TASKS):
                 model._current_task = task_id
@@ -150,22 +162,32 @@ class AerSapContractTests(unittest.TestCase):
 
         self.assertEqual(aer_end_task.call_count, dataset.N_TASKS)
         run_sap.assert_called_once_with(dataset)
+        self.assertEqual(boundary_order[:2], [('aer', 0), ('sap', 0)])
+        self.assertEqual(
+            boundary_order[2:],
+            [('aer', task_id) for task_id in range(1, dataset.N_TASKS)],
+        )
         self.assertEqual(len(model.sap_history), dataset.N_TASKS - 1)
         self.assertTrue(all(
-            event['status'] == SAP_SKIPPED_FINAL_ONLY
+            event['status'] == SAP_SKIPPED_FIRST_SESSION_ONLY
             for event in model.sap_history
         ))
+        self.assertEqual(
+            [event['task_id'] for event in model.sap_history],
+            list(range(1, dataset.N_TASKS)),
+        )
 
-    def test_final_taskwise_sap_uses_one_reference_and_one_feature_matrix(self):
+    def test_first_session_taskwise_sap_projects_only_seen_rows_and_saves_task0(self):
         from models.aer_sap import AerSap
 
         class _Net(nn.Module):
             def __init__(self):
                 super().__init__()
+                self.backbone = nn.Linear(512, 512, bias=False)
                 self.classifier = nn.Linear(512, 100)
 
             def forward(self, inputs):
-                return self.classifier(inputs)
+                return self.classifier(self.backbone(inputs))
 
         class _Dataset:
             NAME = 'seq-cifar100'
@@ -176,7 +198,7 @@ class AerSapContractTests(unittest.TestCase):
             def __init__(self, classifier):
                 self.classifier = classifier
                 self.evaluated_weights = []
-                self.test_loaders = []
+                self.test_loaders = [SimpleNamespace(dataset=range(20))]
 
             @staticmethod
             def get_offsets(task_id):
@@ -185,15 +207,15 @@ class AerSapContractTests(unittest.TestCase):
             def evaluate(self, model, dataset):
                 self.evaluated_weights.append(self.classifier.weight.detach().clone())
                 branch = len(self.evaluated_weights)
-                return [float(branch)] * 10, [float(branch + 10)] * 10
+                return [float(branch)], [float(branch + 10)]
 
         torch.manual_seed(4)
         model = AerSap.__new__(AerSap)
         nn.Module.__init__(model)
         model.net = _Net()
         model.device = torch.device('cpu')
-        model._current_task = 9
-        model._n_seen_classes = 100
+        model._current_task = 0
+        model._n_seen_classes = 10
         model.sap_history = []
         model.args = SimpleNamespace(
             sap_oracle_scale=3000.0,
@@ -205,20 +227,20 @@ class AerSapContractTests(unittest.TestCase):
         dataset = _Dataset(model.net.classifier)
 
         trusted_images = torch.zeros(10, 3, 32, 32, dtype=torch.uint8)
-        trusted_labels = torch.arange(10, dtype=torch.long) * 10
-        trusted_task_ids = torch.arange(10, dtype=torch.long)
+        trusted_labels = torch.arange(10, dtype=torch.long)
+        trusted_task_ids = torch.zeros(10, dtype=torch.long)
         reference_stats = {
-            'current_task_clean_total': 5,
-            'current_task_clean_count': 5,
-            'current_task_clean_selected': 5,
-            'buffer_clean_count': 5,
-            'historical_buffer_clean_count': 5,
-            'reference_new_count': 5,
-            'reference_old_count': 5,
+            'current_task_clean_total': 10,
+            'current_task_clean_count': 10,
+            'current_task_clean_selected': 10,
+            'buffer_clean_count': 3,
+            'historical_buffer_clean_count': 0,
+            'reference_new_count': 10,
+            'reference_old_count': 0,
             'total_reference_count': 10,
-            'current_class_selected_counts': {90: 5},
-            'reference_sampling_seed': 9,
-            'buffer_total_count': 5,
+            'current_class_selected_counts': {class_id: 1 for class_id in range(10)},
+            'reference_sampling_seed': 0,
+            'buffer_total_count': 3,
         }
         build_reference = Mock(return_value=(
             trusted_images, trusted_labels, trusted_task_ids, reference_stats,
@@ -226,100 +248,101 @@ class AerSapContractTests(unittest.TestCase):
         model._build_oracle_reference_batches = build_reference
         model._normalized_batches = Mock(return_value=iter([trusted_images.float()]))
 
-        x_global = torch.zeros(10, 512)
-        x_global[torch.arange(10), torch.arange(10)] = 1.0
+        x_task1 = torch.zeros(10, 512)
+        x_task1[torch.arange(10), torch.arange(10)] = 1.0
         feature_stats = {
             'before': {'min': 1.0, 'median': 1.0, 'mean': 1.0, 'max': 1.0},
             'after': {'min': 1.0, 'median': 1.0, 'mean': 1.0, 'max': 1.0},
         }
-        projection_call = 0
-
         def build_projection(gram):
-            nonlocal projection_call
-            factor = float(projection_call + 2)
-            projection_call += 1
-            projection = torch.eye(512) * factor
+            projection = torch.eye(512) * 2
             energy = torch.ones(512)
             normalized_energy = energy / energy.sum()
-            importance = torch.ones(512) * factor
+            importance = torch.ones(512) * 2
             return projection, energy, normalized_energy, importance
 
         model._build_oracle_projection = Mock(side_effect=build_projection)
         weight_before = model.net.classifier.weight.detach().clone()
         bias_before = model.net.classifier.bias.detach().clone()
+        backbone_before = model.net.backbone.weight.detach().clone()
 
         with tempfile.TemporaryDirectory() as temporary_directory, patch(
-            'models.aer_sap.collect_classifier_input_features', return_value=x_global,
+            'models.aer_sap.collect_classifier_input_features', return_value=x_task1,
         ) as collect_features, patch(
             'models.aer_sap.normalize_classifier_input_features',
-            return_value=(x_global, feature_stats),
+            return_value=(x_task1, feature_stats),
         ) as normalize_features, patch.object(
             model, '_taskwise_artifact_directory', return_value=Path(temporary_directory),
         ):
-            model._run_final_taskwise_sap(dataset)
+            model._run_first_session_taskwise_sap(dataset)
 
             build_reference.assert_called_once_with(dataset, return_task_ids=True)
             collect_features.assert_called_once()
-            normalize_features.assert_called_once_with(x_global)
-            self.assertEqual(model._build_oracle_projection.call_count, 11)
-            self.assertEqual(len(dataset.evaluated_weights), 3)
+            normalize_features.assert_called_once_with(x_task1)
+            self.assertEqual(model._build_oracle_projection.call_count, 1)
+            self.assertEqual(len(dataset.evaluated_weights), 2)
 
-            identity_weight, global_weight, taskwise_weight = dataset.evaluated_weights
-            torch.testing.assert_close(identity_weight, weight_before)
-            torch.testing.assert_close(global_weight, weight_before * 2)
-            for task_id in range(10):
-                start_c, end_c = dataset.get_offsets(task_id)
-                torch.testing.assert_close(
-                    taskwise_weight[start_c:end_c],
-                    weight_before[start_c:end_c] * (task_id + 3),
-                )
+            pre_sap_weight, post_sap_weight = dataset.evaluated_weights
+            torch.testing.assert_close(pre_sap_weight, weight_before)
+            torch.testing.assert_close(post_sap_weight[:10], weight_before[:10] * 2)
+            self.assertTrue(torch.equal(post_sap_weight[10:], weight_before[10:]))
 
-            torch.testing.assert_close(model.net.classifier.weight, taskwise_weight)
-            torch.testing.assert_close(model.net.classifier.bias, bias_before)
+            torch.testing.assert_close(model.net.classifier.weight, post_sap_weight)
+            self.assertTrue(torch.equal(model.net.classifier.bias, bias_before))
+            self.assertTrue(torch.equal(model.net.backbone.weight, backbone_before))
             for name, value in model.net.state_dict().items():
-                torch.testing.assert_close(model.past_model_ckpt[name], value)
+                self.assertTrue(torch.equal(model.past_model_ckpt[name], value))
 
             artifact_dir = Path(temporary_directory)
             self.assertEqual(
                 {
-                    'W_before.pt', 'X_global.pt', 'trusted_labels.pt',
-                    'trusted_task_ids.pt', 'coverage.json', 'G_global.pt',
-                    'M_global.pt',
-                    'W_after_global.pt', 'W_after_taskwise.pt', 'accuracy.json',
-                    *(f'G_task_{task_id}.pt' for task_id in range(10)),
-                    *(f'M_task_{task_id}.pt' for task_id in range(10)),
+                    'W_before.pt', 'X_task1.pt', 'trusted_labels.pt',
+                    'trusted_task_ids.pt', 'reference_stats.json', 'coverage.json',
+                    'G_task_0.pt', 'M_task_0.pt', 'W_after.pt',
+                    'accuracy.json', 'manifest.json',
                 },
                 {path.name for path in artifact_dir.iterdir()},
             )
-            saved_global_gram = torch.load(
-                artifact_dir / 'G_global.pt', weights_only=True,
+            saved_task_gram = torch.load(
+                artifact_dir / 'G_task_0.pt', weights_only=True,
             )
-            self.assertEqual(tuple(saved_global_gram.shape), (512, 512))
+            self.assertEqual(tuple(saved_task_gram.shape), (512, 512))
             torch.testing.assert_close(
-                saved_global_gram, x_global.transpose(0, 1) @ x_global,
+                saved_task_gram, x_task1.transpose(0, 1) @ x_task1,
             )
-            for task_id in range(10):
-                task_features = x_global[trusted_task_ids == task_id]
-                saved_task_gram = torch.load(
-                    artifact_dir / f'G_task_{task_id}.pt', weights_only=True,
-                )
-                self.assertEqual(tuple(saved_task_gram.shape), (512, 512))
-                torch.testing.assert_close(
-                    saved_task_gram,
-                    task_features.transpose(0, 1) @ task_features,
-                )
-                matrix = torch.load(
-                    artifact_dir / f'M_task_{task_id}.pt', weights_only=True,
-                )
-                self.assertEqual(tuple(matrix.shape), (512, 512))
+            matrix = torch.load(
+                artifact_dir / 'M_task_0.pt', weights_only=True,
+            )
+            self.assertEqual(tuple(matrix.shape), (512, 512))
+            self.assertTrue(torch.equal(
+                torch.load(artifact_dir / 'W_after.pt', weights_only=True),
+                post_sap_weight,
+            ))
             accuracy = json.loads((artifact_dir / 'accuracy.json').read_text())
-            self.assertEqual(accuracy['identity']['class_il'], 1.0)
-            self.assertEqual(accuracy['global']['class_il'], 2.0)
-            self.assertEqual(accuracy['taskwise']['class_il'], 3.0)
+            self.assertEqual(accuracy['pre_sap']['class_il'], 1.0)
+            self.assertEqual(accuracy['pre_sap']['task_il'], 11.0)
+            self.assertEqual(accuracy['post_sap']['class_il'], 2.0)
+            self.assertEqual(accuracy['post_sap']['task_il'], 12.0)
             coverage = json.loads((artifact_dir / 'coverage.json').read_text())
-            self.assertEqual(coverage['task_counts'], {str(i): 1 for i in range(10)})
+            self.assertEqual(coverage['task_counts'], {'0': 10})
+            self.assertEqual(set(coverage['tasks']), {'0'})
             self.assertEqual(coverage['empty_tasks'], [])
+            saved_reference_stats = json.loads(
+                (artifact_dir / 'reference_stats.json').read_text(),
+            )
+            self.assertEqual(saved_reference_stats['reference_new_count'], 10)
+            self.assertEqual(saved_reference_stats['reference_old_count'], 0)
+            manifest = json.loads((artifact_dir / 'manifest.json').read_text())
+            self.assertEqual(manifest['seen_tasks'], [0])
+            self.assertFalse(manifest['global_candidate_built'])
             self.assertEqual(model.sap_history[-1]['final_selected_candidate'], 'taskwise')
+            self.assertEqual(model.sap_history[-1]['seen_tasks'], [0])
+            self.assertEqual(
+                model.sap_history[-1]['accuracy']['pre_sap']['class_il'], 1.0,
+            )
+            self.assertEqual(
+                model.sap_history[-1]['accuracy']['post_sap']['class_il'], 2.0,
+            )
 
 
 if __name__ == '__main__':
