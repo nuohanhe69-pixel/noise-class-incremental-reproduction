@@ -50,6 +50,11 @@ DIRECTION_COLUMNS = (
     'classifier_energy_ratio',
     'classifier_energy_loss',
     'classifier_energy_loss_ratio',
+    'centered_classifier_energy_before',
+    'centered_classifier_energy_after',
+    'centered_classifier_energy_ratio',
+    'centered_classifier_energy_loss',
+    'centered_classifier_energy_loss_ratio',
 )
 
 
@@ -179,8 +184,10 @@ def analyze_task1_geometry(
             f'relative error={projection_weight_error:.6e}'
         )
 
-    coefficients_before = weight_before64[:task1_row_count] @ eigenvectors
-    coefficients_after = weight_after64[:task1_row_count] @ eigenvectors
+    task_weight_before = weight_before64[:task1_row_count]
+    task_weight_after = weight_after64[:task1_row_count]
+    coefficients_before = task_weight_before @ eigenvectors
+    coefficients_after = task_weight_after @ eigenvectors
     classifier_energy_before = coefficients_before.square().sum(dim=0)
     classifier_energy_after = coefficients_after.square().sum(dim=0)
     theoretical_energy_after = importance.square() * classifier_energy_before
@@ -193,12 +200,42 @@ def analyze_task1_geometry(
             f'relative error={theoretical_energy_error:.6e}'
         )
 
+    centered_weight_before = task_weight_before - task_weight_before.mean(
+        dim=0, keepdim=True,
+    )
+    centered_weight_after = task_weight_after - task_weight_after.mean(
+        dim=0, keepdim=True,
+    )
+    centered_coefficients_before = centered_weight_before @ eigenvectors
+    centered_coefficients_after = centered_weight_after @ eigenvectors
+    centered_classifier_energy_before = centered_coefficients_before.square().sum(dim=0)
+    centered_classifier_energy_after = centered_coefficients_after.square().sum(dim=0)
+    centered_theoretical_energy_after = (
+        importance.square() * centered_classifier_energy_before
+    )
+    centered_theoretical_energy_error = _relative_error(
+        centered_classifier_energy_after, centered_theoretical_energy_after,
+    )
+    if centered_theoretical_energy_error > sanity_tolerance:
+        raise ValueError(
+            'centered classifier energy does not satisfy '
+            'E_after = m^2 * E_before: '
+            f'relative error={centered_theoretical_energy_error:.6e}'
+        )
+
     epsilon = torch.finfo(torch.float64).eps
     classifier_energy_ratio = classifier_energy_after / (
         classifier_energy_before + epsilon
     )
     classifier_energy_loss = classifier_energy_before - classifier_energy_after
     classifier_energy_loss_ratio = 1.0 - classifier_energy_ratio
+    centered_classifier_energy_ratio = centered_classifier_energy_after / (
+        centered_classifier_energy_before + epsilon
+    )
+    centered_classifier_energy_loss = (
+        centered_classifier_energy_before - centered_classifier_energy_after
+    )
+    centered_classifier_energy_loss_ratio = 1.0 - centered_classifier_energy_ratio
     positive_ratios = feature_energy_ratio[feature_energy_ratio > 0]
     # Standard effective rank: exp(H(p)), where H(p) = -sum_j p_j log(p_j)
     # and p is the normalized non-negative Gram eigenspectrum.
@@ -207,6 +244,8 @@ def analyze_task1_geometry(
     )
     energy_before_total = classifier_energy_before.sum()
     energy_after_total = classifier_energy_after.sum()
+    centered_energy_before_total = centered_classifier_energy_before.sum()
+    centered_energy_after_total = centered_classifier_energy_after.sum()
 
     summary = {
         'alpha': float(alpha),
@@ -222,9 +261,24 @@ def analyze_task1_geometry(
         'classifier_energy_total_ratio': float(
             (energy_after_total / energy_before_total.clamp_min(epsilon)).item()
         ),
+        'centered_classifier_energy_before_total': float(
+            centered_energy_before_total.item()
+        ),
+        'centered_classifier_energy_after_total': float(
+            centered_energy_after_total.item()
+        ),
+        'centered_classifier_energy_total_ratio': float(
+            (
+                centered_energy_after_total
+                / centered_energy_before_total.clamp_min(epsilon)
+            ).item()
+        ),
         'm_reconstruction_relative_error': m_reconstruction_error,
         'w_projection_reconstruction_relative_error': projection_weight_error,
         'theoretical_energy_relation_error': theoretical_energy_error,
+        'centered_theoretical_energy_relation_error': (
+            centered_theoretical_energy_error
+        ),
         'importance_gt_0_9_count': int((importance > 0.9).sum().item()),
         'importance_gt_0_5_count': int((importance > 0.5).sum().item()),
         'importance_lt_0_1_count': int((importance < 0.1).sum().item()),
@@ -243,6 +297,13 @@ def analyze_task1_geometry(
         'classifier_energy_ratio': classifier_energy_ratio,
         'classifier_energy_loss': classifier_energy_loss,
         'classifier_energy_loss_ratio': classifier_energy_loss_ratio,
+        'centered_classifier_energy_before': centered_classifier_energy_before,
+        'centered_classifier_energy_after': centered_classifier_energy_after,
+        'centered_classifier_energy_ratio': centered_classifier_energy_ratio,
+        'centered_classifier_energy_loss': centered_classifier_energy_loss,
+        'centered_classifier_energy_loss_ratio': (
+            centered_classifier_energy_loss_ratio
+        ),
         'summary': summary,
     }
 
@@ -396,6 +457,21 @@ def _plot_diagnostics(result: dict, output_directory: Path, dpi: int) -> list[Pa
             'classifier_energy_ratio.png', 'Classifier energy retained by SAP',
             'E_after / E_before',
             (('Energy ratio', result['classifier_energy_ratio'], '#CC79A7', '-'),),
+        ),
+        (
+            'centered_classifier_energy_before_after.png',
+            'Centered classifier energy by feature direction',
+            'Centered classifier energy',
+            (
+                (
+                    'Before SAP', result['centered_classifier_energy_before'],
+                    '#0072B2', '-',
+                ),
+                (
+                    'After SAP', result['centered_classifier_energy_after'],
+                    '#D55E00', '--',
+                ),
+            ),
         ),
     )
     paths = []
