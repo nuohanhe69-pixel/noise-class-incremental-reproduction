@@ -25,6 +25,10 @@ FEATURE_DIMENSION = 512
 TASK1_CLASS_COUNT = 10
 TOTAL_CLASS_COUNT = 100
 ACTIVE_ENERGY_RELATIVE_THRESHOLD = 1e-12
+DECOMPOSITION_DTYPES = {
+    'float32': torch.float32,
+    'float64': torch.float64,
+}
 TENSOR_FILENAMES = {
     'x_task1': 'X_task1.pt',
     'gram': 'G_task_0.pt',
@@ -97,15 +101,47 @@ def _energy_change_diagnostics(
     return active, ratio, loss, loss_ratio
 
 
-def decompose_psd_gram(gram: Tensor) -> tuple[Tensor, Tensor]:
+def _resolve_decomposition_backend(
+    gram: Tensor,
+    decomposition_device: str,
+    decomposition_dtype: str,
+) -> tuple[torch.device, torch.dtype]:
+    device = torch.device(decomposition_device)
+    if device.type not in ('cpu', 'cuda'):
+        raise ValueError('decomposition_device must be cpu or cuda')
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA decomposition requested but CUDA is unavailable')
+    if decomposition_dtype == 'artifact':
+        dtype = gram.dtype
+    else:
+        try:
+            dtype = DECOMPOSITION_DTYPES[decomposition_dtype]
+        except KeyError as error:
+            raise ValueError(
+                'decomposition_dtype must be artifact, float32, or float64'
+            ) from error
+    if dtype not in DECOMPOSITION_DTYPES.values():
+        raise ValueError('decomposition requires float32 or float64')
+    return device, dtype
+
+
+def decompose_psd_gram(
+    gram: Tensor,
+    *,
+    decomposition_device: str = 'cpu',
+    decomposition_dtype: str = 'artifact',
+) -> tuple[Tensor, Tensor]:
     """Return non-negative eigenvalues/eigenvectors in descending-energy order."""
     _require_finite_floating_matrix(gram, 'G_task_0')
     if gram.shape[0] != gram.shape[1] or gram.shape[0] == 0:
         raise ValueError(f'G_task_0 must be square, got shape {tuple(gram.shape)}')
 
-    gram64 = gram.detach().cpu().to(torch.float64)
-    symmetric_gram = (gram64 + gram64.T) * 0.5
-    asymmetry_ratio = _relative_error(gram64, symmetric_gram)
+    device, dtype = _resolve_decomposition_backend(
+        gram, decomposition_device, decomposition_dtype,
+    )
+    decomposition_gram = gram.detach().to(device=device, dtype=dtype)
+    symmetric_gram = (decomposition_gram + decomposition_gram.T) * 0.5
+    asymmetry_ratio = _relative_error(decomposition_gram, symmetric_gram)
     if asymmetry_ratio > 1e-5:
         raise ValueError(
             f'G_task_0 is not numerically symmetric: relative error={asymmetry_ratio:.3e}'
@@ -114,7 +150,7 @@ def decompose_psd_gram(gram: Tensor) -> tuple[Tensor, Tensor]:
     eigenvalues, eigenvectors = torch.linalg.eigh(symmetric_gram)
     spectral_scale = max(float(eigenvalues.abs().max().item()), 1.0)
     relative_negative_tolerance = (
-        1e-5 if gram.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        1e-5 if dtype == torch.float32
         else 1e-10
     )
     negative_tolerance = relative_negative_tolerance * spectral_scale
@@ -141,6 +177,8 @@ def analyze_task1_geometry(
     alpha: float,
     task1_row_count: int = TASK1_CLASS_COUNT,
     sanity_tolerance: float = 1e-4,
+    decomposition_device: str = 'cpu',
+    decomposition_dtype: str = 'artifact',
 ) -> dict:
     """Analyze one saved Task1 SAP geometry without changing any artifact."""
     if not math.isfinite(alpha) or alpha <= 0:
@@ -148,7 +186,11 @@ def analyze_task1_geometry(
     if sanity_tolerance <= 0:
         raise ValueError('sanity_tolerance must be positive')
 
-    eigenvalues, eigenvectors = decompose_psd_gram(gram)
+    eigenvalues, eigenvectors = decompose_psd_gram(
+        gram,
+        decomposition_device=decomposition_device,
+        decomposition_dtype=decomposition_dtype,
+    )
     feature_dimension = int(eigenvalues.numel())
     for tensor, name in (
         (saved_projection, 'M_task_0'),
@@ -182,9 +224,13 @@ def analyze_task1_geometry(
         reconstructed_projection + reconstructed_projection.T
     ) * 0.5
 
-    saved_projection64 = saved_projection.detach().cpu().to(torch.float64)
+    analysis_device = eigenvalues.device
+    analysis_dtype = eigenvalues.dtype
+    saved_projection_analysis = saved_projection.detach().to(
+        device=analysis_device, dtype=analysis_dtype,
+    )
     m_reconstruction_error = _relative_error(
-        reconstructed_projection, saved_projection64,
+        reconstructed_projection, saved_projection_analysis,
     )
     if m_reconstruction_error > sanity_tolerance:
         raise ValueError(
@@ -192,13 +238,17 @@ def analyze_task1_geometry(
             f'relative error={m_reconstruction_error:.6e}'
         )
 
-    weight_before64 = weight_before.detach().cpu().to(torch.float64)
-    weight_after64 = weight_after.detach().cpu().to(torch.float64)
+    weight_before_analysis = weight_before.detach().to(
+        device=analysis_device, dtype=analysis_dtype,
+    )
+    weight_after_analysis = weight_after.detach().to(
+        device=analysis_device, dtype=analysis_dtype,
+    )
     expected_task1_weight = (
-        weight_before64[:task1_row_count] @ saved_projection64.T
+        weight_before_analysis[:task1_row_count] @ saved_projection_analysis.T
     )
     projection_weight_error = _relative_error(
-        weight_after64[:task1_row_count], expected_task1_weight,
+        weight_after_analysis[:task1_row_count], expected_task1_weight,
     )
     if projection_weight_error > sanity_tolerance:
         raise ValueError(
@@ -206,8 +256,8 @@ def analyze_task1_geometry(
             f'relative error={projection_weight_error:.6e}'
         )
 
-    task_weight_before = weight_before64[:task1_row_count]
-    task_weight_after = weight_after64[:task1_row_count]
+    task_weight_before = weight_before_analysis[:task1_row_count]
+    task_weight_after = weight_after_analysis[:task1_row_count]
     coefficients_before = task_weight_before @ eigenvectors
     coefficients_after = task_weight_after @ eigenvectors
     classifier_energy_before = coefficients_before.square().sum(dim=0)
@@ -261,7 +311,7 @@ def analyze_task1_geometry(
     ) = _energy_change_diagnostics(
         centered_classifier_energy_before, centered_classifier_energy_after,
     )
-    epsilon = torch.finfo(torch.float64).eps
+    epsilon = torch.finfo(analysis_dtype).eps
     positive_ratios = feature_energy_ratio[feature_energy_ratio > 0]
     # Standard effective rank: exp(H(p)), where H(p) = -sum_j p_j log(p_j)
     # and p is the normalized non-negative Gram eigenspectrum.
@@ -275,6 +325,8 @@ def analyze_task1_geometry(
 
     summary = {
         'alpha': float(alpha),
+        'decomposition_device': str(analysis_device),
+        'decomposition_dtype': str(analysis_dtype).removeprefix('torch.'),
         'gram_trace': float(gram.detach().cpu().trace().item()),
         'top1_feature_energy_ratio': float(feature_energy_ratio[:1].sum().item()),
         'top5_feature_energy_ratio': float(feature_energy_ratio[:5].sum().item()),
@@ -309,7 +361,10 @@ def analyze_task1_geometry(
         'importance_gt_0_5_count': int((importance > 0.5).sum().item()),
         'importance_lt_0_1_count': int((importance < 0.1).sum().item()),
     }
-    if not all(math.isfinite(value) for value in summary.values()):
+    numeric_summary_values = (
+        value for value in summary.values() if isinstance(value, (int, float))
+    )
+    if not all(math.isfinite(value) for value in numeric_summary_values):
         raise ValueError('diagnostic summary contains NaN or Inf')
 
     return {
@@ -543,6 +598,8 @@ def run_diagnostic(
     alpha_override: float | None = None,
     sanity_tolerance: float = 1e-4,
     dpi: int = 300,
+    decomposition_device: str = 'cpu',
+    decomposition_dtype: str = 'artifact',
 ) -> list[Path]:
     artifacts = load_first_session_artifacts(
         artifact_directory, alpha_override=alpha_override,
@@ -555,7 +612,11 @@ def run_diagnostic(
         alpha=artifacts['alpha'],
         task1_row_count=TASK1_CLASS_COUNT,
         sanity_tolerance=sanity_tolerance,
+        decomposition_device=decomposition_device,
+        decomposition_dtype=decomposition_dtype,
     )
+    print(f"decomposition_device={result['summary']['decomposition_device']}")
+    print(f"decomposition_dtype={result['summary']['decomposition_dtype']}")
     return save_diagnostics(result, output_directory, dpi=dpi)
 
 
@@ -569,6 +630,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--sanity_tolerance', type=float, default=1e-4)
     parser.add_argument('--dpi', type=int, default=300)
+    parser.add_argument(
+        '--decomposition_device', type=str, default='cpu',
+        help='Eigendecomposition device: cpu, cuda, or an explicit CUDA index.',
+    )
+    parser.add_argument(
+        '--decomposition_dtype', type=str, default='artifact',
+        choices=('artifact', 'float32', 'float64'),
+        help='Eigendecomposition dtype; artifact preserves G_task_0 dtype.',
+    )
     return parser.parse_args()
 
 
@@ -582,6 +652,8 @@ def main() -> None:
         alpha_override=arguments.alpha,
         sanity_tolerance=arguments.sanity_tolerance,
         dpi=arguments.dpi,
+        decomposition_device=arguments.decomposition_device,
+        decomposition_dtype=arguments.decomposition_dtype,
     )
     for path in output_paths:
         print(path)

@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -37,6 +38,8 @@ class FirstSessionSapDiagnosticTests(unittest.TestCase):
             weight_after=weight_after,
             alpha=alpha,
             task1_row_count=2,
+            decomposition_device='cpu',
+            decomposition_dtype='float64',
         )
 
         torch.testing.assert_close(
@@ -62,6 +65,8 @@ class FirstSessionSapDiagnosticTests(unittest.TestCase):
         self.assertLess(
             result['summary']['centered_theoretical_energy_relation_error'], 1e-12,
         )
+        self.assertEqual(result['summary']['decomposition_device'], 'cpu')
+        self.assertEqual(result['summary']['decomposition_dtype'], 'float64')
         self.assertTrue({
             'centered_classifier_energy_before',
             'centered_classifier_energy_after',
@@ -185,6 +190,32 @@ class FirstSessionSapDiagnosticTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, 'negative eigenvalue'):
             diagnostic.decompose_psd_gram(clearly_indefinite)
+
+    def test_decomposition_dtype_is_explicit_and_cuda_never_silently_falls_back(self):
+        gram = torch.diag(torch.tensor([2.0, 1.0], dtype=torch.float64))
+
+        artifact_dtype_values, _ = diagnostic.decompose_psd_gram(
+            gram,
+            decomposition_device='cpu',
+            decomposition_dtype='artifact',
+        )
+        float32_values, _ = diagnostic.decompose_psd_gram(
+            gram,
+            decomposition_device='cpu',
+            decomposition_dtype='float32',
+        )
+
+        self.assertEqual(artifact_dtype_values.device.type, 'cpu')
+        self.assertEqual(artifact_dtype_values.dtype, torch.float64)
+        self.assertEqual(float32_values.device.type, 'cpu')
+        self.assertEqual(float32_values.dtype, torch.float32)
+        with patch('scripts.analyze_first_session_sap.torch.cuda.is_available', return_value=False):
+            with self.assertRaisesRegex(RuntimeError, 'CUDA.*unavailable'):
+                diagnostic.decompose_psd_gram(
+                    gram,
+                    decomposition_device='cuda',
+                    decomposition_dtype='float32',
+                )
 
     def test_loader_uses_first_session_artifact_contract_and_manifest_alpha(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
