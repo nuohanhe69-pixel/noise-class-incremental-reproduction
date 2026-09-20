@@ -63,6 +63,11 @@ DIRECTION_COLUMNS = (
     'centered_classifier_energy_loss',
     'centered_classifier_energy_loss_ratio',
 )
+DIRECTION_RESULT_KEYS = {
+    column: ('eigenvalues' if column == 'eigenvalue' else column)
+    for column in DIRECTION_COLUMNS
+    if column != 'direction_rank'
+}
 
 
 def _require_finite_floating_matrix(value: Tensor, name: str) -> None:
@@ -474,8 +479,10 @@ def load_first_session_artifacts(
 
 
 def _direction_rows(result: dict):
-    tensor_keys = DIRECTION_COLUMNS[1:]
-    values = [result[key].detach().cpu().tolist() for key in tensor_keys]
+    result_keys = (
+        DIRECTION_RESULT_KEYS[column] for column in DIRECTION_COLUMNS[1:]
+    )
+    values = [result[key].detach().cpu().tolist() for key in result_keys]
     for index, direction_values in enumerate(zip(*values), start=1):
         yield (index, *direction_values)
 

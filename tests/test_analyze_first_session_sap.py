@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import tempfile
 import unittest
@@ -14,6 +15,28 @@ import scripts.analyze_first_session_sap as diagnostic
 
 
 class FirstSessionSapDiagnosticTests(unittest.TestCase):
+    def test_direction_summary_maps_eigenvalue_header_to_eigenvalues_result(self):
+        result = {
+            column: torch.tensor([1.0])
+            for column in diagnostic.DIRECTION_COLUMNS
+            if column not in ('direction_rank', 'eigenvalue')
+        }
+        result['eigenvalues'] = torch.tensor([3.5])
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            csv_path = diagnostic._write_direction_summary(
+                result, Path(temporary_directory),
+            )
+            with csv_path.open(newline='', encoding='utf-8') as csv_file:
+                reader = csv.DictReader(csv_file)
+                rows = list(reader)
+
+        self.assertEqual(reader.fieldnames, list(diagnostic.DIRECTION_COLUMNS))
+        self.assertNotIn('eigenvalues', reader.fieldnames)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['direction_rank'], '1')
+        self.assertEqual(float(rows[0]['eigenvalue']), 3.5)
+
     def test_core_analysis_uses_gram_order_and_matches_sap_identities(self):
         gram = torch.diag(torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64))
         alpha = 3.0
