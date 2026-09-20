@@ -68,6 +68,8 @@ class FirstSessionSapDiagnosticTests(unittest.TestCase):
             'centered_classifier_energy_ratio',
             'centered_classifier_energy_loss',
             'centered_classifier_energy_loss_ratio',
+            'classifier_energy_active',
+            'centered_classifier_energy_active',
         }.issubset(diagnostic.DIRECTION_COLUMNS))
         self.assertTrue({
             'centered_classifier_energy_before_total',
@@ -132,6 +134,44 @@ class FirstSessionSapDiagnosticTests(unittest.TestCase):
             original['centered_classifier_energy_after'],
             shifted['centered_classifier_energy_after'],
         )
+
+    def test_zero_before_energy_is_inactive_not_reported_as_full_loss(self):
+        gram = torch.diag(torch.tensor([2.0, 1.0], dtype=torch.float64))
+        alpha = 3.0
+        ratios = torch.tensor([2.0, 1.0], dtype=torch.float64) / 3.0
+        importance = alpha * ratios / ((alpha - 1.0) * ratios + 1.0)
+        projection = torch.diag(importance)
+        weight_before = torch.tensor(
+            [[1.0, 0.0], [-1.0, 0.0]], dtype=torch.float64,
+        )
+        weight_after = weight_before @ projection.T
+
+        result = diagnostic.analyze_task1_geometry(
+            gram=gram,
+            saved_projection=projection,
+            weight_before=weight_before,
+            weight_after=weight_after,
+            alpha=alpha,
+            task1_row_count=2,
+        )
+
+        inactive_direction = 1
+        self.assertFalse(result['classifier_energy_active'][inactive_direction])
+        self.assertTrue(torch.isnan(
+            result['classifier_energy_ratio'][inactive_direction],
+        ))
+        self.assertTrue(torch.isnan(
+            result['classifier_energy_loss_ratio'][inactive_direction],
+        ))
+        self.assertFalse(
+            result['centered_classifier_energy_active'][inactive_direction],
+        )
+        self.assertTrue(torch.isnan(
+            result['centered_classifier_energy_ratio'][inactive_direction],
+        ))
+        self.assertTrue(torch.isnan(
+            result['centered_classifier_energy_loss_ratio'][inactive_direction],
+        ))
 
     def test_gram_decomposition_clamps_only_roundoff_negative_eigenvalues(self):
         almost_psd = torch.diag(

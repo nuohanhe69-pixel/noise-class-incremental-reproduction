@@ -24,6 +24,7 @@ from utils.sap import _sap_importance  # noqa: E402
 FEATURE_DIMENSION = 512
 TASK1_CLASS_COUNT = 10
 TOTAL_CLASS_COUNT = 100
+ACTIVE_ENERGY_RELATIVE_THRESHOLD = 1e-12
 TENSOR_FILENAMES = {
     'x_task1': 'X_task1.pt',
     'gram': 'G_task_0.pt',
@@ -47,11 +48,13 @@ DIRECTION_COLUMNS = (
     'sap_importance',
     'classifier_energy_before',
     'classifier_energy_after',
+    'classifier_energy_active',
     'classifier_energy_ratio',
     'classifier_energy_loss',
     'classifier_energy_loss_ratio',
     'centered_classifier_energy_before',
     'centered_classifier_energy_after',
+    'centered_classifier_energy_active',
     'centered_classifier_energy_ratio',
     'centered_classifier_energy_loss',
     'centered_classifier_energy_loss_ratio',
@@ -73,6 +76,25 @@ def _relative_error(actual: Tensor, expected: Tensor) -> float:
         )
     denominator = expected.norm().clamp_min(torch.finfo(expected.dtype).eps)
     return float(((actual - expected).norm() / denominator).item())
+
+
+def _energy_change_diagnostics(
+    energy_before: Tensor,
+    energy_after: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Return active mask, ratio, loss, and loss ratio for directional energy."""
+    if energy_before.shape != energy_after.shape:
+        raise ValueError('before/after energy shapes differ')
+    active_threshold = (
+        energy_before.max() * ACTIVE_ENERGY_RELATIVE_THRESHOLD
+    )
+    active = energy_before > active_threshold
+    ratio = torch.full_like(energy_before, torch.nan)
+    ratio[active] = energy_after[active] / energy_before[active]
+    loss = energy_before - energy_after
+    loss_ratio = torch.full_like(energy_before, torch.nan)
+    loss_ratio[active] = 1.0 - ratio[active]
+    return active, ratio, loss, loss_ratio
 
 
 def decompose_psd_gram(gram: Tensor) -> tuple[Tensor, Tensor]:
@@ -223,19 +245,23 @@ def analyze_task1_geometry(
             f'relative error={centered_theoretical_energy_error:.6e}'
         )
 
+    (
+        classifier_energy_active,
+        classifier_energy_ratio,
+        classifier_energy_loss,
+        classifier_energy_loss_ratio,
+    ) = _energy_change_diagnostics(
+        classifier_energy_before, classifier_energy_after,
+    )
+    (
+        centered_classifier_energy_active,
+        centered_classifier_energy_ratio,
+        centered_classifier_energy_loss,
+        centered_classifier_energy_loss_ratio,
+    ) = _energy_change_diagnostics(
+        centered_classifier_energy_before, centered_classifier_energy_after,
+    )
     epsilon = torch.finfo(torch.float64).eps
-    classifier_energy_ratio = classifier_energy_after / (
-        classifier_energy_before + epsilon
-    )
-    classifier_energy_loss = classifier_energy_before - classifier_energy_after
-    classifier_energy_loss_ratio = 1.0 - classifier_energy_ratio
-    centered_classifier_energy_ratio = centered_classifier_energy_after / (
-        centered_classifier_energy_before + epsilon
-    )
-    centered_classifier_energy_loss = (
-        centered_classifier_energy_before - centered_classifier_energy_after
-    )
-    centered_classifier_energy_loss_ratio = 1.0 - centered_classifier_energy_ratio
     positive_ratios = feature_energy_ratio[feature_energy_ratio > 0]
     # Standard effective rank: exp(H(p)), where H(p) = -sum_j p_j log(p_j)
     # and p is the normalized non-negative Gram eigenspectrum.
@@ -294,11 +320,13 @@ def analyze_task1_geometry(
         'sap_importance': importance,
         'classifier_energy_before': classifier_energy_before,
         'classifier_energy_after': classifier_energy_after,
+        'classifier_energy_active': classifier_energy_active,
         'classifier_energy_ratio': classifier_energy_ratio,
         'classifier_energy_loss': classifier_energy_loss,
         'classifier_energy_loss_ratio': classifier_energy_loss_ratio,
         'centered_classifier_energy_before': centered_classifier_energy_before,
         'centered_classifier_energy_after': centered_classifier_energy_after,
+        'centered_classifier_energy_active': centered_classifier_energy_active,
         'centered_classifier_energy_ratio': centered_classifier_energy_ratio,
         'centered_classifier_energy_loss': centered_classifier_energy_loss,
         'centered_classifier_energy_loss_ratio': (
