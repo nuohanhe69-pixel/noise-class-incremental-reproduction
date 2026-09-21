@@ -15,6 +15,91 @@ import scripts.analyze_first_session_sap as diagnostic
 
 
 class FirstSessionSapDiagnosticTests(unittest.TestCase):
+    def test_raw_direction_class_energy_decomposition_and_activity(self):
+        labels = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.long)
+        within_sign = torch.tensor(
+            [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
+            dtype=torch.float64,
+        )
+        features = torch.stack((
+            torch.full((8,), 3.0, dtype=torch.float64),
+            torch.where(labels == 0, 2.0, -2.0).to(torch.float64),
+            within_sign,
+            torch.zeros(8, dtype=torch.float64),
+        ), dim=1)
+        features = torch.nn.functional.normalize(features, dim=1)
+        raw_gram = features.T @ features
+        raw_eigenvalues = raw_gram.diag()
+        raw_eigenvectors = torch.eye(4, dtype=torch.float64)
+
+        result = diagnostic.analyze_raw_direction_class_structure(
+            x_task1=features,
+            trusted_labels=labels,
+            raw_gram=raw_gram,
+            raw_eigenvalues=raw_eigenvalues,
+            raw_eigenvectors=raw_eigenvectors,
+            decomposition_device='cpu',
+            decomposition_dtype='float64',
+            sanity_tolerance=1e-10,
+        )
+
+        torch.testing.assert_close(
+            result['sample_projections'].square().sum(dim=0), raw_eigenvalues,
+        )
+        torch.testing.assert_close(
+            result['common_mean_energy']
+            + result['between_class_energy']
+            + result['within_class_energy'],
+            raw_eigenvalues,
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        self.assertGreater(result['common_mean_energy'][0], 5.0)
+        self.assertLess(result['between_class_energy'][0], 1e-12)
+        self.assertGreater(result['class_separation_ratio'][1], 0.999)
+        self.assertLess(result['class_separation_ratio'][2], 1e-12)
+        self.assertFalse(result['class_separation_active'][3])
+        self.assertTrue(torch.isnan(result['class_separation_ratio'][3]))
+        self.assertLess(
+            result['summary']['projection_energy_reconstruction_relative_error'],
+            1e-10,
+        )
+        self.assertLess(
+            result['summary']['raw_energy_decomposition_relative_error'],
+            1e-10,
+        )
+        active_raw_energy = raw_eigenvalues > 0
+        torch.testing.assert_close(
+            result['common_mean_fraction'][active_raw_energy]
+            + result['between_class_fraction'][active_raw_energy]
+            + result['within_class_fraction'][active_raw_energy],
+            torch.ones(int(active_raw_energy.sum()), dtype=torch.float64),
+        )
+        self.assertTrue({
+            'common_mean_energy',
+            'between_class_energy',
+            'within_class_energy',
+            'residual_variation_energy',
+            'common_mean_fraction',
+            'between_class_fraction',
+            'within_class_fraction',
+            'class_separation_active',
+            'class_separation_ratio',
+            'between_class_energy_share',
+        }.issubset(diagnostic.DIRECTION_COLUMNS))
+        self.assertTrue({
+            'common_mean_energy_total',
+            'between_class_energy_total',
+            'within_class_energy_total',
+            'common_mean_energy_fraction_total',
+            'between_class_energy_fraction_total',
+            'within_class_energy_fraction_total',
+            'global_class_separation_ratio',
+            'raw_energy_decomposition_relative_error',
+            'raw_energy_decomposition_max_direction_error',
+            'projection_energy_reconstruction_relative_error',
+        }.issubset(result['summary']))
+
     def test_feature_centering_removes_strong_common_mean_without_renormalizing(self):
         variations = torch.tensor(
             [

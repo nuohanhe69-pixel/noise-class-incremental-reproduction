@@ -49,6 +49,16 @@ DIRECTION_COLUMNS = (
     'eigenvalue',
     'feature_energy_ratio',
     'cumulative_energy',
+    'common_mean_energy',
+    'between_class_energy',
+    'within_class_energy',
+    'residual_variation_energy',
+    'common_mean_fraction',
+    'between_class_fraction',
+    'within_class_fraction',
+    'class_separation_active',
+    'class_separation_ratio',
+    'between_class_energy_share',
     'sap_importance',
     'classifier_energy_before',
     'classifier_energy_after',
@@ -326,6 +336,224 @@ def analyze_feature_centering(
         'centered_eigenvectors': centered_eigenvectors,
         'centered_feature_energy_ratio': centered_feature_energy_ratio,
         'centered_cumulative_energy': centered_cumulative_energy,
+        'summary': summary,
+    }
+
+
+def analyze_raw_direction_class_structure(
+    *,
+    x_task1: Tensor,
+    trusted_labels: Tensor,
+    raw_gram: Tensor,
+    raw_eigenvalues: Tensor,
+    raw_eigenvectors: Tensor,
+    decomposition_device: str = 'cpu',
+    decomposition_dtype: str = 'artifact',
+    sanity_tolerance: float = 1e-4,
+) -> dict:
+    """Decompose each Raw Gram direction into common/between/within energy."""
+    _require_finite_floating_matrix(x_task1, 'X_task1')
+    _require_finite_floating_matrix(raw_gram, 'G_task_0')
+    if x_task1.shape[0] == 0:
+        raise ValueError('X_task1 must contain at least one sample')
+    if trusted_labels.ndim != 1 or len(trusted_labels) != len(x_task1):
+        raise ValueError('trusted_labels must align with X_task1 rows')
+    if raw_eigenvalues.ndim != 1 or not raw_eigenvalues.is_floating_point():
+        raise ValueError('Raw eigenvalues must be a floating-point vector')
+    if not torch.isfinite(raw_eigenvalues).all():
+        raise ValueError('Raw eigenvalues contain NaN or Inf')
+    feature_dimension = int(x_task1.shape[1])
+    if raw_gram.shape != (feature_dimension, feature_dimension):
+        raise ValueError('G_task_0 does not match X_task1 feature dimension')
+    if raw_eigenvalues.shape != (feature_dimension,):
+        raise ValueError('Raw eigenvalues do not match X_task1 feature dimension')
+    if raw_eigenvectors.shape != (feature_dimension, feature_dimension):
+        raise ValueError('Raw eigenvectors do not match X_task1 feature dimension')
+    if sanity_tolerance <= 0:
+        raise ValueError('sanity_tolerance must be positive')
+
+    requested_device, requested_dtype = _resolve_decomposition_backend(
+        x_task1, decomposition_device, decomposition_dtype,
+    )
+    device_mismatch = (
+        raw_eigenvectors.device.type != requested_device.type
+        or (
+            requested_device.index is not None
+            and raw_eigenvectors.device.index != requested_device.index
+        )
+    )
+    if (
+        device_mismatch
+        or raw_eigenvectors.dtype != requested_dtype
+        or raw_eigenvalues.device != raw_eigenvectors.device
+        or raw_eigenvalues.dtype != raw_eigenvectors.dtype
+    ):
+        raise ValueError(
+            'Raw eigendecomposition does not match the requested backend'
+        )
+    analysis_device = raw_eigenvectors.device
+    features = x_task1.detach().to(
+        device=analysis_device, dtype=requested_dtype,
+    )
+    raw_gram_analysis = raw_gram.detach().to(
+        device=analysis_device, dtype=requested_dtype,
+    )
+    labels = trusted_labels.detach().to(device=analysis_device).long()
+    unique_labels = labels.unique(sorted=True)
+    if unique_labels.numel() < 2:
+        raise ValueError('class-structure analysis requires at least two classes')
+
+    sample_projections = features @ raw_eigenvectors
+    projection_energy = sample_projections.square().sum(dim=0)
+    projection_energy_reconstruction_relative_error = _relative_error(
+        projection_energy, raw_eigenvalues,
+    )
+    if projection_energy_reconstruction_relative_error > sanity_tolerance:
+        raise ValueError(
+            'sample projection energy does not reconstruct Raw eigenvalues: '
+            f'relative error={projection_energy_reconstruction_relative_error:.6e}'
+        )
+
+    sample_count = int(sample_projections.shape[0])
+    global_projection_mean = sample_projections.mean(dim=0)
+    common_mean_energy = sample_count * global_projection_mean.square()
+    between_class_energy = torch.zeros_like(raw_eigenvalues)
+    within_class_energy = torch.zeros_like(raw_eigenvalues)
+    for class_label in unique_labels:
+        class_projections = sample_projections[labels == class_label]
+        class_mean = class_projections.mean(dim=0)
+        between_class_energy += class_projections.shape[0] * (
+            class_mean - global_projection_mean
+        ).square()
+        within_class_energy += (
+            class_projections - class_mean.unsqueeze(0)
+        ).square().sum(dim=0)
+
+    residual_variation_energy = between_class_energy + within_class_energy
+    reconstructed_direction_energy = (
+        common_mean_energy + residual_variation_energy
+    )
+    direction_absolute_error = (
+        reconstructed_direction_energy - raw_eigenvalues
+    ).abs()
+    raw_energy_scale = raw_eigenvalues.max()
+    if raw_energy_scale <= 0:
+        raise ValueError('Raw eigenspectrum has no positive energy')
+    raw_energy_active = (
+        raw_eigenvalues > raw_energy_scale * ACTIVE_ENERGY_RELATIVE_THRESHOLD
+    )
+    direction_relative_error = torch.full_like(raw_eigenvalues, torch.nan)
+    direction_relative_error[raw_energy_active] = (
+        direction_absolute_error[raw_energy_active]
+        / raw_eigenvalues[raw_energy_active]
+    )
+    maximum_direction_relative_error = float(
+        direction_relative_error[raw_energy_active].max().item()
+    )
+    maximum_direction_absolute_error = float(direction_absolute_error.max().item())
+    raw_trace = raw_gram_analysis.trace()
+    raw_energy_decomposition_absolute_error = float(
+        (reconstructed_direction_energy.sum() - raw_trace).abs().item()
+    )
+    raw_energy_decomposition_relative_error = float(
+        raw_energy_decomposition_absolute_error / raw_trace.abs().item()
+    )
+    if (
+        maximum_direction_relative_error > sanity_tolerance
+        or raw_energy_decomposition_relative_error > sanity_tolerance
+    ):
+        raise ValueError(
+            'Raw directional energy decomposition failed: '
+            f'max_direction_relative_error={maximum_direction_relative_error:.6e}, '
+            f'global_relative_error={raw_energy_decomposition_relative_error:.6e}'
+        )
+
+    common_mean_fraction = torch.full_like(raw_eigenvalues, torch.nan)
+    between_class_fraction = torch.full_like(raw_eigenvalues, torch.nan)
+    within_class_fraction = torch.full_like(raw_eigenvalues, torch.nan)
+    common_mean_fraction[raw_energy_active] = (
+        common_mean_energy[raw_energy_active] / raw_eigenvalues[raw_energy_active]
+    )
+    between_class_fraction[raw_energy_active] = (
+        between_class_energy[raw_energy_active] / raw_eigenvalues[raw_energy_active]
+    )
+    within_class_fraction[raw_energy_active] = (
+        within_class_energy[raw_energy_active] / raw_eigenvalues[raw_energy_active]
+    )
+    maximum_fraction_sum_error = float((
+        common_mean_fraction[raw_energy_active]
+        + between_class_fraction[raw_energy_active]
+        + within_class_fraction[raw_energy_active]
+        - 1.0
+    ).abs().max().item())
+    if maximum_fraction_sum_error > sanity_tolerance:
+        raise ValueError(
+            'Raw directional energy fractions do not sum to one: '
+            f'max_error={maximum_fraction_sum_error:.6e}'
+        )
+
+    residual_scale = residual_variation_energy.max()
+    class_separation_active = (
+        residual_variation_energy
+        > residual_scale * ACTIVE_ENERGY_RELATIVE_THRESHOLD
+    )
+    class_separation_ratio = torch.full_like(raw_eigenvalues, torch.nan)
+    class_separation_ratio[class_separation_active] = (
+        between_class_energy[class_separation_active]
+        / residual_variation_energy[class_separation_active]
+    )
+    common_total = common_mean_energy.sum()
+    between_total = between_class_energy.sum()
+    within_total = within_class_energy.sum()
+    residual_total = between_total + within_total
+    if between_total <= torch.finfo(requested_dtype).eps:
+        raise ValueError('between-class energy is too small to compute shares')
+    if residual_total <= torch.finfo(requested_dtype).eps:
+        raise ValueError('residual variation energy is too small')
+    between_class_energy_share = between_class_energy / between_total
+
+    summary = {
+        'common_mean_energy_total': float(common_total.item()),
+        'between_class_energy_total': float(between_total.item()),
+        'within_class_energy_total': float(within_total.item()),
+        'common_mean_energy_fraction_total': float((common_total / raw_trace).item()),
+        'between_class_energy_fraction_total': float((between_total / raw_trace).item()),
+        'within_class_energy_fraction_total': float((within_total / raw_trace).item()),
+        'global_class_separation_ratio': float((between_total / residual_total).item()),
+        'raw_energy_decomposition_relative_error': (
+            raw_energy_decomposition_relative_error
+        ),
+        'raw_energy_decomposition_absolute_error': (
+            raw_energy_decomposition_absolute_error
+        ),
+        'raw_energy_decomposition_max_direction_error': (
+            maximum_direction_relative_error
+        ),
+        'raw_energy_decomposition_max_direction_relative_error': (
+            maximum_direction_relative_error
+        ),
+        'raw_energy_decomposition_max_direction_absolute_error': (
+            maximum_direction_absolute_error
+        ),
+        'projection_energy_reconstruction_relative_error': (
+            projection_energy_reconstruction_relative_error
+        ),
+    }
+    if not all(math.isfinite(value) for value in summary.values()):
+        raise ValueError('class-structure diagnostics contain NaN or Inf')
+
+    return {
+        'sample_projections': sample_projections,
+        'common_mean_energy': common_mean_energy,
+        'between_class_energy': between_class_energy,
+        'within_class_energy': within_class_energy,
+        'residual_variation_energy': residual_variation_energy,
+        'common_mean_fraction': common_mean_fraction,
+        'between_class_fraction': between_class_fraction,
+        'within_class_fraction': within_class_fraction,
+        'class_separation_active': class_separation_active,
+        'class_separation_ratio': class_separation_ratio,
+        'between_class_energy_share': between_class_energy_share,
         'summary': summary,
     }
 
@@ -764,6 +992,60 @@ def _plot_diagnostics(result: dict, output_directory: Path, dpi: int) -> list[Pa
         figure.savefig(path, dpi=dpi, bbox_inches='tight')
         plt.close(figure)
         paths.append(path)
+
+    top_count = min(50, result['eigenvalues'].numel())
+    top_ranks = torch.arange(1, top_count + 1).numpy()
+    common_fraction = result['common_mean_fraction'][:top_count].detach().cpu().numpy()
+    between_fraction = result['between_class_fraction'][:top_count].detach().cpu().numpy()
+    within_fraction = result['within_class_fraction'][:top_count].detach().cpu().numpy()
+    figure, axis = plt.subplots(figsize=(9.0, 4.2))
+    axis.bar(
+        top_ranks, common_fraction, label='Common mean', color='#0072B2',
+        width=0.9,
+    )
+    axis.bar(
+        top_ranks, between_fraction, bottom=common_fraction,
+        label='Between-class', color='#D55E00', width=0.9,
+    )
+    axis.bar(
+        top_ranks, within_fraction, bottom=common_fraction + between_fraction,
+        label='Within-class', color='#009E73', width=0.9,
+    )
+    axis.set_xlabel(
+        'Raw feature direction rank (descending Raw Gram eigenvalue)'
+    )
+    axis.set_ylabel('Fraction of raw directional energy')
+    axis.set_ylim(0.0, 1.0)
+    axis.set_title('Raw direction energy decomposition (Top 50)')
+    axis.legend(ncol=3, frameon=False)
+    figure.tight_layout()
+    decomposition_path = output_directory / 'raw_direction_energy_decomposition.png'
+    figure.savefig(decomposition_path, dpi=dpi, bbox_inches='tight')
+    plt.close(figure)
+    paths.append(decomposition_path)
+
+    active = result['class_separation_active']
+    active_shares = result['between_class_energy_share'][active]
+    maximum_share = active_shares.max().clamp_min(
+        torch.finfo(active_shares.dtype).eps
+    )
+    point_sizes = 24.0 + 476.0 * torch.sqrt(active_shares / maximum_share)
+    figure, axis = plt.subplots(figsize=(6.4, 4.4))
+    axis.scatter(
+        result['sap_importance'][active].detach().cpu().numpy(),
+        result['class_separation_ratio'][active].detach().cpu().numpy(),
+        s=point_sizes.detach().cpu().numpy(),
+        color='#CC79A7', alpha=0.65, edgecolors='none',
+    )
+    axis.set_xlabel('SAP importance')
+    axis.set_ylabel('Class-separation ratio')
+    axis.set_title('SAP importance vs Raw-direction class separation')
+    axis.set_ylim(-0.02, 1.02)
+    figure.tight_layout()
+    scatter_path = output_directory / 'sap_importance_vs_discriminativeness.png'
+    figure.savefig(scatter_path, dpi=dpi, bbox_inches='tight')
+    plt.close(figure)
+    paths.append(scatter_path)
     return paths
 
 
@@ -813,6 +1095,18 @@ def run_diagnostic(
     )
     result['summary'].update(centering_result.pop('summary'))
     result.update(centering_result)
+    class_structure_result = analyze_raw_direction_class_structure(
+        x_task1=artifacts['x_task1'],
+        trusted_labels=artifacts['trusted_labels'],
+        raw_gram=artifacts['gram'],
+        raw_eigenvalues=result['eigenvalues'],
+        raw_eigenvectors=result['eigenvectors'],
+        decomposition_device=decomposition_device,
+        decomposition_dtype=decomposition_dtype,
+        sanity_tolerance=sanity_tolerance,
+    )
+    result['summary'].update(class_structure_result.pop('summary'))
+    result.update(class_structure_result)
     print(f"decomposition_device={result['summary']['decomposition_device']}")
     print(f"decomposition_dtype={result['summary']['decomposition_dtype']}")
     return save_diagnostics(result, output_directory, dpi=dpi)
