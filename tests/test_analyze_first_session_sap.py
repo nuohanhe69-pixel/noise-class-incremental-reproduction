@@ -54,6 +54,51 @@ class FirstSessionSapDiagnosticTests(unittest.TestCase):
         self.assertTrue(torch.isnan(result['class_separation_ratio'][-1]))
         self.assertTrue(torch.isnan(result['common_mean_fraction'][-1]))
 
+    def test_fraction_validation_skips_pure_relative_check_below_stable_threshold(self):
+        labels = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.long)
+        tail_scale = (1e-4 / 8.0) ** 0.5
+        features = torch.stack((
+            torch.tensor(
+                [1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0],
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
+                dtype=torch.float32,
+            ),
+            tail_scale * torch.tensor(
+                [1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0],
+                dtype=torch.float32,
+            ),
+        ), dim=1)
+        raw_gram = features.T @ features
+        raw_eigenvalues = raw_gram.diag().clone()
+        raw_eigenvalues[-1] *= 1.01
+
+        result = diagnostic.analyze_raw_direction_class_structure(
+            x_task1=features,
+            trusted_labels=labels,
+            raw_gram=raw_gram,
+            raw_eigenvalues=raw_eigenvalues,
+            raw_eigenvectors=torch.eye(3, dtype=torch.float32),
+            decomposition_device='cpu',
+            decomposition_dtype='float32',
+            sanity_tolerance=1e-4,
+        )
+
+        self.assertTrue(torch.isfinite(result['common_mean_fraction'][-1]))
+        self.assertFalse(result['fraction_relative_stable'][-1])
+        fraction_sum_error = abs(
+            result['common_mean_fraction'][-1]
+            + result['between_class_fraction'][-1]
+            + result['within_class_fraction'][-1]
+            - 1.0
+        )
+        self.assertGreater(fraction_sum_error, 1e-3)
+        self.assertLess(
+            result['summary']['raw_energy_decomposition_relative_error'], 1e-4,
+        )
+
     def test_float32_mixed_tolerance_still_rejects_material_direction_error(self):
         dimension = 101
         features = torch.eye(dimension, dtype=torch.float32)

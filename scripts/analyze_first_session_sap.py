@@ -504,16 +504,42 @@ def analyze_raw_direction_class_structure(
     within_class_fraction[raw_energy_active] = (
         within_class_energy[raw_energy_active] / raw_eigenvalues[raw_energy_active]
     )
-    maximum_fraction_sum_error = float((
+    fraction_sum_error = (
         common_mean_fraction[raw_energy_active]
         + between_class_fraction[raw_energy_active]
         + within_class_fraction[raw_energy_active]
         - 1.0
-    ).abs().max().item())
-    if maximum_fraction_sum_error > sanity_tolerance:
+    ).abs()
+    maximum_fraction_sum_error = float(fraction_sum_error.max().item())
+    relative_stable_threshold = torch.maximum(
+        stable_energy_threshold,
+        numerical_floor / sanity_tolerance,
+    )
+    fraction_relative_stable = raw_eigenvalues > relative_stable_threshold
+    if fraction_relative_stable.any():
+        stable_fraction_sum_error = (
+            common_mean_fraction[fraction_relative_stable]
+            + between_class_fraction[fraction_relative_stable]
+            + within_class_fraction[fraction_relative_stable]
+            - 1.0
+        ).abs()
+        maximum_stable_fraction_sum_error = float(
+            stable_fraction_sum_error.max().item()
+        )
+        stable_fraction_tolerance = (
+            sanity_tolerance
+            + numerical_floor / raw_eigenvalues[fraction_relative_stable]
+        )
+        fraction_validation_failed = bool(
+            (stable_fraction_sum_error > stable_fraction_tolerance).any().item()
+        )
+    else:
+        maximum_stable_fraction_sum_error = 0.0
+        fraction_validation_failed = False
+    if fraction_validation_failed:
         raise ValueError(
             'Raw directional energy fractions do not sum to one: '
-            f'max_error={maximum_fraction_sum_error:.6e}'
+            f'max_relative_stable_error={maximum_stable_fraction_sum_error:.6e}'
         )
 
     residual_scale = residual_variation_energy.max()
@@ -568,6 +594,13 @@ def analyze_raw_direction_class_structure(
         'raw_energy_decomposition_numerical_floor': float(
             numerical_floor.item()
         ),
+        'raw_energy_fraction_sum_max_error': maximum_fraction_sum_error,
+        'raw_energy_fraction_sum_max_relative_stable_error': (
+            maximum_stable_fraction_sum_error
+        ),
+        'raw_energy_fraction_relative_stable_count': int(
+            fraction_relative_stable.sum().item()
+        ),
         'projection_energy_reconstruction_relative_error': (
             projection_energy_reconstruction_relative_error
         ),
@@ -584,6 +617,7 @@ def analyze_raw_direction_class_structure(
         'common_mean_fraction': common_mean_fraction,
         'between_class_fraction': between_class_fraction,
         'within_class_fraction': within_class_fraction,
+        'fraction_relative_stable': fraction_relative_stable,
         'class_separation_active': class_separation_active,
         'class_separation_ratio': class_separation_ratio,
         'between_class_energy_share': between_class_energy_share,
