@@ -22,6 +22,108 @@ from utils.buffer import Buffer
 
 
 class AerSapContractTests(unittest.TestCase):
+    def test_task1_test_decision_capture_matches_seen_class_evaluation_and_state(self):
+        from models.aer_sap import AerSap
+
+        class _Net(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.backbone = nn.Identity()
+                self.classifier = nn.Linear(2, 4)
+
+            def forward(self, inputs):
+                return self.classifier(self.backbone(inputs))
+
+        class _Dataset:
+            N_CLASSES = 4
+            test_loaders = [[(
+                torch.tensor([[3.0, 0.0], [0.0, 4.0]]),
+                torch.tensor([0, 1], dtype=torch.long),
+            )]]
+
+            @staticmethod
+            def get_offsets(task_id=None):
+                return 0, 2
+
+        model = AerSap.__new__(AerSap)
+        nn.Module.__init__(model)
+        model.net = _Net()
+        model.device = torch.device('cpu')
+        model._current_task = 0
+        model.args = SimpleNamespace(debug_mode=0)
+        with torch.no_grad():
+            model.net.classifier.weight.copy_(torch.tensor([
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [100.0, 100.0],
+                [50.0, 50.0],
+            ]))
+            model.net.classifier.bias.copy_(torch.tensor([0.1, 0.2, 10.0, 5.0]))
+
+        state_before = {
+            name: value.detach().clone() for name, value in model.net.state_dict().items()
+        }
+        training_before = {
+            name: module.training for name, module in model.net.named_modules()
+        }
+        pre = model._capture_task1_test_decisions(_Dataset())
+
+        torch.testing.assert_close(
+            pre['raw_features'], torch.tensor([[3.0, 0.0], [0.0, 4.0]]),
+        )
+        self.assertFalse(torch.allclose(
+            pre['raw_features'].norm(dim=1), torch.ones(2),
+        ))
+        torch.testing.assert_close(
+            pre['logits'],
+            torch.nn.functional.linear(
+                pre['raw_features'], state_before['classifier.weight'],
+                state_before['classifier.bias'],
+            ),
+        )
+        self.assertTrue(torch.equal(pre['predictions'], torch.tensor([0, 1])))
+        self.assertTrue(torch.equal(pre['logits'].argmax(dim=1), torch.tensor([2, 2])))
+        self.assertEqual(pre['seen_classes'], [0, 1])
+        self.assertEqual(pre['accuracy'], 100.0)
+        for name, value in model.net.state_dict().items():
+            self.assertTrue(torch.equal(value, state_before[name]))
+        self.assertEqual(
+            {name: module.training for name, module in model.net.named_modules()},
+            training_before,
+        )
+
+        weight_after = state_before['classifier.weight'].clone()
+        weight_after[:2] = weight_after[:2].flip(0)
+        model._install_classifier_candidate(
+            model.net.classifier, weight_after, state_before['classifier.bias'],
+        )
+        post_state_before = {
+            name: value.detach().clone() for name, value in model.net.state_dict().items()
+        }
+        post = model._capture_task1_test_decisions(_Dataset())
+        torch.testing.assert_close(
+            post['logits'],
+            torch.nn.functional.linear(
+                post['raw_features'], weight_after, state_before['classifier.bias'],
+            ),
+        )
+        self.assertEqual(post['accuracy'], 0.0)
+        for name, value in model.net.state_dict().items():
+            self.assertTrue(torch.equal(value, post_state_before[name]))
+
+        decision_stats = model._build_task1_test_decision_stats(
+            pre,
+            post,
+            {
+                'pre_sap': {'per_task_class_il': [100.0]},
+                'post_sap': {'per_task_class_il': [0.0]},
+            },
+            classifier_has_bias=True,
+        )
+        self.assertEqual(decision_stats['pre_accuracy_absolute_error'], 0.0)
+        self.assertEqual(decision_stats['post_accuracy_absolute_error'], 0.0)
+        self.assertEqual(decision_stats['prediction_changed_count'], 2)
+
     def test_inherits_aer_directly_without_dgc(self):
         from models.aer_sap import AerSap
 
@@ -265,6 +367,32 @@ class AerSapContractTests(unittest.TestCase):
         weight_before = model.net.classifier.weight.detach().clone()
         bias_before = model.net.classifier.bias.detach().clone()
         backbone_before = model.net.backbone.weight.detach().clone()
+        task1_test_features_raw = torch.arange(
+            100 * 512, dtype=torch.float32,
+        ).reshape(100, 512) / 100
+        task1_test_labels = torch.zeros(100, dtype=torch.long)
+        pre_logits = torch.zeros(100, 100)
+        pre_logits[:, 1] = 1.0
+        pre_logits[0, 0] = 2.0
+        post_logits = torch.zeros(100, 100)
+        post_logits[:, 1] = 1.0
+        post_logits[:2, 0] = 2.0
+        pre_decisions = {
+            'raw_features': task1_test_features_raw,
+            'labels': task1_test_labels,
+            'logits': pre_logits,
+            'predictions': pre_logits[:, :10].argmax(dim=1),
+            'seen_classes': list(range(10)),
+            'accuracy': 1.0,
+        }
+        post_decisions = {
+            'raw_features': task1_test_features_raw.clone(),
+            'labels': task1_test_labels.clone(),
+            'logits': post_logits,
+            'predictions': post_logits[:, :10].argmax(dim=1),
+            'seen_classes': list(range(10)),
+            'accuracy': 2.0,
+        }
 
         with tempfile.TemporaryDirectory() as temporary_directory, patch(
             'models.aer_sap.collect_classifier_input_features', return_value=x_task1,
@@ -273,12 +401,16 @@ class AerSapContractTests(unittest.TestCase):
             return_value=(x_task1, feature_stats),
         ) as normalize_features, patch.object(
             model, '_taskwise_artifact_directory', return_value=Path(temporary_directory),
-        ):
+        ), patch.object(
+            model, '_capture_task1_test_decisions',
+            side_effect=(pre_decisions, post_decisions),
+        ) as capture_decisions:
             model._run_first_session_taskwise_sap(dataset)
 
             build_reference.assert_called_once_with(dataset, return_task_ids=True)
             collect_features.assert_called_once()
             normalize_features.assert_called_once_with(x_task1)
+            self.assertEqual(capture_decisions.call_count, 2)
             self.assertEqual(model._build_oracle_projection.call_count, 1)
             self.assertEqual(len(dataset.evaluated_weights), 2)
 
@@ -299,6 +431,13 @@ class AerSapContractTests(unittest.TestCase):
                     'W_before.pt', 'X_task1.pt', 'trusted_labels.pt',
                     'trusted_task_ids.pt', 'reference_stats.json', 'coverage.json',
                     'G_task_0.pt', 'M_task_0.pt', 'W_after.pt',
+                    'task1_test_features_raw.pt', 'task1_test_labels.pt',
+                    'classifier_bias_before.pt',
+                    'task1_test_logits_pre_sap.pt',
+                    'task1_test_logits_post_sap.pt',
+                    'task1_test_predictions_pre_sap.pt',
+                    'task1_test_predictions_post_sap.pt',
+                    'task1_test_decision_stats.json',
                     'accuracy.json', 'manifest.json',
                 },
                 {path.name for path in artifact_dir.iterdir()},
@@ -335,6 +474,32 @@ class AerSapContractTests(unittest.TestCase):
             manifest = json.loads((artifact_dir / 'manifest.json').read_text())
             self.assertEqual(manifest['seen_tasks'], [0])
             self.assertFalse(manifest['global_candidate_built'])
+            self.assertTrue(manifest['classifier_has_bias'])
+            self.assertEqual(
+                manifest['test_feature_type'], 'raw_classifier_input',
+            )
+            self.assertFalse(manifest['test_feature_l2_normalized'])
+            torch.testing.assert_close(
+                torch.load(
+                    artifact_dir / 'task1_test_features_raw.pt', weights_only=True,
+                ),
+                task1_test_features_raw,
+            )
+            torch.testing.assert_close(
+                torch.load(
+                    artifact_dir / 'classifier_bias_before.pt', weights_only=True,
+                ),
+                bias_before,
+            )
+            decision_stats = json.loads(
+                (artifact_dir / 'task1_test_decision_stats.json').read_text(),
+            )
+            self.assertEqual(decision_stats['sample_count'], 100)
+            self.assertEqual(decision_stats['pre_accuracy_recomputed'], 1.0)
+            self.assertEqual(decision_stats['post_accuracy_recomputed'], 2.0)
+            self.assertEqual(decision_stats['pre_accuracy_absolute_error'], 0.0)
+            self.assertEqual(decision_stats['post_accuracy_absolute_error'], 0.0)
+            self.assertEqual(decision_stats['prediction_changed_count'], 1)
             self.assertEqual(model.sap_history[-1]['final_selected_candidate'], 'taskwise')
             self.assertEqual(model.sap_history[-1]['seen_tasks'], [0])
             self.assertEqual(

@@ -120,6 +120,123 @@ class AerSap(ErAceAerAbs):
             'per_task_task_il': per_task_task_il,
         }
 
+    @torch.no_grad()
+    def _capture_task1_test_decisions(self, dataset) -> dict:
+        """Capture raw classifier inputs and Task1 Class-IL decisions."""
+        if int(self.current_task) != 0:
+            raise ValueError('Task1 test diagnostics are only valid at task 0')
+        if not dataset.test_loaders:
+            raise ValueError('Task1 test loader is unavailable')
+        start_c, seen_end = dataset.get_offsets()
+        start_c, seen_end = int(start_c), int(seen_end)
+        if start_c != 0 or seen_end <= 0:
+            raise ValueError('Task1 Class-IL evaluation requires classes [0, seen_end)')
+
+        classifier = resolve_classifier_module(self.net)
+        captured_features = []
+
+        def capture_classifier_input(_module, args):
+            if not args:
+                raise RuntimeError('classifier received no positional input')
+            features = args[0].detach()
+            if features.ndim != 2 or features.shape[1] != classifier.in_features:
+                raise ValueError('unexpected Task1 test classifier-input shape')
+            captured_features.append(features)
+
+        training_states = {
+            module: module.training for module in self.net.modules()
+        }
+        handle = classifier.register_forward_pre_hook(capture_classifier_input)
+        logits_batches = []
+        label_batches = []
+        try:
+            self.net.eval()
+            for batch_index, data in enumerate(dataset.test_loaders[0]):
+                if (
+                    getattr(self.args, 'debug_mode', False)
+                    and batch_index > self.get_debug_iters()
+                ):
+                    break
+                inputs, labels = data[0], data[1]
+                inputs = inputs.to(self.device)
+                labels = labels.to(self.device).long()
+                logits = self(inputs)
+                if logits.ndim != 2 or logits.shape[1] < seen_end:
+                    raise ValueError('Task1 test logits do not cover all seen classes')
+                logits_batches.append(logits.detach())
+                label_batches.append(labels.detach())
+        finally:
+            handle.remove()
+            for module, was_training in training_states.items():
+                module.training = was_training
+
+        if not captured_features or not logits_batches:
+            raise ValueError('Task1 test diagnostic capture produced no samples')
+        raw_features = torch.cat(captured_features, dim=0)
+        logits = torch.cat(logits_batches, dim=0)
+        labels = torch.cat(label_batches, dim=0)
+        sample_count = int(labels.shape[0])
+        if not (
+            raw_features.shape[0] == sample_count
+            and logits.shape[0] == sample_count
+        ):
+            raise ValueError('Task1 test features, labels, and logits are not aligned')
+        predictions = logits[:, :seen_end].argmax(dim=1)
+        correct = int((predictions == labels).sum().item())
+        accuracy = correct / sample_count * 100.0
+        return {
+            'raw_features': raw_features.detach().cpu(),
+            'labels': labels.detach().cpu(),
+            'logits': logits.detach().cpu(),
+            'predictions': predictions.detach().cpu(),
+            'seen_classes': list(range(seen_end)),
+            'accuracy': accuracy,
+        }
+
+    @staticmethod
+    def _build_task1_test_decision_stats(
+        pre_sap: dict,
+        post_sap: dict,
+        accuracy: dict,
+        *,
+        classifier_has_bias: bool,
+        tolerance: float = 1e-6,
+    ) -> dict:
+        """Verify saved decisions reproduce Task1 evaluator accuracy."""
+        for key in ('raw_features', 'labels', 'logits', 'predictions'):
+            if len(pre_sap[key]) != len(post_sap[key]):
+                raise ValueError(f'pre/post Task1 test {key} are not aligned')
+        if not torch.equal(pre_sap['labels'], post_sap['labels']):
+            raise ValueError('pre/post Task1 test labels differ')
+        if not torch.equal(pre_sap['raw_features'], post_sap['raw_features']):
+            raise ValueError('pre/post raw Task1 test features differ')
+        if pre_sap['seen_classes'] != post_sap['seen_classes']:
+            raise ValueError('pre/post seen-class decision semantics differ')
+
+        pre_evaluator = float(accuracy['pre_sap']['per_task_class_il'][0])
+        post_evaluator = float(accuracy['post_sap']['per_task_class_il'][0])
+        pre_error = abs(float(pre_sap['accuracy']) - pre_evaluator)
+        post_error = abs(float(post_sap['accuracy']) - post_evaluator)
+        if pre_error > tolerance or post_error > tolerance:
+            raise ValueError(
+                'saved Task1 decisions do not reproduce candidate evaluation: '
+                f'pre_error={pre_error:.6e}, post_error={post_error:.6e}'
+            )
+        return {
+            'sample_count': int(len(pre_sap['labels'])),
+            'seen_classes': pre_sap['seen_classes'],
+            'classifier_has_bias': bool(classifier_has_bias),
+            'pre_accuracy_recomputed': float(pre_sap['accuracy']),
+            'post_accuracy_recomputed': float(post_sap['accuracy']),
+            'pre_accuracy_evaluator': pre_evaluator,
+            'post_accuracy_evaluator': post_evaluator,
+            'pre_accuracy_absolute_error': pre_error,
+            'post_accuracy_absolute_error': post_error,
+            'prediction_changed_count': int((
+                pre_sap['predictions'] != post_sap['predictions']
+            ).sum().item()),
+        }
+
     @staticmethod
     def _build_reference_coverage(
         dataset, trusted_labels, trusted_task_ids, seen_tasks,
@@ -207,6 +324,9 @@ class AerSap(ErAceAerAbs):
         weight_after,
         accuracy,
         manifest,
+        test_decisions,
+        classifier_bias_before,
+        decision_stats,
     ) -> Path:
         output_directory = self._taskwise_artifact_directory(dataset)
         output_directory.mkdir(parents=True, exist_ok=True)
@@ -216,7 +336,19 @@ class AerSap(ErAceAerAbs):
             'trusted_labels.pt': trusted_labels,
             'trusted_task_ids.pt': trusted_task_ids,
             'W_after.pt': weight_after,
+            'task1_test_features_raw.pt': test_decisions['pre_sap']['raw_features'],
+            'task1_test_labels.pt': test_decisions['pre_sap']['labels'],
+            'task1_test_logits_pre_sap.pt': test_decisions['pre_sap']['logits'],
+            'task1_test_logits_post_sap.pt': test_decisions['post_sap']['logits'],
+            'task1_test_predictions_pre_sap.pt': (
+                test_decisions['pre_sap']['predictions']
+            ),
+            'task1_test_predictions_post_sap.pt': (
+                test_decisions['post_sap']['predictions']
+            ),
         }
+        if classifier_bias_before is not None:
+            tensors['classifier_bias_before.pt'] = classifier_bias_before
         for filename, tensor in tensors.items():
             torch.save(tensor.detach().cpu(), output_directory / filename)
         for task_id, gram in sorted(task_grams.items()):
@@ -238,6 +370,9 @@ class AerSap(ErAceAerAbs):
         )
         (output_directory / 'manifest.json').write_text(
             json.dumps(manifest, indent=2, sort_keys=True), encoding='utf-8',
+        )
+        (output_directory / 'task1_test_decision_stats.json').write_text(
+            json.dumps(decision_stats, indent=2, sort_keys=True), encoding='utf-8',
         )
         return output_directory
 
@@ -377,6 +512,7 @@ class AerSap(ErAceAerAbs):
 
             stage = 'candidate_evaluation'
             accuracy = {}
+            test_decisions = {}
             for candidate_name, candidate_weight in (
                 ('pre_sap', weight_before),
                 ('post_sap', weight_after_taskwise),
@@ -384,11 +520,21 @@ class AerSap(ErAceAerAbs):
                 self._install_classifier_candidate(
                     classifier, candidate_weight, bias_before,
                 )
+                test_decisions[candidate_name] = (
+                    self._capture_task1_test_decisions(dataset)
+                )
                 accuracy[candidate_name] = self._summarize_evaluation(dataset, self)
                 logging.info(
                     'Task-wise SAP candidate %s results: %s',
                     candidate_name, accuracy[candidate_name],
                 )
+
+            decision_stats = self._build_task1_test_decision_stats(
+                test_decisions['pre_sap'],
+                test_decisions['post_sap'],
+                accuracy,
+                classifier_has_bias=bias_before is not None,
+            )
 
             manifest = {
                 'experiment_name': 'first_session_only_taskwise_sap_v1',
@@ -398,6 +544,10 @@ class AerSap(ErAceAerAbs):
                 'projection_target': 'classifier',
                 'projection_scope': 'taskwise_seen_tasks',
                 'global_candidate_built': False,
+                'classifier_has_bias': bias_before is not None,
+                'test_feature_type': 'raw_classifier_input',
+                'test_feature_l2_normalized': False,
+                'test_decision_semantics': 'class_il_seen_classes',
             }
             stage = 'artifact_save'
             output_directory = self._save_taskwise_artifacts(
@@ -413,6 +563,9 @@ class AerSap(ErAceAerAbs):
                 weight_after=weight_after_taskwise,
                 accuracy=accuracy,
                 manifest=manifest,
+                test_decisions=test_decisions,
+                classifier_bias_before=bias_before,
+                decision_stats=decision_stats,
             )
 
             stage = 'taskwise_commit'
