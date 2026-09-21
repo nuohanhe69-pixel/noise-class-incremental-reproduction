@@ -173,6 +173,163 @@ def decompose_psd_gram(
     return eigenvalues, eigenvectors
 
 
+def analyze_feature_centering(
+    *,
+    x_task1: Tensor,
+    raw_gram: Tensor,
+    raw_eigenvectors: Tensor,
+    decomposition_device: str = 'cpu',
+    decomposition_dtype: str = 'artifact',
+    sanity_tolerance: float = 1e-4,
+) -> dict:
+    """Compare the saved Raw Gram with a mean-centered feature Gram."""
+    _require_finite_floating_matrix(x_task1, 'X_task1')
+    _require_finite_floating_matrix(raw_gram, 'G_task_0')
+    if x_task1.shape[0] == 0:
+        raise ValueError('X_task1 must contain at least one sample')
+    if raw_gram.shape != (x_task1.shape[1], x_task1.shape[1]):
+        raise ValueError('G_task_0 shape does not match X_task1 feature dimension')
+    if sanity_tolerance <= 0:
+        raise ValueError('sanity_tolerance must be positive')
+
+    device, dtype = _resolve_decomposition_backend(
+        raw_gram, decomposition_device, decomposition_dtype,
+    )
+    if raw_eigenvectors.shape != raw_gram.shape:
+        raise ValueError('Raw eigenvector shape does not match G_task_0')
+    device_mismatch = (
+        raw_eigenvectors.device.type != device.type
+        or (
+            device.index is not None
+            and raw_eigenvectors.device.index != device.index
+        )
+    )
+    if device_mismatch or raw_eigenvectors.dtype != dtype:
+        raise ValueError(
+            'Raw eigenvectors do not match the requested decomposition backend'
+        )
+    device = raw_eigenvectors.device
+    features = x_task1.detach().to(device=device, dtype=dtype)
+    raw_gram_analysis = raw_gram.detach().to(device=device, dtype=dtype)
+    sample_count = int(features.shape[0])
+
+    feature_mean = features.mean(dim=0)
+    feature_mean_norm_squared = feature_mean.square().sum()
+    mean_norm_tolerance = torch.finfo(dtype).eps
+    if feature_mean_norm_squared <= mean_norm_tolerance:
+        raise ValueError(
+            'X_task1 feature mean is too small for cosine analysis: '
+            f'norm_squared={feature_mean_norm_squared.item():.6e}'
+        )
+    mean_energy = sample_count * feature_mean_norm_squared
+    raw_trace = raw_gram_analysis.trace()
+    if raw_trace <= 0:
+        raise ValueError('G_task_0 trace must be positive')
+    mean_energy_fraction = mean_energy / raw_trace
+
+    raw_top1 = raw_eigenvectors[:, 0]
+    cosine_denominator = raw_top1.square().sum() * feature_mean_norm_squared
+    raw_top1_mean_cosine_squared = (
+        raw_top1.dot(feature_mean).square() / cosine_denominator
+    )
+
+    # X_task1 is already sample-wise L2 normalized by the SAP artifact path.
+    # Centering subtracts only the shared feature mean; there is no second L2 step.
+    centered_features = features - feature_mean.unsqueeze(0)
+    centered_gram = centered_features.T @ centered_features
+    expected_centered_gram = (
+        raw_gram_analysis - sample_count * torch.outer(feature_mean, feature_mean)
+    )
+    centered_gram_identity_absolute_error = float(
+        (centered_gram - expected_centered_gram).norm().item()
+    )
+    centered_gram_identity_relative_error = _relative_error(
+        centered_gram, expected_centered_gram,
+    )
+    if centered_gram_identity_relative_error > sanity_tolerance:
+        raise ValueError(
+            'centered Gram identity failed: '
+            f'relative error={centered_gram_identity_relative_error:.6e}'
+        )
+
+    centered_trace = centered_gram.trace()
+    trace_decomposition_absolute_error = float(
+        (raw_trace - (centered_trace + mean_energy)).abs().item()
+    )
+    trace_decomposition_relative_error = float(
+        (trace_decomposition_absolute_error / raw_trace.abs().item())
+    )
+    if trace_decomposition_relative_error > sanity_tolerance:
+        raise ValueError(
+            'Gram trace decomposition failed: '
+            f'relative error={trace_decomposition_relative_error:.6e}'
+        )
+
+    centered_eigenvalues, centered_eigenvectors = decompose_psd_gram(
+        centered_gram,
+        decomposition_device=decomposition_device,
+        decomposition_dtype=decomposition_dtype,
+    )
+    centered_feature_energy_ratio = (
+        centered_eigenvalues / centered_eigenvalues.sum()
+    )
+    centered_cumulative_energy = centered_feature_energy_ratio.cumsum(dim=0)
+    positive_centered_ratios = centered_feature_energy_ratio[
+        centered_feature_energy_ratio > 0
+    ]
+    centered_effective_rank = torch.exp(
+        -(positive_centered_ratios * positive_centered_ratios.log()).sum(),
+    )
+
+    summary = {
+        'feature_mean_norm_squared': float(feature_mean_norm_squared.item()),
+        'mean_energy': float(mean_energy.item()),
+        'mean_energy_fraction': float(mean_energy_fraction.item()),
+        'raw_top1_mean_cosine_squared': float(
+            raw_top1_mean_cosine_squared.item()
+        ),
+        'centered_gram_trace': float(centered_trace.item()),
+        'centered_top1_feature_energy_ratio': float(
+            centered_feature_energy_ratio[:1].sum().item()
+        ),
+        'centered_top5_feature_energy_ratio': float(
+            centered_feature_energy_ratio[:5].sum().item()
+        ),
+        'centered_top10_feature_energy_ratio': float(
+            centered_feature_energy_ratio[:10].sum().item()
+        ),
+        'centered_top20_feature_energy_ratio': float(
+            centered_feature_energy_ratio[:20].sum().item()
+        ),
+        'centered_top50_feature_energy_ratio': float(
+            centered_feature_energy_ratio[:50].sum().item()
+        ),
+        'centered_effective_rank': float(centered_effective_rank.item()),
+        'centered_gram_identity_relative_error': (
+            centered_gram_identity_relative_error
+        ),
+        'centered_gram_identity_absolute_error': (
+            centered_gram_identity_absolute_error
+        ),
+        'trace_decomposition_error': trace_decomposition_relative_error,
+        'trace_decomposition_relative_error': trace_decomposition_relative_error,
+        'trace_decomposition_absolute_error': trace_decomposition_absolute_error,
+    }
+    if not all(math.isfinite(value) for value in summary.values()):
+        raise ValueError('feature-centering diagnostics contain NaN or Inf')
+
+    return {
+        'feature_mean': feature_mean,
+        'centered_features': centered_features,
+        'centered_gram': centered_gram,
+        'centered_eigenvalues': centered_eigenvalues,
+        'centered_eigenvectors': centered_eigenvectors,
+        'centered_feature_energy_ratio': centered_feature_energy_ratio,
+        'centered_cumulative_energy': centered_cumulative_energy,
+        'summary': summary,
+    }
+
+
 def analyze_task1_geometry(
     *,
     gram: Tensor,
@@ -532,6 +689,30 @@ def _plot_diagnostics(result: dict, output_directory: Path, dpi: int) -> list[Pa
             (('Cumulative energy', result['cumulative_energy'], '#009E73', '-'),),
         ),
         (
+            'raw_vs_centered_spectrum.png',
+            'Raw vs feature-centered spectrum',
+            'Feature energy ratio',
+            (
+                ('Raw', result['feature_energy_ratio'], '#0072B2', '-'),
+                (
+                    'Feature-centered', result['centered_feature_energy_ratio'],
+                    '#D55E00', '--',
+                ),
+            ),
+        ),
+        (
+            'raw_vs_centered_cumulative_energy.png',
+            'Raw vs feature-centered cumulative energy',
+            'Cumulative energy',
+            (
+                ('Raw', result['cumulative_energy'], '#0072B2', '-'),
+                (
+                    'Feature-centered', result['centered_cumulative_energy'],
+                    '#D55E00', '--',
+                ),
+            ),
+        ),
+        (
             'sap_importance.png', 'SAP importance', 'SAP importance',
             (('Importance', result['sap_importance'], '#E69F00', '-'),),
         ),
@@ -622,6 +803,16 @@ def run_diagnostic(
         decomposition_device=decomposition_device,
         decomposition_dtype=decomposition_dtype,
     )
+    centering_result = analyze_feature_centering(
+        x_task1=artifacts['x_task1'],
+        raw_gram=artifacts['gram'],
+        raw_eigenvectors=result['eigenvectors'],
+        decomposition_device=decomposition_device,
+        decomposition_dtype=decomposition_dtype,
+        sanity_tolerance=sanity_tolerance,
+    )
+    result['summary'].update(centering_result.pop('summary'))
+    result.update(centering_result)
     print(f"decomposition_device={result['summary']['decomposition_device']}")
     print(f"decomposition_dtype={result['summary']['decomposition_dtype']}")
     return save_diagnostics(result, output_directory, dpi=dpi)

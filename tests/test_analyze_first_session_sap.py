@@ -15,6 +15,73 @@ import scripts.analyze_first_session_sap as diagnostic
 
 
 class FirstSessionSapDiagnosticTests(unittest.TestCase):
+    def test_feature_centering_removes_strong_common_mean_without_renormalizing(self):
+        variations = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, -1.0],
+            ],
+            dtype=torch.float64,
+        )
+        features = torch.cat(
+            (torch.full((len(variations), 1), 3.0, dtype=torch.float64), variations),
+            dim=1,
+        )
+        features = torch.nn.functional.normalize(features, dim=1)
+        raw_gram = features.T @ features
+        raw_eigenvalues, raw_eigenvectors = diagnostic.decompose_psd_gram(
+            raw_gram,
+            decomposition_device='cpu',
+            decomposition_dtype='float64',
+        )
+        raw_ratios = raw_eigenvalues / raw_eigenvalues.sum()
+        positive_raw_ratios = raw_ratios[raw_ratios > 0]
+        raw_effective_rank = torch.exp(
+            -(positive_raw_ratios * positive_raw_ratios.log()).sum(),
+        )
+
+        centered = diagnostic.analyze_feature_centering(
+            x_task1=features,
+            raw_gram=raw_gram,
+            raw_eigenvectors=raw_eigenvectors,
+            decomposition_device='cpu',
+            decomposition_dtype='float64',
+            sanity_tolerance=1e-10,
+        )
+
+        self.assertGreater(float(raw_ratios[0].item()), 0.85)
+        self.assertGreater(centered['summary']['raw_top1_mean_cosine_squared'], 0.999)
+        self.assertLess(
+            centered['summary']['centered_top1_feature_energy_ratio'],
+            float(raw_ratios[0].item()),
+        )
+        self.assertGreater(
+            centered['summary']['centered_effective_rank'],
+            float(raw_effective_rank.item()),
+        )
+        torch.testing.assert_close(
+            centered['centered_gram'],
+            raw_gram - len(features) * torch.outer(features.mean(dim=0), features.mean(dim=0)),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        self.assertLess(
+            centered['summary']['centered_gram_identity_relative_error'], 1e-10,
+        )
+        self.assertLess(
+            centered['summary']['trace_decomposition_absolute_error'], 1e-10,
+        )
+        expected_centered = features - features.mean(dim=0, keepdim=True)
+        torch.testing.assert_close(centered['centered_features'], expected_centered)
+        self.assertFalse(torch.allclose(
+            centered['centered_features'].norm(dim=1),
+            torch.ones(len(features), dtype=torch.float64),
+        ))
+
     def test_direction_summary_maps_eigenvalue_header_to_eigenvalues_result(self):
         result = {
             column: torch.tensor([1.0])
