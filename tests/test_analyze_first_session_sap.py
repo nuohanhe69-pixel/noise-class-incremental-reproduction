@@ -15,6 +15,70 @@ import scripts.analyze_first_session_sap as diagnostic
 
 
 class FirstSessionSapDiagnosticTests(unittest.TestCase):
+    def test_float32_tail_error_uses_numerical_floor_and_is_separation_inactive(self):
+        labels = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+        tail = 1e-4
+        features = torch.tensor(
+            [
+                [1.0, 1.0, tail],
+                [1.0, -1.0, -tail],
+                [-1.0, 1.0, tail],
+                [-1.0, -1.0, -tail],
+            ],
+            dtype=torch.float32,
+        )
+        raw_gram = features.T @ features
+        projection_energy = raw_gram.diag()
+        raw_eigenvalues = projection_energy.clone()
+        raw_eigenvalues[-1] *= 1.02
+
+        result = diagnostic.analyze_raw_direction_class_structure(
+            x_task1=features,
+            trusted_labels=labels,
+            raw_gram=raw_gram,
+            raw_eigenvalues=raw_eigenvalues,
+            raw_eigenvectors=torch.eye(3, dtype=torch.float32),
+            decomposition_device='cpu',
+            decomposition_dtype='float32',
+            sanity_tolerance=1e-4,
+        )
+
+        self.assertLess(
+            result['summary']['raw_energy_decomposition_relative_error'], 1e-4,
+        )
+        self.assertGreater(
+            result['summary']['raw_energy_decomposition_max_direction_error'],
+            1e-2,
+        )
+        self.assertFalse(result['class_separation_active'][-1])
+        self.assertTrue(torch.isnan(result['class_separation_ratio'][-1]))
+        self.assertTrue(torch.isnan(result['common_mean_fraction'][-1]))
+
+    def test_float32_mixed_tolerance_still_rejects_material_direction_error(self):
+        dimension = 101
+        features = torch.eye(dimension, dtype=torch.float32)
+        labels = torch.cat((
+            torch.zeros(50, dtype=torch.long),
+            torch.ones(dimension - 50, dtype=torch.long),
+        ))
+        raw_gram = features.T @ features
+        raw_eigenvalues = torch.ones(dimension, dtype=torch.float32)
+        raw_eigenvalues[0] = 1.001
+
+        with self.assertRaisesRegex(
+            ValueError, 'Raw directional energy decomposition failed',
+        ):
+            diagnostic.analyze_raw_direction_class_structure(
+                x_task1=features,
+                trusted_labels=labels,
+                raw_gram=raw_gram,
+                raw_eigenvalues=raw_eigenvalues,
+                raw_eigenvectors=torch.eye(dimension, dtype=torch.float32),
+                decomposition_device='cpu',
+                decomposition_dtype='float32',
+                sanity_tolerance=1e-4,
+            )
+
     def test_raw_direction_class_energy_decomposition_and_activity(self):
         labels = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.long)
         within_sign = torch.tensor(

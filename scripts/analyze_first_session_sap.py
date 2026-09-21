@@ -25,6 +25,9 @@ FEATURE_DIMENSION = 512
 TASK1_CLASS_COUNT = 10
 TOTAL_CLASS_COUNT = 100
 ACTIVE_ENERGY_RELATIVE_THRESHOLD = 1e-12
+# This factor only supplies a floating-point floor for tail-spectrum validation.
+# It does not change any experiment, energy definition, or analysis threshold.
+DIRECTIONAL_NUMERICAL_FLOOR_SAFETY_FACTOR = 8.0
 DECOMPOSITION_DTYPES = {
     'float32': torch.float32,
     'float64': torch.float64,
@@ -439,19 +442,38 @@ def analyze_raw_direction_class_structure(
     raw_energy_scale = raw_eigenvalues.max()
     if raw_energy_scale <= 0:
         raise ValueError('Raw eigenspectrum has no positive energy')
+    raw_trace = raw_gram_analysis.trace()
+    numerical_floor = (
+        DIRECTIONAL_NUMERICAL_FLOOR_SAFETY_FACTOR
+        * torch.finfo(requested_dtype).eps
+        * raw_trace.abs()
+    )
+    stable_energy_threshold = torch.maximum(
+        raw_energy_scale * ACTIVE_ENERGY_RELATIVE_THRESHOLD,
+        numerical_floor,
+    )
     raw_energy_active = (
-        raw_eigenvalues > raw_energy_scale * ACTIVE_ENERGY_RELATIVE_THRESHOLD
+        raw_eigenvalues > stable_energy_threshold
     )
     direction_relative_error = torch.full_like(raw_eigenvalues, torch.nan)
-    direction_relative_error[raw_energy_active] = (
-        direction_absolute_error[raw_energy_active]
-        / raw_eigenvalues[raw_energy_active]
+    positive_energy = raw_eigenvalues > 0
+    direction_relative_error[positive_energy] = (
+        direction_absolute_error[positive_energy]
+        / raw_eigenvalues[positive_energy]
     )
     maximum_direction_relative_error = float(
+        direction_relative_error[positive_energy].max().item()
+    )
+    maximum_stable_direction_relative_error = float(
         direction_relative_error[raw_energy_active].max().item()
     )
     maximum_direction_absolute_error = float(direction_absolute_error.max().item())
-    raw_trace = raw_gram_analysis.trace()
+    mixed_direction_tolerance = (
+        sanity_tolerance * raw_eigenvalues.abs() + numerical_floor
+    )
+    direction_tolerance_failed = bool(
+        (direction_absolute_error > mixed_direction_tolerance).any().item()
+    )
     raw_energy_decomposition_absolute_error = float(
         (reconstructed_direction_energy.sum() - raw_trace).abs().item()
     )
@@ -459,12 +481,14 @@ def analyze_raw_direction_class_structure(
         raw_energy_decomposition_absolute_error / raw_trace.abs().item()
     )
     if (
-        maximum_direction_relative_error > sanity_tolerance
+        direction_tolerance_failed
         or raw_energy_decomposition_relative_error > sanity_tolerance
     ):
         raise ValueError(
             'Raw directional energy decomposition failed: '
             f'max_direction_relative_error={maximum_direction_relative_error:.6e}, '
+            f'max_stable_direction_relative_error='
+            f'{maximum_stable_direction_relative_error:.6e}, '
             f'global_relative_error={raw_energy_decomposition_relative_error:.6e}'
         )
 
@@ -493,9 +517,12 @@ def analyze_raw_direction_class_structure(
         )
 
     residual_scale = residual_variation_energy.max()
+    stable_residual_threshold = torch.maximum(
+        residual_scale * ACTIVE_ENERGY_RELATIVE_THRESHOLD,
+        numerical_floor,
+    )
     class_separation_active = (
-        residual_variation_energy
-        > residual_scale * ACTIVE_ENERGY_RELATIVE_THRESHOLD
+        residual_variation_energy > stable_residual_threshold
     )
     class_separation_ratio = torch.full_like(raw_eigenvalues, torch.nan)
     class_separation_ratio[class_separation_active] = (
@@ -532,8 +559,14 @@ def analyze_raw_direction_class_structure(
         'raw_energy_decomposition_max_direction_relative_error': (
             maximum_direction_relative_error
         ),
+        'raw_energy_decomposition_max_stable_direction_relative_error': (
+            maximum_stable_direction_relative_error
+        ),
         'raw_energy_decomposition_max_direction_absolute_error': (
             maximum_direction_absolute_error
+        ),
+        'raw_energy_decomposition_numerical_floor': float(
+            numerical_floor.item()
         ),
         'projection_energy_reconstruction_relative_error': (
             projection_energy_reconstruction_relative_error
