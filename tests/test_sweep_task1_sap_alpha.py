@@ -17,17 +17,17 @@ from utils.sap import build_sap_projection_from_gram, project_linear_weight
 
 
 class Task1SapAlphaSweepTests(unittest.TestCase):
-    def test_fixed_alpha_grid_and_raw_centered_candidates_preserve_scope(self):
+    def test_fixed_local_alpha_grid_and_raw_candidates_preserve_scope(self):
         self.assertEqual(
             sweep.ALPHA_GRID,
-            (1, 10, 30, 100, 300, 1000, 3000, 10000),
+            (150, 200, 250, 300, 400, 500, 700),
         )
         raw = torch.tensor([
             [4.0, 1.0, 0.0], [4.0, -1.0, 0.0],
             [4.0, 0.0, 1.0], [4.0, 0.0, -1.0],
         ])
         reference = torch.nn.functional.normalize(raw, dim=1)
-        raw_gram, centered_gram = sweep.prepare_raw_and_centered_grams(
+        raw_gram = sweep.prepare_raw_gram(
             reference,
             decomposition_device='cpu',
             decomposition_dtype='float32',
@@ -39,18 +39,9 @@ class Task1SapAlphaSweepTests(unittest.TestCase):
         raw_candidate = sweep.build_candidate(
             weight, raw_gram, alpha=100, class_count=10,
         )
-        centered_candidate = sweep.build_candidate(
-            weight, centered_gram, alpha=100, class_count=10,
-        )
 
         torch.testing.assert_close(raw_gram, reference.T @ reference)
-        expected_centered = reference - reference.mean(dim=0, keepdim=True)
-        torch.testing.assert_close(centered_gram, expected_centered.T @ expected_centered)
-        self.assertFalse(torch.allclose(
-            expected_centered.norm(dim=1), torch.ones(reference.shape[0]),
-        ))
         self.assertTrue(torch.equal(raw_candidate['weight'][10:], weight[10:]))
-        self.assertTrue(torch.equal(centered_candidate['weight'][10:], weight[10:]))
         self.assertTrue(torch.equal(bias, bias_before))
 
     @staticmethod
@@ -98,7 +89,7 @@ class Task1SapAlphaSweepTests(unittest.TestCase):
             'post_accuracy_evaluator': float((raw_predictions == labels).float().mean() * 100),
         }))
 
-    def test_end_to_end_runs_both_paths_and_writes_required_schema(self):
+    def test_end_to_end_runs_raw_local_grid_and_writes_required_schema(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             self._write_artifacts(root)
@@ -116,7 +107,7 @@ class Task1SapAlphaSweepTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, output.resolve())
-            self.assertEqual(projection_builder.call_count, len(sweep.ALPHA_GRID) * 2)
+            self.assertEqual(projection_builder.call_count, 1 + len(sweep.ALPHA_GRID))
             self.assertEqual(
                 {path.name for path in output.iterdir()},
                 {
@@ -124,17 +115,16 @@ class Task1SapAlphaSweepTests(unittest.TestCase):
                     'task1_sap_alpha_sweep_per_class.csv',
                     'task1_sap_alpha_sweep_summary.json',
                     '01_alpha_vs_accuracy.png',
-                    '02_alpha_vs_mean_margin.png',
                 },
             )
             payload = json.loads(
                 (output / 'task1_sap_alpha_sweep_summary.json').read_text(),
             )
             self.assertEqual(payload['alpha_grid'], list(sweep.ALPHA_GRID))
-            self.assertEqual(len(payload['results']), len(sweep.ALPHA_GRID) * 2)
+            self.assertEqual(len(payload['results']), len(sweep.ALPHA_GRID))
             self.assertEqual(
                 {row['variant'] for row in payload['results']},
-                {'raw', 'centered'},
+                {'raw'},
             )
             self.assertTrue(
                 payload['sanity_checks'][
@@ -158,7 +148,7 @@ class Task1SapAlphaSweepTests(unittest.TestCase):
 
             with (output / 'task1_sap_alpha_sweep_summary.csv').open(newline='') as handle:
                 summary_rows = list(csv.DictReader(handle))
-            self.assertEqual(len(summary_rows), 1 + len(sweep.ALPHA_GRID) * 2)
+            self.assertEqual(len(summary_rows), 1 + len(sweep.ALPHA_GRID))
             self.assertEqual(summary_rows[0]['variant'], 'pre_sap')
             self.assertEqual(summary_rows[0]['alpha'], '')
             self.assertTrue({
@@ -170,7 +160,7 @@ class Task1SapAlphaSweepTests(unittest.TestCase):
                 class_rows = list(csv.DictReader(handle))
             self.assertEqual(
                 len(class_rows),
-                10 + len(sweep.ALPHA_GRID) * 2 * 10,
+                10 + len(sweep.ALPHA_GRID) * 10,
             )
             self.assertEqual(class_rows[0]['variant'], 'pre_sap')
             self.assertEqual(class_rows[0]['alpha'], '')

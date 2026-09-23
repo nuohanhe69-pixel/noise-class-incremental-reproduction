@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Offline Task1 Raw/Centered SAP alpha sweep from frozen artifacts."""
+"""Offline Task1 Raw SAP local alpha sweep from frozen artifacts."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -28,7 +27,7 @@ from utils.sap import (  # noqa: E402
 )
 
 
-ALPHA_GRID = (1, 10, 30, 100, 300, 1000, 3000, 10000)
+ALPHA_GRID = (150, 200, 250, 300, 400, 500, 700)
 REFERENCE_ALPHA = 3000
 SUMMARY_COLUMNS = [
     'variant', 'alpha', 'accuracy', 'mean_margin', 'median_margin',
@@ -41,15 +40,15 @@ PER_CLASS_COLUMNS = [
 ]
 
 
-def prepare_raw_and_centered_grams(
+def prepare_raw_gram(
     reference_features: Tensor,
     *,
     saved_raw_gram: Tensor | None = None,
     decomposition_device: str = 'cuda',
     decomposition_dtype: str = 'float32',
     norm_tolerance: float = 1e-5,
-) -> tuple[Tensor, Tensor]:
-    """Prepare the frozen Raw Gram and task-mean-centered Gram on one backend."""
+) -> Tensor:
+    """Prepare the frozen Raw Gram on the requested decomposition backend."""
     if reference_features.ndim != 2 or not reference_features.is_floating_point():
         raise ValueError('X_task1 must be a floating-point matrix')
     if not torch.isfinite(reference_features).all():
@@ -79,13 +78,8 @@ def prepare_raw_and_centered_grams(
         decomposition_device,
         decomposition_dtype,
     )
-    features = reference_features.detach().to(device=device, dtype=dtype)
     raw_gram = artifact_gram.detach().to(device=device, dtype=dtype)
-    centered_features = features - features.mean(dim=0, keepdim=True)
-    centered_gram = centered_features.T @ centered_features
-    if not torch.isfinite(centered_gram).all() or centered_gram.trace() <= 0:
-        raise ValueError('Centered Gram must have finite positive energy')
-    return raw_gram, centered_gram
+    return raw_gram
 
 
 def build_candidate(
@@ -287,21 +281,15 @@ def _save_curve_plot(
         linewidth=1.6,
         label='Pre-SAP',
     )
-    for variant, color, label in (
-        ('raw', '#0072B2', 'Raw SAP'),
-        ('centered', '#D55E00', 'Centered SAP'),
-    ):
-        rows = [row for row in results if row['variant'] == variant]
-        axis.plot(
-            [row['alpha'] for row in rows],
-            [row[metric] for row in rows],
-            marker='o',
-            linewidth=1.8,
-            color=color,
-            label=label,
-        )
-    axis.set_xscale('log')
-    axis.set_xlabel('SAP alpha (log scale)')
+    axis.plot(
+        [row['alpha'] for row in results],
+        [row[metric] for row in results],
+        marker='o',
+        linewidth=1.8,
+        color='#0072B2',
+        label='Raw SAP',
+    )
+    axis.set_xlabel('SAP alpha')
     axis.set_ylabel(ylabel)
     axis.grid(alpha=0.18)
     axis.legend(frameon=False)
@@ -317,7 +305,7 @@ def _save_curve_plot_with_pillow(
     metric: str,
     ylabel: str,
 ) -> None:
-    """Dependency-light log-alpha curve fallback for test environments."""
+    """Dependency-light alpha curve fallback for test environments."""
     from PIL import Image, ImageDraw
 
     width, height = 760, 500
@@ -335,10 +323,10 @@ def _save_curve_plot_with_pillow(
     if value_min == value_max:
         value_min -= 1.0
         value_max += 1.0
-    x_min, x_max = math.log10(ALPHA_GRID[0]), math.log10(ALPHA_GRID[-1])
+    x_min, x_max = ALPHA_GRID[0], ALPHA_GRID[-1]
 
     def map_x(alpha: float) -> float:
-        return left + (math.log10(alpha) - x_min) / (x_max - x_min) * plot_width
+        return left + (alpha - x_min) / (x_max - x_min) * plot_width
 
     def map_y(value: float) -> float:
         return top + plot_height - (
@@ -350,13 +338,14 @@ def _save_curve_plot_with_pillow(
         (left, baseline_y, left + plot_width, baseline_y),
         fill='#5F6368', width=2,
     )
-    for variant, color in (('raw', '#0072B2'), ('centered', '#D55E00')):
-        rows = [row for row in results if row['variant'] == variant]
-        points = [(map_x(row['alpha']), map_y(float(row[metric]))) for row in rows]
-        draw.line(points, fill=color, width=3)
-        for x, y in points:
-            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=color)
-    draw.text((left + 5, height - 38), 'SAP alpha (log scale)', fill='black')
+    points = [
+        (map_x(row['alpha']), map_y(float(row[metric])))
+        for row in results
+    ]
+    draw.line(points, fill='#0072B2', width=3)
+    for x, y in points:
+        draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill='#0072B2')
+    draw.text((left + 5, height - 38), 'SAP alpha', fill='black')
     draw.text((8, top + plot_height // 2), ylabel, fill='black')
     image.save(output_path)
 
@@ -369,7 +358,7 @@ def run_sweep(
     decomposition_dtype: str = 'float32',
     sanity_tolerance: float = 1e-5,
 ) -> Path:
-    """Run the fixed Raw/Centered alpha grid without loading or training a model."""
+    """Run the fixed local Raw alpha grid without loading or training a model."""
     artifact_directory = artifact_directory.expanduser().resolve()
     if output_directory is None:
         output_directory = artifact_directory / 'task1_sap_alpha_sweep'
@@ -420,7 +409,7 @@ def run_sweep(
     if labels.unique(sorted=True).tolist() != list(range(comparison.TASK1_CLASS_COUNT)):
         raise ValueError('Task1 alpha sweep requires exactly classes 0-9')
 
-    raw_gram, centered_gram = prepare_raw_and_centered_grams(
+    raw_gram = prepare_raw_gram(
         reference,
         saved_raw_gram=tensors['raw_gram'],
         decomposition_device=decomposition_device,
@@ -536,36 +525,32 @@ def run_sweep(
         labels=labels,
     )
 
-    candidate_cache = {('raw', REFERENCE_ALPHA): raw_reference}
     result_rows = []
     class_rows = []
     unseen_rows_unchanged = True
     for alpha in ALPHA_GRID:
-        for variant, gram in (('raw', raw_gram), ('centered', centered_gram)):
-            candidate = candidate_cache.get((variant, alpha))
-            if candidate is None:
-                candidate = build_candidate(
-                    weight_before,
-                    gram,
-                    alpha=alpha,
-                )
-            unseen_rows_unchanged = unseen_rows_unchanged and torch.equal(
-                candidate['weight'][comparison.TASK1_CLASS_COUNT:],
-                weight_before[comparison.TASK1_CLASS_COUNT:],
-            )
-            logits = torch.nn.functional.linear(
-                features,
-                candidate['weight'],
-                bias,
-            )[:, :comparison.TASK1_CLASS_COUNT]
-            metrics, per_class = _candidate_metrics(
-                logits,
-                labels,
-                pre_predictions,
-                pre_margins,
-            )
-            result_rows.append({'variant': variant, 'alpha': alpha, **metrics})
-            class_rows.extend(_per_class_rows(variant, alpha, per_class))
+        candidate = build_candidate(
+            weight_before,
+            raw_gram,
+            alpha=alpha,
+        )
+        unseen_rows_unchanged = unseen_rows_unchanged and torch.equal(
+            candidate['weight'][comparison.TASK1_CLASS_COUNT:],
+            weight_before[comparison.TASK1_CLASS_COUNT:],
+        )
+        logits = torch.nn.functional.linear(
+            features,
+            candidate['weight'],
+            bias,
+        )[:, :comparison.TASK1_CLASS_COUNT]
+        metrics, per_class = _candidate_metrics(
+            logits,
+            labels,
+            pre_predictions,
+            pre_margins,
+        )
+        result_rows.append({'variant': 'raw', 'alpha': alpha, **metrics})
+        class_rows.extend(_per_class_rows('raw', alpha, per_class))
     if not unseen_rows_unchanged:
         raise AssertionError('one or more sweep candidates changed unseen rows')
     bias_unchanged = bias is None or torch.equal(bias, bias_before)
@@ -578,7 +563,7 @@ def run_sweep(
     ]
     per_class_csv_rows = _per_class_rows('pre_sap', '', baseline_per_class) + class_rows
     payload = {
-        'experiment_name': 'task1_raw_centered_sap_alpha_sweep',
+        'experiment_name': 'task1_raw_sap_local_alpha_sweep',
         'alpha_grid': list(ALPHA_GRID),
         'baseline': baseline,
         'baseline_per_class': baseline_per_class,
@@ -632,13 +617,6 @@ def run_sweep(
         baseline['accuracy'],
         'accuracy',
         'Task1 accuracy (%)',
-    )
-    _save_curve_plot(
-        output_directory / '02_alpha_vs_mean_margin.png',
-        result_rows,
-        baseline['mean_margin'],
-        'mean_margin',
-        'Task1 mean true-class margin',
     )
     return output_directory
 
