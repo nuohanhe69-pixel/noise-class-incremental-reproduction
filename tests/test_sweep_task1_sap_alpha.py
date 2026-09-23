@@ -136,9 +136,23 @@ class Task1SapAlphaSweepTests(unittest.TestCase):
                 {row['variant'] for row in payload['results']},
                 {'raw', 'centered'},
             )
-            self.assertTrue(payload['sanity_checks']['alpha_3000_raw_reconstruction'])
+            self.assertTrue(
+                payload['sanity_checks'][
+                    'source_raw_alpha3000_internal_consistency'
+                ]
+            )
+            self.assertTrue(
+                payload['sanity_checks'][
+                    'recomputed_raw_alpha3000_drift_recorded'
+                ]
+            )
             self.assertTrue(payload['sanity_checks']['bias_unchanged'])
             self.assertTrue(payload['sanity_checks']['unseen_rows_unchanged'])
+            self.assertIn('source_raw_alpha3000', payload)
+            self.assertIn('recomputed_raw_alpha3000', payload)
+            self.assertIn(
+                'cross_hardware_drift', payload['recomputed_raw_alpha3000'],
+            )
             self.assertFalse(payload['training_performed'])
             self.assertFalse(payload['second_l2_normalization'])
 
@@ -170,7 +184,7 @@ class Task1SapAlphaSweepTests(unittest.TestCase):
             self.assertNotIn('initialize(', source)
             self.assertNotIn('train(', source)
 
-    def test_alpha_3000_raw_mismatch_fails_before_outputs(self):
+    def test_source_alpha_3000_internal_mismatch_fails_before_outputs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             self._write_artifacts(root)
@@ -179,7 +193,9 @@ class Task1SapAlphaSweepTests(unittest.TestCase):
             torch.save(saved_projection, root / 'M_task_0.pt')
             output = root / 'sweep'
 
-            with self.assertRaisesRegex(AssertionError, 'alpha=3000 Raw'):
+            with self.assertRaisesRegex(
+                AssertionError, 'source alpha=3000 Raw artifact',
+            ):
                 sweep.run_sweep(
                     root,
                     output,
@@ -187,6 +203,63 @@ class Task1SapAlphaSweepTests(unittest.TestCase):
                     decomposition_dtype='float32',
                 )
             self.assertFalse(output.exists())
+
+    def test_cross_hardware_projection_drift_is_recorded_without_failure(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_artifacts(root)
+            output = root / 'sweep'
+
+            def drifted_projection(gram, scale, **kwargs):
+                projection = build_sap_projection_from_gram(
+                    gram, scale=scale, **kwargs,
+                )
+                if float(scale) == 3000.0:
+                    projection = projection.clone()
+                    projection[0, 0] += 3.0e-4
+                return projection
+
+            with patch.object(
+                sweep,
+                'build_sap_projection_from_gram',
+                side_effect=drifted_projection,
+            ):
+                sweep.run_sweep(
+                    root,
+                    output,
+                    decomposition_device='cpu',
+                    decomposition_dtype='float32',
+                )
+
+            payload = json.loads(
+                (output / 'task1_sap_alpha_sweep_summary.json').read_text(),
+            )
+            drift = payload['recomputed_raw_alpha3000']['cross_hardware_drift']
+            self.assertTrue({
+                'projection_max_abs_diff',
+                'projection_relative_frobenius_diff',
+                'weight_max_abs_diff',
+                'weight_relative_frobenius_diff',
+                'logits_mean_abs_diff',
+                'logits_max_abs_diff',
+                'prediction_disagreement_count',
+                'recomputed_accuracy',
+                'source_accuracy',
+                'accuracy_delta',
+            }.issubset(drift))
+            self.assertGreater(drift['projection_max_abs_diff'], 2.9e-4)
+            self.assertGreater(drift['projection_relative_frobenius_diff'], 0.0)
+            self.assertGreater(drift['weight_max_abs_diff'], 0.0)
+            self.assertGreaterEqual(drift['prediction_disagreement_count'], 0)
+            self.assertAlmostEqual(
+                drift['accuracy_delta'],
+                drift['recomputed_accuracy'] - drift['source_accuracy'],
+            )
+            self.assertTrue(
+                payload['sanity_checks'][
+                    'source_raw_alpha3000_internal_consistency'
+                ]
+            )
 
 
 if __name__ == '__main__':

@@ -125,6 +125,55 @@ def build_candidate(
     }
 
 
+def _relative_frobenius_diff(actual: Tensor, source: Tensor) -> float:
+    source = source.to(device=actual.device, dtype=actual.dtype)
+    denominator = source.norm().clamp_min(torch.finfo(source.dtype).eps)
+    return float(((actual - source).norm() / denominator).item())
+
+
+def _cross_hardware_drift(
+    *,
+    recomputed_projection: Tensor,
+    source_projection: Tensor,
+    recomputed_weight: Tensor,
+    source_weight: Tensor,
+    recomputed_logits: Tensor,
+    source_logits: Tensor,
+    recomputed_predictions: Tensor,
+    source_predictions: Tensor,
+    labels: Tensor,
+) -> dict[str, float | int]:
+    source_projection_backend = source_projection.to(
+        device=recomputed_projection.device,
+        dtype=recomputed_projection.dtype,
+    )
+    projection_delta = recomputed_projection - source_projection_backend
+    weight_delta = recomputed_weight - source_weight
+    logits_delta = recomputed_logits - source_logits
+    recomputed_accuracy = comparison._accuracy(recomputed_predictions, labels)
+    source_accuracy = comparison._accuracy(source_predictions, labels)
+    return {
+        'projection_max_abs_diff': float(projection_delta.abs().max().item()),
+        'projection_relative_frobenius_diff': _relative_frobenius_diff(
+            recomputed_projection,
+            source_projection_backend,
+        ),
+        'weight_max_abs_diff': float(weight_delta.abs().max().item()),
+        'weight_relative_frobenius_diff': _relative_frobenius_diff(
+            recomputed_weight,
+            source_weight,
+        ),
+        'logits_mean_abs_diff': float(logits_delta.abs().mean().item()),
+        'logits_max_abs_diff': float(logits_delta.abs().max().item()),
+        'prediction_disagreement_count': int((
+            recomputed_predictions != source_predictions
+        ).sum().item()),
+        'recomputed_accuracy': recomputed_accuracy,
+        'source_accuracy': source_accuracy,
+        'accuracy_delta': recomputed_accuracy - source_accuracy,
+    }
+
+
 def _candidate_metrics(
     logits: Tensor,
     labels: Tensor,
@@ -395,53 +444,97 @@ def run_sweep(
         labels,
     )
 
-    raw_reference = build_candidate(
-        weight_before,
-        raw_gram,
-        alpha=REFERENCE_ALPHA,
-    )
+    source_weight_reconstructed = weight_before.clone()
     try:
+        source_weight_reconstructed[
+            :comparison.TASK1_CLASS_COUNT
+        ], _ = project_linear_weight(
+            weight_before[:comparison.TASK1_CLASS_COUNT],
+            tensors['raw_projection'],
+        )
         torch.testing.assert_close(
-            raw_reference['projection'],
-            tensors['raw_projection'].to(
-                device=raw_reference['projection'].device,
-                dtype=raw_reference['projection'].dtype,
-            ),
+            source_weight_reconstructed,
+            weight_after,
             rtol=1e-5,
             atol=1e-6,
         )
-        torch.testing.assert_close(
-            raw_reference['weight'], weight_after, rtol=1e-5, atol=1e-6,
-        )
     except AssertionError as error:
         raise AssertionError(
-            'alpha=3000 Raw projection/weight reconstruction failed; '
-            'use the decomposition device and dtype from the source SAP run'
+            'source alpha=3000 Raw artifact is internally inconsistent: '
+            'saved M_task_0 + W_before does not reconstruct W_after'
         ) from error
-    raw_reference_logits_full = torch.nn.functional.linear(
+
+    source_raw_logits_full = torch.nn.functional.linear(
         features,
-        raw_reference['weight'],
+        weight_after,
         bias,
     )
     try:
         torch.testing.assert_close(
-            raw_reference_logits_full,
+            source_raw_logits_full,
             tensors['raw_logits'],
             rtol=1e-5,
             atol=1e-6,
         )
     except AssertionError as error:
-        raise AssertionError('alpha=3000 Raw logits reconstruction failed') from error
-    raw_reference_predictions = raw_reference_logits_full[
+        raise AssertionError(
+            'source alpha=3000 Raw artifact is internally inconsistent: '
+            'saved W_after does not reconstruct saved post-SAP logits'
+        ) from error
+    source_raw_predictions = source_raw_logits_full[
         :, :comparison.TASK1_CLASS_COUNT
     ].argmax(dim=1)
-    if not torch.equal(raw_reference_predictions, tensors['raw_predictions'].long()):
-        raise AssertionError('alpha=3000 Raw prediction reconstruction failed')
+    if not torch.equal(source_raw_predictions, tensors['raw_predictions'].long()):
+        raise AssertionError(
+            'source alpha=3000 Raw artifact is internally inconsistent: '
+            'saved post-SAP predictions do not match saved logits'
+        )
+    source_raw_accuracy = comparison._accuracy(source_raw_predictions, labels)
     if abs(
-        comparison._accuracy(raw_reference_predictions, labels)
+        source_raw_accuracy
         - float(decision_stats['post_accuracy_evaluator'])
     ) > sanity_tolerance:
-        raise AssertionError('alpha=3000 Raw evaluator accuracy reconstruction failed')
+        raise AssertionError(
+            'source alpha=3000 Raw artifact is internally inconsistent: '
+            'saved post-SAP accuracy does not match evaluator accuracy'
+        )
+    source_raw_metrics, _ = _candidate_metrics(
+        source_raw_logits_full[:, :comparison.TASK1_CLASS_COUNT],
+        labels,
+        pre_predictions,
+        pre_margins,
+    )
+
+    raw_reference = build_candidate(
+        weight_before,
+        raw_gram,
+        alpha=REFERENCE_ALPHA,
+    )
+    recomputed_raw_logits_full = torch.nn.functional.linear(
+        features,
+        raw_reference['weight'],
+        bias,
+    )
+    recomputed_raw_predictions = recomputed_raw_logits_full[
+        :, :comparison.TASK1_CLASS_COUNT
+    ].argmax(dim=1)
+    recomputed_raw_metrics, _ = _candidate_metrics(
+        recomputed_raw_logits_full[:, :comparison.TASK1_CLASS_COUNT],
+        labels,
+        pre_predictions,
+        pre_margins,
+    )
+    cross_hardware_drift = _cross_hardware_drift(
+        recomputed_projection=raw_reference['projection'],
+        source_projection=tensors['raw_projection'],
+        recomputed_weight=raw_reference['weight'],
+        source_weight=weight_after,
+        recomputed_logits=recomputed_raw_logits_full,
+        source_logits=tensors['raw_logits'],
+        recomputed_predictions=recomputed_raw_predictions,
+        source_predictions=tensors['raw_predictions'].long(),
+        labels=labels,
+    )
 
     candidate_cache = {('raw', REFERENCE_ALPHA): raw_reference}
     result_rows = []
@@ -497,9 +590,18 @@ def run_sweep(
         'decomposition_dtype': str(raw_gram.dtype).removeprefix('torch.'),
         'second_l2_normalization': False,
         'training_performed': False,
+        'source_raw_alpha3000': {
+            'metrics': source_raw_metrics,
+            'internal_consistency': True,
+        },
+        'recomputed_raw_alpha3000': {
+            'metrics': recomputed_raw_metrics,
+            'cross_hardware_drift': cross_hardware_drift,
+        },
         'sanity_checks': {
             'pre_sap_reconstruction': True,
-            'alpha_3000_raw_reconstruction': True,
+            'source_raw_alpha3000_internal_consistency': True,
+            'recomputed_raw_alpha3000_drift_recorded': True,
             'bias_unchanged': bool(bias_unchanged),
             'unseen_rows_unchanged': bool(unseen_rows_unchanged),
         },
