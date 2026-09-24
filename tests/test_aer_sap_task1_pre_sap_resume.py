@@ -2,6 +2,7 @@
 
 import copy
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,7 +15,10 @@ from models.dgc_sap import SAP_ORACLE_EXECUTED
 from tests.test_aer_sap_task0_resume import (
     _ResumeDataset, _assert_same_buffer, _configure_model,
 )
-from utils.checkpoints import mammoth_load_checkpoint
+from tests.test_sap_oracle_smoke import _FakeTrainDataset
+from utils.checkpoints import mammoth_load_checkpoint, save_mammoth_checkpoint
+from utils.loggers import Logger
+from utils.training import train
 
 
 def _real_reference_model(directory, dataset, *, loadcheck=None, start_from=None):
@@ -34,7 +38,149 @@ def _successful_tasks(model):
             if event['status'] == SAP_ORACLE_EXECUTED]
 
 
+class _TrainingLoader:
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return 1
+
+    def __iter__(self):
+        return iter((None,))
+
+
+class _TrainingDataset(_ResumeDataset):
+    def __init__(self):
+        super().__init__()
+        self.c_task = -1
+
+    def get_data_loaders(self):
+        super().get_data_loaders()
+        self.train_loader = _TrainingLoader(self.train_loader.dataset)
+        return self.train_loader, self.test_loaders[self.c_task]
+
+    def evaluate(self, model, _dataset):
+        seen_end = (self.c_task + 1) * 10
+        class_accs, task_accs = [], []
+        with torch.no_grad():
+            for task_id in range(self.c_task + 1):
+                inputs, labels = self.test_loaders[task_id].batches[0]
+                logits = model.net(inputs)
+                class_accs.append(float((logits[:, :seen_end].argmax(1) == labels).float().mean() * 100))
+                start, end = self.get_offsets(task_id)
+                task_accs.append(float((logits[:, start:end].argmax(1) + start == labels).float().mean() * 100))
+        return class_accs, task_accs
+
+    def log(self, args, logger, accs, task, setting, **_kwargs):
+        logger.log((sum(accs[0]) / len(accs[0]), sum(accs[1]) / len(accs[1])))
+        logger.log_fullacc(accs)
+        return accs
+
+
+def _training_model(directory, dataset, *, loadcheck=None, start_from=None, ckpt_name='direct'):
+    model = _real_reference_model(directory, dataset, loadcheck=loadcheck,
+                                  start_from=start_from)
+    model.args.ckpt_name = ckpt_name
+    model.args.stop_after = 2
+    model.args.nowand = True
+    model.args.disable_log = False
+    model.args.eval_future = False
+    model.args.enable_other_metrics = False
+    model.args.n_epochs = 1
+    model.args.fitting_mode = 'epochs'
+    model.args.early_stopping_patience = 1
+    model.args.eval_epochs = None
+    model.args.non_verbose = True
+    model.args.code_optimization = 0
+    model.args.device = 'cpu'
+    model.args.validation = None
+    model.args.lr_scheduler = None
+    return model
+
+
 class AerSapTask1PreSapResumeTests(unittest.TestCase):
+    def test_train_restores_task1_history_and_post_sap_checkpoint_before_task2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint_dir = root / 'checkpoints'
+            checkpoint_dir.mkdir()
+            artifacts = str(root / 'artifacts')
+            source_dataset = _TrainingDataset()
+            source_dataset.c_task = -1
+            source_dataset.get_data_loaders()
+            source = _training_model(artifacts, source_dataset)
+            source.meta_begin_task(source_dataset)
+            for sample_id, label in ((0, 0), (1, 1)):
+                source.buffer.add_data(
+                    examples=torch.full((1, 3, 32, 32), (sample_id + 1) / 255),
+                    labels=torch.tensor([label]), true_labels=torch.tensor([label]),
+                    task_labels=torch.tensor([0]), sample_ids=torch.tensor([sample_id]),
+                    sample_selection_scores=torch.tensor([(sample_id + 1) / 10]),
+                )
+            source.meta_end_task(source_dataset)
+            history_logger = Logger(source.args, source_dataset.SETTING,
+                                    source_dataset.NAME, source.NAME)
+            history_logger.log((50.0, 50.0))
+            history_logger.log_fullacc(([50.0], [50.0]))
+            task0_checkpoint = root / 'task0-post-sap'
+            save_mammoth_checkpoint(
+                0, 2, source.args, source,
+                results=[[[50.0]], [[50.0]], history_logger.dump()],
+                checkpoint_name=str(task0_checkpoint),
+            )
+
+            def one_epoch(model, *_args, **_kwargs):
+                self.assertEqual(model.current_task, 1)  # Task1 is trained only in the direct path
+                with torch.no_grad():
+                    model.net.backbone.weight[0, 1] += 0.25
+                model.seen_so_far = torch.arange(20)
+
+            direct_dataset = _TrainingDataset()
+            direct = _training_model(artifacts, direct_dataset,
+                                     loadcheck=str(task0_checkpoint) + '.pt', start_from=1)
+            with patch('models.aer_sap.get_checkpoint_path', return_value=str(checkpoint_dir)), \
+                 patch('utils.checkpoints.get_checkpoint_path', return_value=str(checkpoint_dir)), \
+                 patch('utils.training.MammothDatasetWrapper', _FakeTrainDataset), \
+                 patch('utils.training.train_single_epoch', side_effect=one_epoch) as train_epoch, \
+                 patch.object(Logger, 'write'):
+                train(direct, direct_dataset, args=direct.args)
+            self.assertEqual(train_epoch.call_count, 1)
+            self.assertEqual(_successful_tasks(direct), [0, 1])
+            pre_checkpoint = checkpoint_dir / 'direct_1_pre_sap.pt'
+            direct_post = torch.load(checkpoint_dir / 'direct_1.pt',
+                                     map_location='cpu', weights_only=False)
+            pre = torch.load(pre_checkpoint, map_location='cpu', weights_only=False)
+            self.assertEqual(pre['results'][0], [[50.0]])
+            self.assertEqual(pre['results'][1], [[50.0]])
+            self.assertEqual(pre['results'][2], history_logger.dump())
+            self.assertEqual(len(direct_post['results'][0]), 2)
+            self.assertEqual(len(direct_post['results'][2]['accs']), 2)
+            direct_net = copy.deepcopy(direct.net.state_dict())
+            shutil.rmtree(Path(direct.sap_history[-1]['artifact_output_directory']))
+
+            resumed_dataset = _TrainingDataset()
+            resumed = _training_model(artifacts, resumed_dataset,
+                                      loadcheck=str(pre_checkpoint), start_from=2,
+                                      ckpt_name='resumed')
+            with patch('models.aer_sap.get_checkpoint_path', return_value=str(checkpoint_dir)), \
+                 patch('utils.checkpoints.get_checkpoint_path', return_value=str(checkpoint_dir)), \
+                 patch('utils.training.MammothDatasetWrapper', _FakeTrainDataset), \
+                 patch('utils.training.train_single_epoch',
+                       side_effect=AssertionError('Task1 was retrained')), \
+                 patch.object(Logger, 'write'):
+                train(resumed, resumed_dataset, args=resumed.args)
+            resumed_post = torch.load(checkpoint_dir / 'resumed_1.pt',
+                                      map_location='cpu', weights_only=False)
+            self.assertEqual(direct_post['results'], resumed_post['results'])
+            self.assertEqual(_successful_tasks(resumed), [0, 1])
+            self.assertEqual(resumed.current_task, 2)
+            for key, value in direct_net.items():
+                torch.testing.assert_close(value, resumed.net.state_dict()[key],
+                                           rtol=0, atol=0)
+                torch.testing.assert_close(direct_post['model'][f'net.{key}'],
+                                           resumed_post['model'][f'net.{key}'],
+                                           rtol=0, atol=0)
+
     def test_pre_sap_round_trip_matches_uninterrupted_task1_sap(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -66,6 +212,10 @@ class AerSapTask1PreSapResumeTests(unittest.TestCase):
             direct_reference = live._build_oracle_reference_batches(
                 dataset, return_task_ids=True, return_evidence=True,
             )
+            logger = Logger(live.args, dataset.SETTING, dataset.NAME, live.NAME)
+            logger.log((50.0, 50.0))
+            logger.log_fullacc(([50.0], [50.0]))
+            live._task1_pre_sap_results = [[[50.0]], [[50.0]], logger.dump()]
 
             with patch('models.aer_sap.get_checkpoint_path',
                        return_value=str(checkpoint_dir)):
@@ -76,6 +226,7 @@ class AerSapTask1PreSapResumeTests(unittest.TestCase):
             payload = torch.load(checkpoint, map_location='cpu', weights_only=False)
             self.assertEqual(payload['sap_state']['phase'], 'task1_pre_sap')
             self.assertEqual(payload['sap_state']['next_task'], 2)
+            self.assertEqual(payload['results'], live._task1_pre_sap_results)
             self.assertEqual([event['task_id'] for event in payload['sap_state']['history']
                               if event['status'] == SAP_ORACLE_EXECUTED], [0])
             for key, value in pre_net.items():

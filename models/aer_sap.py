@@ -533,6 +533,9 @@ class AerSap(ErAceAerAbs):
             self._record_sap_event(status=SAP_SKIPPED_AFTER_SECOND_BOUNDARY)
             return
         if self.current_task == 1 and getattr(self.args, 'savecheck', None):
+            history = getattr(self, '_task1_pre_sap_results', None)
+            if history is None or len(history) != 3 or len(history[0]) != 1 or len(history[1]) != 1:
+                raise ValueError('Task1 Pre-SAP checkpoint requires Task0 training history')
             self._pending_task1_sap = True
             try:
                 checkpoint_name = str(
@@ -540,6 +543,7 @@ class AerSap(ErAceAerAbs):
                 )
                 save_mammoth_checkpoint(
                     1, int(dataset.N_TASKS), self.args, self,
+                    results=history,
                     optimizer_st=self.opt.state_dict() if hasattr(self, 'opt') else None,
                     checkpoint_name=checkpoint_name,
                 )
@@ -547,10 +551,10 @@ class AerSap(ErAceAerAbs):
                 self._pending_task1_sap = False
         self._run_task_boundary_sap(dataset)
 
-    def resume_pending_task1_sap(self, dataset) -> None:
+    def resume_pending_task1_sap(self, dataset) -> bool:
         """Finish the saved Task1 boundary before the Task2 training loop."""
         if not getattr(self, '_pending_task1_sap', False):
-            return
+            return False
         if self.current_task != 2 or int(dataset.c_task) != 1:
             raise ValueError('Task1 Pre-SAP resume requires reconstructed Task1 loaders')
         self._current_task = 1
@@ -559,6 +563,7 @@ class AerSap(ErAceAerAbs):
         finally:
             self._current_task = 2
         self._pending_task1_sap = False
+        return True
 
     def serialize_sap_state(self) -> dict:
         """Preserve the completed boundary needed to begin the next task."""

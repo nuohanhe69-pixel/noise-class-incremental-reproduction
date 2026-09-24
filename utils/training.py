@@ -171,12 +171,10 @@ def train(model: ContinualModel, dataset: ContinualDataset,
         if args.loadcheck is not None:
             model, past_res = mammoth_load_checkpoint(args.loadcheck, model, args=args)
 
-            if hasattr(model, 'resume_pending_task1_sap'):
-                model.resume_pending_task1_sap(dataset)
-
-            if not args.disable_log and past_res is not None:
+            if past_res is not None:
                 (results, results_mask_classes, csvdump) = past_res
-                logger.load(csvdump)
+                if not args.disable_log:
+                    logger.load(csvdump)
 
             logging.info('Checkpoint Loaded!')
 
@@ -195,6 +193,25 @@ def train(model: ContinualModel, dataset: ContinualDataset,
                     del eval_dataset.train_loader
         else:
             eval_dataset = dataset
+
+        if getattr(model, '_pending_task1_sap', False):
+            if past_res is None or args.disable_log:
+                raise ValueError('Task1 Pre-SAP resume requires Task0 results and logger state')
+            if model.resume_pending_task1_sap(dataset):
+                accs = eval_dataset.evaluate(model, eval_dataset)
+                logged_accs = eval_dataset.log(args, logger, accs, 1, dataset.SETTING)
+                if dataset.SETTING != 'biased-class-il':
+                    results.append(accs[0])
+                    results_mask_classes.append(accs[1])
+                else:
+                    results.append(logged_accs[0])
+                    results_mask_classes.append(logged_accs[1])
+                if args.savecheck:
+                    save_mammoth_checkpoint(
+                        1, end_task, args, model,
+                        results=[results, results_mask_classes, logger.dump()],
+                        optimizer_st=model.opt.state_dict() if hasattr(model, 'opt') else None,
+                    )
 
         torch.cuda.empty_cache()
         for cur_task in range(start_task, end_task):
@@ -305,7 +322,16 @@ def train(model: ContinualModel, dataset: ContinualDataset,
 
                 train_pbar.close()
 
-            model.meta_end_task(dataset)
+            if cur_task == 1 and hasattr(model, 'resume_pending_task1_sap') and args.savecheck:
+                model._task1_pre_sap_results = [
+                    copy.deepcopy(results), copy.deepcopy(results_mask_classes),
+                    copy.deepcopy(logger.dump()),
+                ]
+            try:
+                model.meta_end_task(dataset)
+            finally:
+                if hasattr(model, '_task1_pre_sap_results'):
+                    del model._task1_pre_sap_results
 
             accs = eval_dataset.evaluate(model, eval_dataset)
 
