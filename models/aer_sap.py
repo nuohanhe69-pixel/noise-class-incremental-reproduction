@@ -20,7 +20,8 @@ from models.dgc_sap import (
     SAP_SKIPPED_INFERENCE,
 )
 from models.er_ace_aer_abs import ErAceAerAbs
-from utils.conf import base_path
+from utils.checkpoints import save_mammoth_checkpoint
+from utils.conf import base_path, get_checkpoint_path
 from utils.sap import (
     collect_classifier_input_features,
     normalize_classifier_input_features,
@@ -63,6 +64,7 @@ class AerSap(ErAceAerAbs):
         if args.sap_oracle_scale != 300.0:
             raise ValueError('double-boundary SAP requires sap_oracle_scale=300')
         self.sap_history = []
+        self._pending_task1_sap = False
 
     def _should_store_buffer_metadata(self) -> bool:
         # Oracle cleanliness at the task boundary requires the true label of
@@ -521,7 +523,8 @@ class AerSap(ErAceAerAbs):
 
     def end_task(self, dataset):
         start_from = getattr(self.args, 'start_from', None)
-        if (self.current_task == 0 and start_from == 1
+        if (self.current_task in (0, 1) and start_from is not None
+                and self.current_task < start_from
                 and getattr(self.args, 'loadcheck', None) is not None):
             self._record_sap_event(status=SAP_SKIPPED_CHECKPOINT_RECONSTRUCTION)
             return
@@ -529,24 +532,61 @@ class AerSap(ErAceAerAbs):
         if self.current_task not in (0, 1):
             self._record_sap_event(status=SAP_SKIPPED_AFTER_SECOND_BOUNDARY)
             return
+        if self.current_task == 1 and getattr(self.args, 'savecheck', None):
+            self._pending_task1_sap = True
+            try:
+                checkpoint_name = str(
+                    Path(get_checkpoint_path()) / f'{self.args.ckpt_name}_1_pre_sap'
+                )
+                save_mammoth_checkpoint(
+                    1, int(dataset.N_TASKS), self.args, self,
+                    optimizer_st=self.opt.state_dict() if hasattr(self, 'opt') else None,
+                    checkpoint_name=checkpoint_name,
+                )
+            finally:
+                self._pending_task1_sap = False
         self._run_task_boundary_sap(dataset)
+
+    def resume_pending_task1_sap(self, dataset) -> None:
+        """Finish the saved Task1 boundary before the Task2 training loop."""
+        if not getattr(self, '_pending_task1_sap', False):
+            return
+        if self.current_task != 2 or int(dataset.c_task) != 1:
+            raise ValueError('Task1 Pre-SAP resume requires reconstructed Task1 loaders')
+        self._current_task = 1
+        try:
+            self._run_taskwise_sap(dataset)
+        finally:
+            self._current_task = 2
+        self._pending_task1_sap = False
 
     def serialize_sap_state(self) -> dict:
         """Preserve the completed boundary needed to begin the next task."""
+        pending_task1_sap = getattr(self, '_pending_task1_sap', False)
+        phase = 'task1_pre_sap' if pending_task1_sap else 'task_boundary'
         if int(self.current_task) == 1:
             if not any(event.get('task_id') == 0 and event.get('status') == SAP_ORACLE_EXECUTED
                        for event in self.sap_history):
                 raise ValueError('cannot checkpoint an incomplete Task0 SAP boundary')
+            if pending_task1_sap and any(
+                event.get('task_id') == 1 and event.get('status') == SAP_ORACLE_EXECUTED
+                for event in self.sap_history
+            ):
+                raise ValueError('Task1 Pre-SAP checkpoint already contains Task1 SAP')
             if not hasattr(self, 'past_model_ckpt') or self.past_model_ckpt is None:
                 raise ValueError('completed SAP boundary is missing the AER checkpoint')
-            net_state = self.net.state_dict()
-            if (net_state.keys() != self.past_model_ckpt.keys()
-                    or any(not torch.equal(value, self.past_model_ckpt[key])
-                           for key, value in net_state.items())):
-                raise ValueError('AER checkpoint differs from the post-SAP network')
+            if phase == 'task_boundary':
+                net_state = self.net.state_dict()
+                if (net_state.keys() != self.past_model_ckpt.keys()
+                        or any(not torch.equal(value, self.past_model_ckpt[key])
+                               for key, value in net_state.items())):
+                    raise ValueError('AER checkpoint differs from the post-SAP network')
         return {
             'version': 1,
-            'next_task': int(self.current_task),
+            'phase': phase,
+            'next_task': 2 if pending_task1_sap else int(self.current_task),
+            'n_seen_classes': int(self.n_seen_classes),
+            'n_past_classes': int(self.n_past_classes),
             'past_model_ckpt': (
                 {key: value.detach().cpu().clone()
                  for key, value in self.past_model_ckpt.items()}
@@ -560,6 +600,9 @@ class AerSap(ErAceAerAbs):
         """Load only at the next task, after checkpoint task reconstruction."""
         if state.get('version') != 1:
             raise ValueError('unsupported aer-sap checkpoint state')
+        phase = state.get('phase', 'task_boundary')
+        if phase not in ('task_boundary', 'task1_pre_sap'):
+            raise ValueError('unsupported aer-sap checkpoint phase')
         next_task = int(state['next_task'])
         if int(self.current_task) != next_task:
             raise ValueError(
@@ -567,6 +610,19 @@ class AerSap(ErAceAerAbs):
                 f'reconstructed next task is {self.current_task}'
             )
         saved_past = state.get('past_model_ckpt')
+        if phase == 'task1_pre_sap':
+            if next_task != 2 or saved_past is None:
+                raise ValueError('invalid Task1 Pre-SAP checkpoint state')
+            if saved_past.keys() != self.net.state_dict().keys():
+                raise ValueError('Task1 Pre-SAP AER checkpoint keys differ from network')
+            expected_past, expected_seen = map(int, self.get_offsets(1))
+            if (int(state['n_past_classes']) != expected_past
+                    or int(state['n_seen_classes']) != expected_seen):
+                raise ValueError('Task1 Pre-SAP seen-class counters differ from task')
+            successful_tasks = [event.get('task_id') for event in state['history']
+                                if event.get('status') == SAP_ORACLE_EXECUTED]
+            if successful_tasks.count(0) != 1 or 1 in successful_tasks:
+                raise ValueError('Task1 Pre-SAP checkpoint has invalid SAP history')
         if next_task == 1:
             net_state = self.net.state_dict()
             if (saved_past is None or saved_past.keys() != net_state.keys()
@@ -580,3 +636,7 @@ class AerSap(ErAceAerAbs):
         )
         self.seen_so_far = state['seen_so_far'].to(self.device).clone()
         self.sap_history = copy.deepcopy(state['history'])
+        if phase == 'task1_pre_sap':
+            self._n_seen_classes = int(state['n_seen_classes'])
+            self._n_past_classes = int(state['n_past_classes'])
+        self._pending_task1_sap = phase == 'task1_pre_sap'

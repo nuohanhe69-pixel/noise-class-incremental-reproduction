@@ -171,6 +171,9 @@ def train(model: ContinualModel, dataset: ContinualDataset,
         if args.loadcheck is not None:
             model, past_res = mammoth_load_checkpoint(args.loadcheck, model, args=args)
 
+            if hasattr(model, 'resume_pending_task1_sap'):
+                model.resume_pending_task1_sap(dataset)
+
             if not args.disable_log and past_res is not None:
                 (results, results_mask_classes, csvdump) = past_res
                 logger.load(csvdump)
