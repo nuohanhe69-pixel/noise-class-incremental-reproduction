@@ -212,7 +212,8 @@ class DgcSap(DGC):
         if epoch_number in self.args.sap_score_epochs:
             self._record_current_task_trajectory(dataset, epoch_number)
 
-    def _build_oracle_reference_batches(self, dataset, *, return_task_ids=False):
+    def _build_oracle_reference_batches(self, dataset, *, return_task_ids=False,
+                                        return_evidence=False):
         """Build the balanced oracle reference set used by Linear SAP.
 
         Task 1 keeps every oracle-clean current-task sample and ignores the
@@ -233,6 +234,8 @@ class DgcSap(DGC):
         clean_mask = observed_cpu == task_true_labels_all
         clean_task_images = images[clean_mask]
         clean_task_labels = task_true_labels_all[clean_mask]
+        clean_task_sample_ids = sample_ids_cpu[clean_mask]
+        clean_task_observed = observed_cpu[clean_mask]
         current_classes = clean_task_labels.unique(sorted=True)
         current_task_clean_total = int(clean_task_images.shape[0])
         sampling_seed = int(getattr(self.args, 'seed', 0) or 0) + int(self.current_task)
@@ -243,6 +246,9 @@ class DgcSap(DGC):
         buffer_total = 0
         buffer_clean_count = 0
         historical_buffer_clean_count = 0
+        historical_buffer_candidate_count = 0
+        buffer_sample_ids = None
+        buffer_observed = None
 
         if not self.buffer.is_empty():
             buf = self.buffer.get_all_data(device='cpu')
@@ -265,7 +271,13 @@ class DgcSap(DGC):
                         raise ValueError('oracle mode requires buffer.task_labels to be set')
                     buf_source_task_ids = self.buffer.task_labels[:len(buf_labels)].detach().cpu().long()
                     historical = buf_source_task_ids < int(self.current_task)
+                    historical_buffer_candidate_count = int(historical.sum().item())
                     keep = clean & historical
+                    if return_evidence:
+                        if not hasattr(self.buffer, 'sample_ids') or self.buffer.sample_ids is None:
+                            raise ValueError('reference evidence requires buffer.sample_ids')
+                        buffer_sample_ids = self.buffer.sample_ids[:len(buf_labels)].detach().cpu().long()[keep]
+                        buffer_observed = buf_labels_cpu[keep]
                     buffer_images = buf_images[keep]
                     buffer_true = buf_true[keep]
                     buffer_task_ids = buf_source_task_ids[keep]
@@ -274,6 +286,7 @@ class DgcSap(DGC):
         if self.current_task == 0:
             selected_task_images = clean_task_images
             selected_task_labels = clean_task_labels
+            selected_indices = torch.arange(current_task_clean_total)
         else:
             new_target = historical_buffer_clean_count
             class_count = int(current_classes.numel())
@@ -334,15 +347,23 @@ class DgcSap(DGC):
         selected_task_ids = torch.full(
             (reference_new_count,), int(self.current_task), dtype=torch.long,
         )
+        selected_sample_ids = clean_task_sample_ids[selected_indices]
+        selected_observed = clean_task_observed[selected_indices]
 
         if reference_old_count > 0:
             all_images = torch.cat([selected_task_images, buffer_images], dim=0)
             all_true_labels = torch.cat([selected_task_labels, buffer_true], dim=0)
             all_task_ids = torch.cat([selected_task_ids, buffer_task_ids], dim=0)
+            if return_evidence:
+                all_sample_ids = torch.cat([selected_sample_ids, buffer_sample_ids], dim=0)
+                all_observed = torch.cat([selected_observed, buffer_observed], dim=0)
         else:
             all_images = selected_task_images
             all_true_labels = selected_task_labels
             all_task_ids = selected_task_ids
+            if return_evidence:
+                all_sample_ids = selected_sample_ids
+                all_observed = selected_observed
 
         stats = {
             'current_task_clean_total': current_task_clean_total,
@@ -357,6 +378,34 @@ class DgcSap(DGC):
             'reference_sampling_seed': sampling_seed,
             'buffer_total_count': buffer_total,
         }
+        if return_evidence:
+            evidence = {
+                'sample_ids': all_sample_ids,
+                'true_labels': all_true_labels.clone(),
+                'observed_labels': all_observed,
+                'source_task_ids': all_task_ids.clone(),
+                'is_old': torch.arange(len(all_true_labels)) >= reference_new_count,
+                'reference_order': torch.arange(len(all_true_labels), dtype=torch.long),
+                'counts': {
+                    'current_candidate': int(len(images)),
+                    'current_eligible': current_task_clean_total,
+                    'current_selected': reference_new_count,
+                    'old_candidate': historical_buffer_candidate_count,
+                    'old_eligible': historical_buffer_clean_count,
+                    'old_selected': reference_old_count,
+                    'new_candidate': int(len(images)),
+                    'new_eligible': current_task_clean_total,
+                    'new_selected': reference_new_count,
+                    'selected_per_class': {
+                        int(label): int((all_true_labels == label).sum().item())
+                        for label in all_true_labels.unique(sorted=True).tolist()
+                    },
+                    'sampling_seed': sampling_seed,
+                },
+            }
+            if return_task_ids:
+                return all_images, all_true_labels, all_task_ids, stats, evidence
+            return all_images, all_true_labels, stats, evidence
         if return_task_ids:
             return all_images, all_true_labels, all_task_ids, stats
         return all_images, all_true_labels, stats
@@ -597,7 +646,7 @@ class DgcSap(DGC):
                 module.training = was_training
         return task_accuracies
 
-    def _build_oracle_projection(self, gram: torch.Tensor):
+    def _build_oracle_projection(self, gram: torch.Tensor, *, return_eigenvectors=False):
         """Build the SAP input-side projection Mr from the classifier-input Gram.
 
         Equivalent to the official SAP path with no basis truncation and the
@@ -615,14 +664,18 @@ class DgcSap(DGC):
             raise ValueError('oracle Gram has zero trace; cannot build projection')
 
         eigenvalues, eigenvectors = torch.linalg.eigh(symmetric_gram)
+        raw_eigenvalues = eigenvalues
         energy = eigenvalues.clamp_min(0)
         if device.type == 'mps':
             energy = energy.to(device)
+            raw_eigenvalues = raw_eigenvalues.to(device)
             eigenvectors = eigenvectors.to(device)
         importance = self._sap_importance_from_energy(energy)
         projection = (eigenvectors * importance.unsqueeze(0)) @ eigenvectors.transpose(0, 1)
         projection = (projection + projection.transpose(0, 1)) * 0.5
         normalized_energy = energy / energy.sum()
+        if return_eigenvectors:
+            return projection, energy, normalized_energy, importance, eigenvectors, raw_eigenvalues
         return projection, energy, normalized_energy, importance
 
     def _sap_importance_from_energy(self, energy: torch.Tensor) -> torch.Tensor:

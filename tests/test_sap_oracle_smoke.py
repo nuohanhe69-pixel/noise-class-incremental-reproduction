@@ -63,6 +63,46 @@ def _reference_model(train_dataset, buffer, current_task, seed=0):
 
 
 class OracleEndToEndSmokeTests(unittest.TestCase):
+    def test_task1_reference_evidence_matches_actual_selection_without_resampling(self):
+        true_labels = torch.tensor([10] * 6 + [11] * 6)
+        observed = true_labels.clone()
+        observed[0] = 11
+        train = _FakeTrainDataset(12, 2, true_labels, observed)
+        buffer = _FakeBuffer(
+            torch.arange(6 * 3 * 32 * 32, dtype=torch.int32).remainder(256)
+            .to(torch.uint8).reshape(6, 3, 32, 32),
+            torch.tensor([0, 1, 2, 0, 1, 2]),
+            torch.tensor([0, 1, 3, 0, 1, 2]),
+            torch.tensor([0, 0, 0, 1, 1, 0]),
+        )
+        buffer.sample_ids = torch.tensor([40, 41, 42, 43, 44, 45])
+        model, dataset = _reference_model(train, buffer, current_task=1, seed=0)
+        with patch('models.dgc_sap.torch.randperm', wraps=torch.randperm) as randperm:
+            images, labels, tasks, stats, evidence = model._build_oracle_reference_batches(
+                dataset, return_task_ids=True, return_evidence=True,
+            )
+        self.assertEqual(randperm.call_count, 2)
+        self.assertEqual(stats['reference_new_count'], 3)
+        self.assertEqual(stats['reference_old_count'], 3)
+        self.assertEqual(evidence['counts']['old_candidate'], 4)
+        self.assertEqual(evidence['counts']['old_eligible'], 3)
+        self.assertEqual(evidence['counts']['new_eligible'], 11)
+        self.assertEqual(evidence['sample_ids'][3:].tolist(), [40, 41, 45])
+        self.assertEqual(evidence['observed_labels'][3:].tolist(), [0, 1, 2])
+        self.assertTrue(torch.equal(evidence['true_labels'], labels))
+        self.assertTrue(torch.equal(evidence['source_task_ids'], tasks))
+        self.assertEqual(evidence['reference_order'].tolist(), list(range(6)))
+        for position in range(3):
+            sample_id = evidence['sample_ids'][position]
+            expected_image = torch.as_tensor(train.data[sample_id]).permute(2, 0, 1)
+            self.assertTrue(torch.equal(images[position], expected_image))
+        for position, buffer_index in enumerate((0, 1, 5), start=3):
+            self.assertTrue(torch.equal(images[position], buffer.images[buffer_index]))
+        second = model._build_oracle_reference_batches(
+            dataset, return_task_ids=True, return_evidence=True,
+        )
+        self.assertTrue(torch.equal(second[4]['sample_ids'], evidence['sample_ids']))
+
     def test_oracle_boundary_projects_classifier_and_records_event(self):
         torch.manual_seed(0)
         # Build a small 2-class task with 32 samples, 25 clean references.

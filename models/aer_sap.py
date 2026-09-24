@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import shutil
+import tempfile
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -27,7 +29,7 @@ from utils.sap import (
 )
 
 
-SAP_SKIPPED_FIRST_SESSION_ONLY = 'SAP_SKIPPED_FIRST_SESSION_ONLY'
+SAP_SKIPPED_AFTER_SECOND_BOUNDARY = 'SAP_SKIPPED_AFTER_SECOND_BOUNDARY'
 TASKWISE_SAP_STARTED = 'TASKWISE_SAP_STARTED'
 TASK_REFERENCE_EMPTY = 'TASK_REFERENCE_EMPTY'
 
@@ -45,11 +47,10 @@ class AerSap(ErAceAerAbs):
         group.add_argument('--sap_batch_size', type=int, default=32)
         group.add_argument(
             '--sap_oracle_reference', type=int, default=1, choices=[1],
-            help='Task 1 uses all current-task oracle-clean samples; later tasks '
-                 'skip the SAP pipeline.',
+            help='Oracle-clean references at the first two task boundaries.',
         )
         group.add_argument(
-            '--sap_oracle_scale', type=float, default=100.0,
+            '--sap_oracle_scale', type=float, default=300.0,
             help='SAP scale coefficient for the final Linear projection.',
         )
         return parser
@@ -58,8 +59,8 @@ class AerSap(ErAceAerAbs):
         super().__init__(backbone, loss, args, transform, dataset=dataset)
         if args.sap_batch_size <= 0:
             raise ValueError('sap_batch_size must be positive')
-        if args.sap_oracle_scale <= 0:
-            raise ValueError('sap_oracle_scale must be positive')
+        if args.sap_oracle_scale != 300.0:
+            raise ValueError('double-boundary SAP requires sap_oracle_scale=300')
         self.sap_history = []
 
     def _should_store_buffer_metadata(self) -> bool:
@@ -121,120 +122,97 @@ class AerSap(ErAceAerAbs):
         }
 
     @torch.no_grad()
-    def _capture_task1_test_decisions(self, dataset) -> dict:
-        """Capture raw classifier inputs and Task1 Class-IL decisions."""
-        if int(self.current_task) != 0:
-            raise ValueError('Task1 test diagnostics are only valid at task 0')
-        if not dataset.test_loaders:
-            raise ValueError('Task1 test loader is unavailable')
-        start_c, seen_end = dataset.get_offsets()
-        start_c, seen_end = int(start_c), int(seen_end)
-        if start_c != 0 or seen_end <= 0:
-            raise ValueError('Task1 Class-IL evaluation requires classes [0, seen_end)')
-
+    def _capture_seen_test_decisions(self, dataset) -> dict:
+        """Capture all seen test tasks in loader order with stable identities."""
+        seen_tasks = list(range(int(self.current_task) + 1))
+        if len(dataset.test_loaders) < len(seen_tasks):
+            raise ValueError('seen test loaders are unavailable')
+        seen_end = int(dataset.get_offsets(self.current_task)[1])
         classifier = resolve_classifier_module(self.net)
         captured_features = []
 
         def capture_classifier_input(_module, args):
-            if not args:
-                raise RuntimeError('classifier received no positional input')
             features = args[0].detach()
             if features.ndim != 2 or features.shape[1] != classifier.in_features:
-                raise ValueError('unexpected Task1 test classifier-input shape')
+                raise ValueError('unexpected test classifier-input shape')
             captured_features.append(features)
 
-        training_states = {
-            module: module.training for module in self.net.modules()
-        }
+        training_states = {module: module.training for module in self.net.modules()}
         handle = classifier.register_forward_pre_hook(capture_classifier_input)
-        logits_batches = []
-        label_batches = []
+        features, logits, labels, sample_ids, task_ids = [], [], [], [], []
         try:
             self.net.eval()
-            for batch_index, data in enumerate(dataset.test_loaders[0]):
-                if (
-                    getattr(self.args, 'debug_mode', False)
-                    and batch_index > self.get_debug_iters()
-                ):
-                    break
-                inputs, labels = data[0], data[1]
-                inputs = inputs.to(self.device)
-                labels = labels.to(self.device).long()
-                logits = self(inputs)
-                if logits.ndim != 2 or logits.shape[1] < seen_end:
-                    raise ValueError('Task1 test logits do not cover all seen classes')
-                logits_batches.append(logits.detach())
-                label_batches.append(labels.detach())
+            for task_id in seen_tasks:
+                loader = dataset.test_loaders[task_id]
+                original_ids = torch.as_tensor(loader.dataset.indexes, dtype=torch.long)
+                cursor = 0
+                for batch_index, data in enumerate(loader):
+                    if getattr(self.args, 'debug_mode', False) and batch_index > self.get_debug_iters():
+                        break
+                    before_count = len(captured_features)
+                    batch_logits = self(data[0].to(self.device)).detach().cpu()
+                    if len(captured_features) != before_count + 1:
+                        raise ValueError('test classifier hook did not fire exactly once')
+                    batch_labels = data[1].detach().cpu().long()
+                    count = len(batch_labels)
+                    if batch_logits.shape[1] < seen_end or len(captured_features[-1]) != count:
+                        raise ValueError('test feature/logit batch is not aligned')
+                    features.append(captured_features.pop().cpu())
+                    logits.append(batch_logits)
+                    labels.append(batch_labels)
+                    sample_ids.append(original_ids[cursor:cursor + count])
+                    task_ids.append(torch.full((count,), task_id, dtype=torch.long))
+                    cursor += count
+                if cursor == 0 or (not getattr(self.args, 'debug_mode', False) and cursor != len(original_ids)):
+                    raise ValueError('test IDs and loader samples are not aligned')
         finally:
             handle.remove()
             for module, was_training in training_states.items():
                 module.training = was_training
 
-        if not captured_features or not logits_batches:
-            raise ValueError('Task1 test diagnostic capture produced no samples')
-        raw_features = torch.cat(captured_features, dim=0)
-        logits = torch.cat(logits_batches, dim=0)
-        labels = torch.cat(label_batches, dim=0)
-        sample_count = int(labels.shape[0])
-        if not (
-            raw_features.shape[0] == sample_count
-            and logits.shape[0] == sample_count
-        ):
-            raise ValueError('Task1 test features, labels, and logits are not aligned')
-        predictions = logits[:, :seen_end].argmax(dim=1)
-        correct = int((predictions == labels).sum().item())
-        accuracy = correct / sample_count * 100.0
+        raw_features = torch.cat(features)
+        full_logits = torch.cat(logits)
+        true_labels = torch.cat(labels)
+        source_tasks = torch.cat(task_ids)
+        class_predictions = full_logits[:, :seen_end].argmax(dim=1)
+        task_predictions = torch.empty_like(class_predictions)
+        per_task_class_il, per_task_task_il = [], []
+        for task_id in seen_tasks:
+            start_c, end_c = map(int, dataset.get_offsets(task_id))
+            mask = source_tasks == task_id
+            task_predictions[mask] = full_logits[mask, start_c:end_c].argmax(dim=1) + start_c
+            per_task_class_il.append(float((class_predictions[mask] == true_labels[mask]).float().mean() * 100))
+            per_task_task_il.append(float((task_predictions[mask] == true_labels[mask]).float().mean() * 100))
         return {
-            'raw_features': raw_features.detach().cpu(),
-            'labels': labels.detach().cpu(),
-            'logits': logits.detach().cpu(),
-            'predictions': predictions.detach().cpu(),
+            'sample_ids': torch.cat(sample_ids), 'task_ids': source_tasks,
+            'raw_features': raw_features, 'labels': true_labels,
+            'logits': full_logits, 'predictions': class_predictions,
+            'task_predictions': task_predictions,
             'seen_classes': list(range(seen_end)),
-            'accuracy': accuracy,
+            'per_task_class_il': per_task_class_il,
+            'per_task_task_il': per_task_task_il,
         }
 
     @staticmethod
-    def _build_task1_test_decision_stats(
-        pre_sap: dict,
-        post_sap: dict,
-        accuracy: dict,
-        *,
-        classifier_has_bias: bool,
-        tolerance: float = 1e-6,
-    ) -> dict:
-        """Verify saved decisions reproduce Task1 evaluator accuracy."""
-        for key in ('raw_features', 'labels', 'logits', 'predictions'):
-            if len(pre_sap[key]) != len(post_sap[key]):
-                raise ValueError(f'pre/post Task1 test {key} are not aligned')
-        if not torch.equal(pre_sap['labels'], post_sap['labels']):
-            raise ValueError('pre/post Task1 test labels differ')
-        if not torch.equal(pre_sap['raw_features'], post_sap['raw_features']):
-            raise ValueError('pre/post raw Task1 test features differ')
+    def _build_test_decision_stats(pre_sap: dict, post_sap: dict,
+                                   accuracy: dict, *, classifier_has_bias: bool,
+                                   tolerance: float = 1e-5) -> dict:
+        for key in ('sample_ids', 'task_ids', 'labels', 'raw_features'):
+            if not torch.equal(pre_sap[key], post_sap[key]):
+                raise ValueError(f'pre/post test {key} are not aligned')
         if pre_sap['seen_classes'] != post_sap['seen_classes']:
-            raise ValueError('pre/post seen-class decision semantics differ')
-
-        pre_evaluator = float(accuracy['pre_sap']['per_task_class_il'][0])
-        post_evaluator = float(accuracy['post_sap']['per_task_class_il'][0])
-        pre_error = abs(float(pre_sap['accuracy']) - pre_evaluator)
-        post_error = abs(float(post_sap['accuracy']) - post_evaluator)
-        if pre_error > tolerance or post_error > tolerance:
-            raise ValueError(
-                'saved Task1 decisions do not reproduce candidate evaluation: '
-                f'pre_error={pre_error:.6e}, post_error={post_error:.6e}'
-            )
+            raise ValueError('pre/post seen classes differ')
+        for candidate, decisions in (('pre_sap', pre_sap), ('post_sap', post_sap)):
+            for metric in ('per_task_class_il', 'per_task_task_il'):
+                expected = accuracy[candidate][metric]
+                actual = decisions[metric]
+                if len(actual) != len(expected) or any(abs(a - b) > tolerance for a, b in zip(actual, expected)):
+                    raise ValueError(f'{candidate} saved decisions do not reproduce {metric}')
         return {
-            'sample_count': int(len(pre_sap['labels'])),
+            'sample_count': len(pre_sap['labels']),
             'seen_classes': pre_sap['seen_classes'],
             'classifier_has_bias': bool(classifier_has_bias),
-            'pre_accuracy_recomputed': float(pre_sap['accuracy']),
-            'post_accuracy_recomputed': float(post_sap['accuracy']),
-            'pre_accuracy_evaluator': pre_evaluator,
-            'post_accuracy_evaluator': post_evaluator,
-            'pre_accuracy_absolute_error': pre_error,
-            'post_accuracy_absolute_error': post_error,
-            'prediction_changed_count': int((
-                pre_sap['predictions'] != post_sap['predictions']
-            ).sum().item()),
+            'prediction_changed_count': int((pre_sap['predictions'] != post_sap['predictions']).sum()),
         }
 
     @staticmethod
@@ -300,391 +278,249 @@ class AerSap(ErAceAerAbs):
         run_id = getattr(self.args, 'conf_jobnum', None)
         if not run_id:
             run_id = f"seed{int(getattr(self.args, 'seed', 0) or 0)}"
-        return (
-            results_root
-            / dataset.SETTING
-            / dataset.NAME
-            / self.NAME
-            / 'first_session_only_taskwise_sap_v1'
-            / str(run_id)
-        )
+        return (results_root / dataset.SETTING / dataset.NAME / self.NAME
+                / 'double_boundary_taskwise_sap_v1' / str(run_id)
+                / f'boundary_task_{int(self.current_task)}')
 
-    def _save_taskwise_artifacts(
-        self,
-        dataset,
-        *,
-        weight_before,
-        x_task1,
-        trusted_labels,
-        trusted_task_ids,
-        reference_stats,
-        coverage,
-        task_grams,
-        task_projections,
-        weight_after,
-        accuracy,
-        manifest,
-        test_decisions,
-        classifier_bias_before,
-        decision_stats,
-    ) -> Path:
-        output_directory = self._taskwise_artifact_directory(dataset)
-        output_directory.mkdir(parents=True, exist_ok=True)
-        tensors = {
-            'W_before.pt': weight_before,
-            'X_task1.pt': x_task1,
-            'trusted_labels.pt': trusted_labels,
-            'trusted_task_ids.pt': trusted_task_ids,
-            'W_after.pt': weight_after,
-            'task1_test_features_raw.pt': test_decisions['pre_sap']['raw_features'],
-            'task1_test_labels.pt': test_decisions['pre_sap']['labels'],
-            'task1_test_logits_pre_sap.pt': test_decisions['pre_sap']['logits'],
-            'task1_test_logits_post_sap.pt': test_decisions['post_sap']['logits'],
-            'task1_test_predictions_pre_sap.pt': (
-                test_decisions['pre_sap']['predictions']
-            ),
-            'task1_test_predictions_post_sap.pt': (
-                test_decisions['post_sap']['predictions']
-            ),
-        }
-        if classifier_bias_before is not None:
-            tensors['classifier_bias_before.pt'] = classifier_bias_before
-        for filename, tensor in tensors.items():
-            torch.save(tensor.detach().cpu(), output_directory / filename)
-        for task_id, gram in sorted(task_grams.items()):
-            torch.save(
-                gram.detach().cpu(), output_directory / f'G_task_{task_id}.pt',
+    @staticmethod
+    def _save_taskwise_artifacts(directory: Path, tensors: dict,
+                                 reference_counts: dict, coverage: dict,
+                                 accuracy: dict, decision_stats: dict) -> dict:
+        files = {}
+        for filename, value in tensors.items():
+            if isinstance(value, torch.Tensor):
+                stored = value.detach().cpu()
+            elif isinstance(value, dict):
+                stored = {key: tensor.detach().cpu() for key, tensor in value.items()}
+            else:
+                stored = value
+            torch.save(stored, directory / filename)
+            if isinstance(value, torch.Tensor):
+                files[filename] = {'shape': list(value.shape), 'dtype': str(value.dtype)}
+            elif isinstance(value, dict):
+                files[filename] = {
+                    'type': 'network_state_dict',
+                    'tensors': {
+                        key: {'shape': list(tensor.shape), 'dtype': str(tensor.dtype)}
+                        for key, tensor in value.items()
+                    },
+                }
+            else:
+                files[filename] = {'type': type(value).__name__}
+        for filename, value in (
+            ('reference_counts.json', reference_counts),
+            ('coverage.json', coverage), ('accuracy.json', accuracy),
+            ('test_decision_stats.json', decision_stats),
+        ):
+            (directory / filename).write_text(
+                json.dumps(value, indent=2, sort_keys=True), encoding='utf-8',
             )
-        for task_id, projection in sorted(task_projections.items()):
-            torch.save(
-                projection.detach().cpu(), output_directory / f'M_task_{task_id}.pt',
-            )
-        (output_directory / 'coverage.json').write_text(
-            json.dumps(coverage, indent=2, sort_keys=True), encoding='utf-8',
-        )
-        (output_directory / 'reference_stats.json').write_text(
-            json.dumps(reference_stats, indent=2, sort_keys=True), encoding='utf-8',
-        )
-        (output_directory / 'accuracy.json').write_text(
-            json.dumps(accuracy, indent=2, sort_keys=True), encoding='utf-8',
-        )
-        (output_directory / 'manifest.json').write_text(
-            json.dumps(manifest, indent=2, sort_keys=True), encoding='utf-8',
-        )
-        (output_directory / 'task1_test_decision_stats.json').write_text(
-            json.dumps(decision_stats, indent=2, sort_keys=True), encoding='utf-8',
-        )
-        return output_directory
+            files[filename] = {'type': 'json'}
+        return files
 
-    def _run_first_session_taskwise_sap(self, dataset) -> None:
-        """Apply Task-wise SAP once after Task 1's complete AER boundary."""
-        self._record_sap_event(status=TASKWISE_SAP_STARTED)
-        classifier = None
-        weight_before = None
-        bias_before = None
+    def _run_taskwise_sap(self, dataset) -> None:
+        if int(self.current_task) not in (0, 1):
+            raise ValueError('task-wise SAP is expected only at boundaries 0 and 1')
+        if float(self.args.sap_oracle_scale) != 300.0:
+            raise ValueError('double-boundary SAP requires sap_oracle_scale=300')
+        self._record_sap_event(status=TASKWISE_SAP_STARTED, sap_alpha=300.0)
+        history_start = len(self.sap_history)
+        network_before = copy.deepcopy(self.net.state_dict())
+        had_past = hasattr(self, 'past_model_ckpt')
+        past_before = copy.deepcopy(self.past_model_ckpt) if had_past else None
+        final_directory = self._taskwise_artifact_directory(dataset)
+        stage_directory = None
         stage = 'reference_construction'
         try:
-            (
-                all_images,
-                trusted_labels,
-                trusted_task_ids,
-                reference_stats,
-            ) = self._build_oracle_reference_batches(
-                dataset, return_task_ids=True,
+            (images, trusted_labels, trusted_task_ids, reference_stats,
+             evidence) = self._build_oracle_reference_batches(
+                dataset, return_task_ids=True, return_evidence=True,
             )
-            total_images = int(all_images.shape[0])
-            if total_images == 0:
-                raise ValueError('first-session task-wise SAP reference set is empty')
-            if not (
-                len(trusted_labels) == total_images
-                and len(trusted_task_ids) == total_images
-            ):
-                raise ValueError('trusted images, labels, and task ids are not aligned')
+            count = int(len(images))
+            if count == 0 or any(len(evidence[key]) != count for key in (
+                'sample_ids', 'true_labels', 'observed_labels',
+                'source_task_ids', 'is_old', 'reference_order',
+            )):
+                raise ValueError('reference evidence and images are not aligned')
+            if not torch.equal(evidence['true_labels'], trusted_labels) or not torch.equal(
+                evidence['source_task_ids'], trusted_task_ids,
+            ) or not torch.equal(evidence['reference_order'], torch.arange(count)):
+                raise ValueError('reference evidence differs from the actual reference')
             seen_tasks = list(range(int(self.current_task) + 1))
-
-            stage = 'classifier_snapshot'
-            classifier = resolve_classifier_module(self.net)
-            weight_before = classifier.weight.detach().clone()
-            bias_before = (
-                classifier.bias.detach().clone()
-                if classifier.bias is not None else None
-            )
-
-            stage = 'feature_collection'
-            batches_with_labels = list(
-                self._normalized_batches(all_images, trusted_labels),
-            )
-
-            def image_batches():
-                for images, _labels in batches_with_labels:
-                    yield images
-
-            features = collect_classifier_input_features(
-                self.net, image_batches(), total_images=total_images,
-            )
-            x_task1, feature_norm_stats = normalize_classifier_input_features(features)
-            if x_task1.shape[0] != total_images:
-                raise ValueError('normalized features are not aligned with the reference set')
-            if x_task1.shape[1] != weight_before.shape[1]:
-                raise ValueError(
-                    'classifier input dimension does not match normalized features'
-                )
-            if weight_before.shape[0] != int(dataset.N_CLASSES):
-                raise ValueError('classifier row count does not match dataset classes')
-
-            stage = 'coverage'
             coverage = self._build_reference_coverage(
                 dataset, trusted_labels, trusted_task_ids, seen_tasks,
             )
-            logging.info(
-                'Task-wise SAP reference: total=%d task_counts=%s missing_classes=%s '
-                'empty_tasks=%s',
-                total_images,
-                coverage['task_counts'],
-                {
-                    task_id: task_stats['missing_classes']
-                    for task_id, task_stats in coverage['tasks'].items()
-                    if task_stats['missing_classes']
-                },
-                coverage['empty_tasks'],
-            )
             if coverage['empty_tasks']:
                 for task_id in coverage['empty_tasks']:
-                    self._record_sap_event(
-                        status=TASK_REFERENCE_EMPTY,
-                        reference_task_id=int(task_id),
-                    )
-                raise ValueError(
-                    f"empty trusted task references: {coverage['empty_tasks']}"
-                )
+                    self._record_sap_event(status=TASK_REFERENCE_EMPTY,
+                                           reference_task_id=int(task_id))
+                raise ValueError(f"empty trusted task references: {coverage['empty_tasks']}")
+
+            stage = 'feature_collection'
+            classifier = resolve_classifier_module(self.net)
+            weight_before = classifier.weight.detach().clone()
+            bias_before = classifier.bias.detach().clone() if classifier.bias is not None else None
+            # CIFAR current images are uint8 [0,255], while Buffer examples
+            # originate from ToTensor() and are float [0,1]. Concatenation in
+            # the unchanged reference builder promotes the mixed batch to float.
+            # Restore the current slice to [0,1] before normalizing both slices.
+            feature_images = images
+            if self.current_task == 1 and images.is_floating_point():
+                feature_images = images.clone()
+                feature_images[:reference_stats['reference_new_count']].div_(255)
+            def image_batches():
+                for batch_images, _ in self._normalized_batches(feature_images, trusted_labels):
+                    yield batch_images
+            x_raw = collect_classifier_input_features(
+                self.net, image_batches(), total_images=count,
+            )
+            x_l2, feature_norm_stats = normalize_classifier_input_features(x_raw)
+            if x_l2.shape != (count, weight_before.shape[1]):
+                raise ValueError('classifier feature shape differs from weight')
+            if weight_before.shape[0] != int(dataset.N_CLASSES):
+                raise ValueError('classifier row count differs from dataset classes')
 
             stage = 'taskwise_projection'
-            weight_after_taskwise = weight_before.clone()
-            task_grams = {}
-            task_projections = {}
-            task_projection_stats = {}
-            task_ids_device = trusted_task_ids.to(x_task1.device)
-            projected_row_mask = torch.zeros(
-                weight_before.shape[0], dtype=torch.bool, device=weight_before.device,
-            )
+            weight_after = weight_before.clone()
+            projected = torch.zeros(len(weight_before), dtype=torch.bool,
+                                    device=weight_before.device)
+            tensors = {
+                'network_pre_sap.pt': network_before,
+                'reference_sample_ids.pt': evidence['sample_ids'],
+                'reference_true_labels.pt': evidence['true_labels'],
+                'reference_observed_labels.pt': evidence['observed_labels'],
+                'reference_source_task_ids.pt': evidence['source_task_ids'],
+                'reference_is_old.pt': evidence['is_old'],
+                'reference_order.pt': evidence['reference_order'],
+                'X_raw.pt': x_raw, 'X_l2.pt': x_l2,
+                'W_before.pt': weight_before, 'bias_before.pt': bias_before,
+            }
             for task_id in seen_tasks:
-                task_features = x_task1[task_ids_device == task_id]
-                task_gram = task_features.transpose(0, 1) @ task_features
-                (
-                    task_projection,
-                    task_energy,
-                    task_normalized_energy,
-                    task_importance,
-                ) = self._build_oracle_projection(task_gram)
-                task_grams[task_id] = task_gram
-                start_c, end_c = dataset.get_offsets(task_id)
-                start_c, end_c = int(start_c), int(end_c)
-                task_weight, task_weight_stats = project_linear_weight(
-                    weight_before[start_c:end_c, :], task_projection,
+                mask = trusted_task_ids.to(x_l2.device) == task_id
+                task_x_raw = x_raw[mask]
+                task_x = x_l2[mask]
+                gram = task_x.T @ task_x
+                matrix, energy, _, importance, eigenvectors, eigenvalues = (
+                    self._build_oracle_projection(gram, return_eigenvectors=True)
                 )
-                weight_after_taskwise[start_c:end_c, :] = task_weight
-                projected_row_mask[start_c:end_c] = True
-                task_projections[task_id] = task_projection
-                task_projection_stats[str(task_id)] = {
-                    'reference_count': int(task_features.shape[0]),
-                    'gram_trace': task_gram.trace().item(),
-                    'normalized_energy_min': task_normalized_energy.min().item(),
-                    'normalized_energy_median': task_normalized_energy.median().item(),
-                    'normalized_energy_max': task_normalized_energy.max().item(),
-                    'importance_min': task_importance.min().item(),
-                    'importance_median': task_importance.median().item(),
-                    'importance_max': task_importance.max().item(),
-                    'importance_trace': task_importance.sum().item(),
-                    'relative_weight_delta': task_weight_stats['relative_weight_delta'],
-                    'weight_norm_ratio': task_weight_stats['weight_norm_ratio'],
-                    'projection_shape': list(task_projection.shape),
-                    'gram_eigenvalue_min': task_energy.min().item(),
-                    'gram_eigenvalue_max': task_energy.max().item(),
-                }
-            if not torch.equal(
-                weight_after_taskwise[~projected_row_mask],
-                weight_before[~projected_row_mask],
-            ):
-                raise AssertionError('Task-wise SAP changed unseen classifier rows')
-            taskwise_weight_stats = self._weight_stats(
-                weight_before, weight_after_taskwise,
-            )
+                start_c, end_c = map(int, dataset.get_offsets(task_id))
+                task_weight, _ = project_linear_weight(
+                    weight_before[start_c:end_c, :], matrix,
+                )
+                weight_after[start_c:end_c, :] = task_weight
+                projected[start_c:end_c] = True
+                tensors.update({
+                    f'X_raw_task_{task_id}.pt': task_x_raw,
+                    f'X_l2_task_{task_id}.pt': task_x,
+                    f'G_task_{task_id}.pt': gram,
+                    f'eigenvalues_task_{task_id}.pt': eigenvalues,
+                    f'energy_task_{task_id}.pt': energy,
+                    f'eigenvectors_task_{task_id}.pt': eigenvectors,
+                    f'importance_task_{task_id}.pt': importance,
+                    f'M_task_{task_id}.pt': matrix,
+                })
+            if not torch.equal(weight_after[~projected], weight_before[~projected]):
+                raise AssertionError('SAP changed unseen classifier rows')
 
             stage = 'candidate_evaluation'
-            accuracy = {}
-            test_decisions = {}
-            for candidate_name, candidate_weight in (
-                ('pre_sap', weight_before),
-                ('post_sap', weight_after_taskwise),
-            ):
-                self._install_classifier_candidate(
-                    classifier, candidate_weight, bias_before,
-                )
-                test_decisions[candidate_name] = (
-                    self._capture_task1_test_decisions(dataset)
-                )
-                accuracy[candidate_name] = self._summarize_evaluation(dataset, self)
-                logging.info(
-                    'Task-wise SAP candidate %s results: %s',
-                    candidate_name, accuracy[candidate_name],
-                )
-
-            decision_stats = self._build_task1_test_decision_stats(
-                test_decisions['pre_sap'],
-                test_decisions['post_sap'],
-                accuracy,
+            accuracy, decisions = {}, {}
+            for name, weight in (('pre_sap', weight_before), ('post_sap', weight_after)):
+                self._install_classifier_candidate(classifier, weight, bias_before)
+                decisions[name] = self._capture_seen_test_decisions(dataset)
+                accuracy[name] = self._summarize_evaluation(dataset, self)
+            decision_stats = self._build_test_decision_stats(
+                decisions['pre_sap'], decisions['post_sap'], accuracy,
                 classifier_has_bias=bias_before is not None,
             )
+            network_after = copy.deepcopy(self.net.state_dict())
+            for key, value in network_before.items():
+                if key not in ('net.classifier.weight', 'classifier.weight') and not torch.equal(
+                    value, network_after[key],
+                ):
+                    raise AssertionError(f'SAP changed non-target network state: {key}')
+            if bias_before is not None and not torch.equal(classifier.bias, bias_before):
+                raise AssertionError('SAP changed classifier bias')
+            tensors.update({
+                'network_post_sap.pt': network_after,
+                'W_after.pt': weight_after,
+                'bias_after.pt': classifier.bias.detach().clone() if classifier.bias is not None else None,
+            })
+            for name, result in decisions.items():
+                for key in ('sample_ids', 'task_ids', 'labels', 'raw_features',
+                            'logits', 'predictions', 'task_predictions'):
+                    tensors[f'test_{name}_{key}.pt'] = result[key]
 
-            manifest = {
-                'experiment_name': 'first_session_only_taskwise_sap_v1',
-                'task_id': int(self.current_task),
-                'seen_tasks': seen_tasks,
-                'sap_alpha': float(self.args.sap_oracle_scale),
-                'projection_target': 'classifier',
-                'projection_scope': 'taskwise_seen_tasks',
-                'global_candidate_built': False,
-                'classifier_has_bias': bias_before is not None,
-                'test_feature_type': 'raw_classifier_input',
-                'test_feature_l2_normalized': False,
-                'test_decision_semantics': 'class_il_seen_classes',
-            }
             stage = 'artifact_save'
-            output_directory = self._save_taskwise_artifacts(
-                dataset,
-                weight_before=weight_before,
-                x_task1=x_task1,
-                trusted_labels=trusted_labels,
-                trusted_task_ids=trusted_task_ids,
-                reference_stats=reference_stats,
-                coverage=coverage,
-                task_grams=task_grams,
-                task_projections=task_projections,
-                weight_after=weight_after_taskwise,
-                accuracy=accuracy,
-                manifest=manifest,
-                test_decisions=test_decisions,
-                classifier_bias_before=bias_before,
-                decision_stats=decision_stats,
+            final_directory.parent.mkdir(parents=True, exist_ok=True)
+            if final_directory.exists():
+                raise FileExistsError(f'boundary artifact already exists: {final_directory}')
+            stage_directory = Path(tempfile.mkdtemp(
+                prefix=f'.boundary_task_{self.current_task}_',
+                dir=final_directory.parent,
+            ))
+            files = self._save_taskwise_artifacts(
+                stage_directory, tensors, evidence['counts'], coverage,
+                accuracy, decision_stats,
             )
-
             stage = 'taskwise_commit'
-            self._install_classifier_candidate(
-                classifier, weight_after_taskwise, bias_before,
-            )
+            self._install_classifier_candidate(classifier, weight_after, bias_before)
             self.past_model_ckpt = copy.deepcopy(self.net.state_dict())
-            logging.info(
-                'First-session Task-wise SAP selected candidate=taskwise artifacts=%s',
-                output_directory,
-            )
-
-            task_accuracy_comparisons = []
-            for task_id, (before, after) in enumerate(zip(
-                accuracy['pre_sap']['per_task_class_il'],
-                accuracy['post_sap']['per_task_class_il'],
-            )):
-                test_loader = dataset.test_loaders[task_id] \
-                    if task_id < len(dataset.test_loaders) else None
-                sample_count = None
-                if test_loader is not None and hasattr(test_loader, 'dataset'):
-                    sample_count = len(test_loader.dataset)
-                task_accuracy_comparisons.append({
-                    'task_id': task_id,
-                    'sample_count': sample_count,
-                    'accuracy_before': before / 100.0,
-                    'accuracy_after': after / 100.0,
-                    'accuracy_delta': (after - before) / 100.0,
-                })
-            max_bias_delta = (
-                0.0 if bias_before is None
-                else (classifier.bias.detach() - bias_before).abs().max().item()
-            )
-            primary_task_id = seen_tasks[-1]
-            primary_gram = task_grams[primary_task_id]
-            primary_stats = task_projection_stats[str(primary_task_id)]
+            if any(not torch.equal(self.past_model_ckpt[key], value)
+                   for key, value in self.net.state_dict().items()):
+                raise AssertionError('AER checkpoint does not match post-SAP network')
             self._record_sap_event(
-                status=SAP_ORACLE_EXECUTED,
-                projection_location='pre',
-                projection_target='classifier',
-                projection_scope='taskwise_seen_tasks',
-                seen_tasks=seen_tasks,
-                total_reference_count=total_images,
-                current_task_clean_count=reference_stats['current_task_clean_count'],
-                buffer_clean_count=reference_stats['buffer_clean_count'],
-                current_task_clean_total=reference_stats['current_task_clean_total'],
-                current_task_clean_selected=reference_stats['current_task_clean_selected'],
-                historical_buffer_clean_count=reference_stats['historical_buffer_clean_count'],
-                reference_new_count=reference_stats['reference_new_count'],
-                reference_old_count=reference_stats['reference_old_count'],
-                current_class_selected_counts=reference_stats['current_class_selected_counts'],
-                reference_sampling_seed=reference_stats['reference_sampling_seed'],
-                buffer_total_count=reference_stats['buffer_total_count'],
-                gram_shape=list(primary_gram.shape),
-                gram_trace=primary_gram.trace().item(),
-                feature_norm_before_min=feature_norm_stats['before']['min'],
-                feature_norm_before_median=feature_norm_stats['before']['median'],
-                feature_norm_before_mean=feature_norm_stats['before']['mean'],
-                feature_norm_before_max=feature_norm_stats['before']['max'],
-                feature_norm_after_min=feature_norm_stats['after']['min'],
-                feature_norm_after_median=feature_norm_stats['after']['median'],
-                feature_norm_after_mean=feature_norm_stats['after']['mean'],
-                feature_norm_after_max=feature_norm_stats['after']['max'],
-                gram_eigenvalue_min=primary_stats['gram_eigenvalue_min'],
-                gram_eigenvalue_max=primary_stats['gram_eigenvalue_max'],
-                normalized_energy_min=primary_stats['normalized_energy_min'],
-                normalized_energy_median=primary_stats['normalized_energy_median'],
-                normalized_energy_max=primary_stats['normalized_energy_max'],
-                sap_alpha=float(self.args.sap_oracle_scale),
-                importance_min=primary_stats['importance_min'],
-                importance_median=primary_stats['importance_median'],
-                importance_max=primary_stats['importance_max'],
-                importance_trace=primary_stats['importance_trace'],
-                n_seen_classes=int(self.n_seen_classes),
-                total_classifier_rows=int(classifier.weight.shape[0]),
-                relative_weight_delta=taskwise_weight_stats['relative_weight_delta'],
-                weight_norm_ratio=taskwise_weight_stats['weight_norm_ratio'],
-                max_bias_delta=max_bias_delta,
-                seen_task_accuracy_comparisons=task_accuracy_comparisons,
-                seen_average_accuracy_before=accuracy['pre_sap']['class_il'] / 100.0,
-                seen_average_accuracy_after=accuracy['post_sap']['class_il'] / 100.0,
-                task_projection_stats=task_projection_stats,
-                accuracy=accuracy,
-                coverage=coverage,
-                final_selected_candidate='taskwise',
-                artifact_output_directory=str(output_directory),
+                status=SAP_ORACLE_EXECUTED, sap_alpha=300.0,
+                seen_tasks=seen_tasks, projection_scope='taskwise_seen_tasks',
+                total_reference_count=count, reference_stats=reference_stats,
+                feature_norm_stats=feature_norm_stats,
+                accuracy=accuracy, coverage=coverage,
+                artifact_output_directory=str(final_directory),
             )
+            manifest = {
+                'experiment_name': 'double_boundary_taskwise_sap_v1',
+                'boundary_task_id': int(self.current_task),
+                'seen_tasks': seen_tasks, 'sap_alpha': 300.0,
+                'reference_count': count, 'projection_scope': 'taskwise_seen_tasks',
+                'expected_sap': True, 'started': True, 'succeeded': True,
+                'artifact_complete': True, 'valid': True,
+                'pre_state': 'network_pre_sap.pt',
+                'post_state': 'network_post_sap.pt',
+                'files': files,
+            }
+            (stage_directory / 'manifest.json').write_text(
+                json.dumps(manifest, indent=2, sort_keys=True), encoding='utf-8',
+            )
+            stage_directory.rename(final_directory)
+            stage_directory = None
         except Exception as error:
-            if classifier is not None and weight_before is not None:
-                self._install_classifier_candidate(
-                    classifier, weight_before, bias_before,
-                )
+            self.net.load_state_dict(network_before)
+            if had_past:
+                self.past_model_ckpt = past_before
+            elif hasattr(self, 'past_model_ckpt'):
+                delattr(self, 'past_model_ckpt')
+            if stage_directory is not None:
+                shutil.rmtree(stage_directory)
+            del self.sap_history[history_start:]
             self._record_sap_event(
-                status=SAP_FAILED,
-                oracle_stage=stage,
-                error_type=type(error).__name__,
-                error_message=str(error),
+                status=SAP_FAILED, oracle_stage=stage,
+                error_type=type(error).__name__, error_message=str(error),
             )
-            logging.exception(
-                'First-session Task-wise Oracle SAP failed; pre-SAP classifier was restored.'
-            )
+            raise
 
     def _run_task_boundary_sap(self, dataset) -> None:
         start_from = getattr(self.args, 'start_from', None)
-        if (
-            getattr(self.args, 'loadcheck', None) is not None
-            and start_from is not None
-            and self.current_task < start_from
-        ):
+        if (getattr(self.args, 'loadcheck', None) is not None
+                and start_from is not None and self.current_task < start_from):
             self._record_sap_event(status=SAP_SKIPPED_CHECKPOINT_RECONSTRUCTION)
             return
         if getattr(self.args, 'inference_only', False):
             self._record_sap_event(status=SAP_SKIPPED_INFERENCE)
             return
-        self._run_first_session_taskwise_sap(dataset)
+        self._run_taskwise_sap(dataset)
 
     def end_task(self, dataset):
         super().end_task(dataset)
-        if self.current_task != 0:
-            self._record_sap_event(status=SAP_SKIPPED_FIRST_SESSION_ONLY)
+        if self.current_task not in (0, 1):
+            self._record_sap_event(status=SAP_SKIPPED_AFTER_SECOND_BOUNDARY)
             return
         self._run_task_boundary_sap(dataset)

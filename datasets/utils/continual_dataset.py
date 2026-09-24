@@ -527,8 +527,9 @@ def store_masked_loaders(train_dataset: Dataset, test_dataset: Dataset,
     # Loss tracing needs stable dataset ids and source-task ids to follow a
     # sample through DataLoader shuffling and later memory-buffer replacement.
     # Add them after task filtering so that they align directly with data/targets.
-    if getattr(setting.args, 'enable_loss_trace', 0):
+    if getattr(setting.args, 'enable_loss_trace', 0) or getattr(setting.args, 'model', None) in ('aer-sap', 'aer_sap'):
         train_dataset.add_extra_return_field('sample_ids', train_dataset.indexes.copy())
+    if getattr(setting.args, 'enable_loss_trace', 0):
         train_dataset.add_extra_return_field(
             'source_task_ids',
             np.full(len(train_dataset.targets), setting.c_task, dtype=np.int64),
