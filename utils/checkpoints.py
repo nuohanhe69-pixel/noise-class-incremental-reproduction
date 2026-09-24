@@ -198,6 +198,10 @@ def mammoth_load_checkpoint(checkpoint_path: str,
                 if not hasattr(model, 'load_sap_state'):
                     raise ValueError('Checkpoint contains SAP state but the selected model cannot load it')
                 model.load_sap_state(saved_obj['sap_state'])
+            elif (getattr(model, 'requires_sap_checkpoint_state', False)
+                  and getattr(args, 'start_from', None) == 1
+                  and not getattr(args, 'inference_only', False)):
+                raise ValueError('AerSap Task0 boundary resume requires SAP checkpoint state')
 
             return model, saved_obj['results']
         else:

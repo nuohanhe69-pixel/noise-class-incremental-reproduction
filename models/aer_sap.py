@@ -39,6 +39,7 @@ class AerSap(ErAceAerAbs):
 
     NAME = 'aer_sap'
     COMPATIBILITY = ['class-il', 'task-il']
+    requires_sap_checkpoint_state = True
 
     @staticmethod
     def get_parser(parser) -> ArgumentParser:
@@ -519,8 +520,63 @@ class AerSap(ErAceAerAbs):
         self._run_taskwise_sap(dataset)
 
     def end_task(self, dataset):
+        start_from = getattr(self.args, 'start_from', None)
+        if (self.current_task == 0 and start_from == 1
+                and getattr(self.args, 'loadcheck', None) is not None):
+            self._record_sap_event(status=SAP_SKIPPED_CHECKPOINT_RECONSTRUCTION)
+            return
         super().end_task(dataset)
         if self.current_task not in (0, 1):
             self._record_sap_event(status=SAP_SKIPPED_AFTER_SECOND_BOUNDARY)
             return
         self._run_task_boundary_sap(dataset)
+
+    def serialize_sap_state(self) -> dict:
+        """Preserve the completed boundary needed to begin the next task."""
+        if int(self.current_task) == 1:
+            if not any(event.get('task_id') == 0 and event.get('status') == SAP_ORACLE_EXECUTED
+                       for event in self.sap_history):
+                raise ValueError('cannot checkpoint an incomplete Task0 SAP boundary')
+            if not hasattr(self, 'past_model_ckpt') or self.past_model_ckpt is None:
+                raise ValueError('completed SAP boundary is missing the AER checkpoint')
+            net_state = self.net.state_dict()
+            if (net_state.keys() != self.past_model_ckpt.keys()
+                    or any(not torch.equal(value, self.past_model_ckpt[key])
+                           for key, value in net_state.items())):
+                raise ValueError('AER checkpoint differs from the post-SAP network')
+        return {
+            'version': 1,
+            'next_task': int(self.current_task),
+            'past_model_ckpt': (
+                {key: value.detach().cpu().clone()
+                 for key, value in self.past_model_ckpt.items()}
+                if getattr(self, 'past_model_ckpt', None) is not None else None
+            ),
+            'seen_so_far': self.seen_so_far.detach().cpu().clone(),
+            'history': copy.deepcopy(self.sap_history),
+        }
+
+    def load_sap_state(self, state: dict) -> None:
+        """Load only at the next task, after checkpoint task reconstruction."""
+        if state.get('version') != 1:
+            raise ValueError('unsupported aer-sap checkpoint state')
+        next_task = int(state['next_task'])
+        if int(self.current_task) != next_task:
+            raise ValueError(
+                f'aer-sap checkpoint requires start_from={next_task}; '
+                f'reconstructed next task is {self.current_task}'
+            )
+        saved_past = state.get('past_model_ckpt')
+        if next_task == 1:
+            net_state = self.net.state_dict()
+            if (saved_past is None or saved_past.keys() != net_state.keys()
+                    or any(not torch.equal(saved_past[key], value.cpu())
+                           for key, value in net_state.items())):
+                raise ValueError('loaded AER checkpoint differs from post-SAP network')
+        self.past_model_ckpt = (
+            {key: saved_past[key].to(value.device).clone()
+             for key, value in self.net.state_dict().items()}
+            if saved_past is not None else None
+        )
+        self.seen_so_far = state['seen_so_far'].to(self.device).clone()
+        self.sap_history = copy.deepcopy(state['history'])
