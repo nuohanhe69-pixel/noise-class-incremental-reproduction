@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 import torch
 from torch import nn
 
-from models.aer_sap import AerSap, SAP_SKIPPED_AFTER_SECOND_BOUNDARY
+from models.aer_sap import AerSap
 from models.dgc_sap import DgcSap, SAP_FAILED, SAP_ORACLE_EXECUTED
 from models.er_ace_aer_abs import ErAceAerAbs
 
@@ -51,6 +51,12 @@ class _Dataset:
             _Loader(torch.tensor([[0., 0., 2., 0.], [0., 0., 0., 2.]]),
                     torch.tensor([10, 11]), [200, 201]),
         ]
+        for task_id in range(2, self.N_TASKS):
+            self.test_loaders.append(_Loader(
+                torch.tensor([[2., 0., 0., 0.], [0., 2., 0., 0.]]),
+                torch.tensor([task_id * 10, task_id * 10 + 1]),
+                [100 * (task_id + 1), 100 * (task_id + 1) + 1],
+            ))
 
     @staticmethod
     def get_offsets(task_id):
@@ -81,14 +87,15 @@ def _reference(task_id):
             [0., 0., 255., 0.], [0., 0., 0., 255.],
             [2., 0., 0., 0.], [0., 2., 0., 0.],
         ])
-        labels = torch.tensor([10, 11, 0, 1])
-        ids = torch.tensor([10, 11, 0, 1])
-        tasks = torch.tensor([1, 1, 0, 0])
+        labels = torch.tensor([task_id * 10, task_id * 10 + 1, 0, 1])
+        ids = torch.tensor([task_id * 10, task_id * 10 + 1, 0, 1])
+        tasks = torch.tensor([task_id, task_id, 0, 0])
         new_count = 2
     counts = {
         'current_candidate': 2, 'current_eligible': 2, 'current_selected': 2,
-        'old_candidate': task_id * 2, 'old_eligible': task_id * 2,
-        'old_selected': task_id * 2, 'new_candidate': 2,
+        'old_candidate': 0 if task_id == 0 else 2,
+        'old_eligible': 0 if task_id == 0 else 2,
+        'old_selected': 0 if task_id == 0 else 2, 'new_candidate': 2,
         'new_eligible': 2, 'new_selected': 2,
         'selected_per_class': {int(label): 1 for label in labels},
         'sampling_seed': task_id,
@@ -100,7 +107,7 @@ def _reference(task_id):
         'reference_order': torch.arange(len(labels)), 'counts': counts,
     }
     return images, labels, tasks, {'reference_new_count': 2,
-                                    'reference_old_count': task_id * 2}, evidence
+                                    'reference_old_count': 0 if task_id == 0 else 2}, evidence
 
 
 def _model(results_path):
@@ -143,10 +150,9 @@ class AerSapContractTests(unittest.TestCase):
             for task_id in range(10):
                 model._current_task = task_id
                 model.end_task(dataset)
-        self.assertEqual([task for kind, task in order if kind == 'sap'], [0, 1])
+        self.assertEqual([task for kind, task in order if kind == 'sap'], list(range(10)))
         self.assertEqual(order[:4], [('aer', 0), ('sap', 0), ('aer', 1), ('sap', 1)])
-        self.assertEqual([event['status'] for event in model.sap_history],
-                         [SAP_SKIPPED_AFTER_SECOND_BOUNDARY] * 8)
+        self.assertEqual(len(order), 20)
 
     def test_two_boundaries_save_independent_reconstructable_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -174,16 +180,19 @@ class AerSapContractTests(unittest.TestCase):
             self.assertEqual(manifest['reference_count'], 4)
             self.assertEqual(set(manifest['files']),
                              {path.name for path in second.iterdir()} - {'manifest.json'})
-            self.assertFalse(torch.equal(first_matrix,
-                                         torch.load(second / 'M_task_0.pt', weights_only=True)))
+            self.assertFalse((second / 'M_task_0.pt').exists())
+            self.assertTrue((second / 'M_task_1.pt').exists())
+            self.assertEqual(first_matrix.shape,
+                             torch.load(second / 'M_task_1.pt', weights_only=True).shape)
 
             before = torch.load(second / 'W_before.pt', weights_only=True)
             after = torch.load(second / 'W_after.pt', weights_only=True)
             x_raw = torch.load(second / 'X_raw.pt', weights_only=True)
             expected_new = torch.eye(4)[2:4] @ pre_state['backbone.weight'].T
             torch.testing.assert_close(x_raw[:2], expected_new)
+            self.assertTrue(torch.equal(before[:10], after[:10]))
             self.assertTrue(torch.equal(before[20:], after[20:]))
-            for task_id in (0, 1):
+            for task_id in (1,):
                 x = torch.load(second / f'X_l2_task_{task_id}.pt', weights_only=True)
                 gram = torch.load(second / f'G_task_{task_id}.pt', weights_only=True)
                 matrix = torch.load(second / f'M_task_{task_id}.pt', weights_only=True)
@@ -228,6 +237,60 @@ class AerSapContractTests(unittest.TestCase):
                 ))
             self.assertEqual([event['sap_alpha'] for event in model.sap_history
                               if event['status'] == SAP_ORACLE_EXECUTED], [300.0, 300.0])
+
+    def test_each_boundary_projects_only_current_reference_and_classifier_rows(self):
+        for task_id in range(10):
+            with self.subTest(task_id=task_id), tempfile.TemporaryDirectory() as tmp:
+                model = _model(tmp)
+                dataset = _Dataset()
+                model._current_task = task_id
+                model._n_seen_classes = (task_id + 1) * 10
+                before = copy.deepcopy(model.net.state_dict())
+                model._run_taskwise_sap(dataset)
+                artifact = model._taskwise_artifact_directory(dataset)
+                manifest = json.loads((artifact / 'manifest.json').read_text())
+                self.assertEqual(manifest['boundary_task_id'], task_id)
+                self.assertEqual(manifest['projection_scope'], 'current_task_only')
+                self.assertEqual(manifest['sap_alpha'], 300.0)
+                self.assertTrue(manifest['valid'] and manifest['artifact_complete'])
+                self.assertEqual(set(manifest['files']),
+                                 {path.name for path in artifact.iterdir()} - {'manifest.json'})
+                for historical_task in range(task_id):
+                    self.assertFalse((artifact / f'G_task_{historical_task}.pt').exists())
+                    self.assertFalse((artifact / f'M_task_{historical_task}.pt').exists())
+                x = torch.load(artifact / 'X_l2.pt', weights_only=True)
+                x_raw = torch.load(artifact / 'X_raw.pt', weights_only=True)
+                source_tasks = torch.load(artifact / 'reference_source_task_ids.pt',
+                                          weights_only=True)
+                is_old = torch.load(artifact / 'reference_is_old.pt', weights_only=True)
+                self.assertTrue(torch.equal(source_tasks == task_id, ~is_old))
+                if task_id:
+                    torch.testing.assert_close(
+                        x_raw[:2], torch.eye(4)[2:4] @ before['backbone.weight'].T,
+                    )
+                current_x = x[source_tasks == task_id]
+                torch.testing.assert_close(
+                    torch.load(artifact / f'X_l2_task_{task_id}.pt', weights_only=True),
+                    current_x,
+                )
+                gram = torch.load(artifact / f'G_task_{task_id}.pt', weights_only=True)
+                matrix = torch.load(artifact / f'M_task_{task_id}.pt', weights_only=True)
+                torch.testing.assert_close(gram, current_x.T @ current_x)
+                if task_id:
+                    self.assertFalse(torch.equal(gram, x.T @ x))
+                weight_before = torch.load(artifact / 'W_before.pt', weights_only=True)
+                weight_after = torch.load(artifact / 'W_after.pt', weights_only=True)
+                start, end = dataset.get_offsets(task_id)
+                torch.testing.assert_close(weight_after[start:end],
+                                           weight_before[start:end] @ matrix.T)
+                self.assertTrue(torch.equal(weight_after[:start], weight_before[:start]))
+                self.assertTrue(torch.equal(weight_after[end:], weight_before[end:]))
+                self.assertTrue(torch.equal(model.net.classifier.bias,
+                                            before['classifier.bias']))
+                self.assertTrue(torch.equal(model.net.backbone.weight,
+                                            before['backbone.weight']))
+                self.assertEqual(model.sap_history[-1]['status'], SAP_ORACLE_EXECUTED)
+                self.assertEqual(model.sap_history[-1]['sap_alpha'], 300.0)
 
     def test_save_failure_rolls_back_network_and_aer_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -49,7 +49,7 @@ class AerSap(ErAceAerAbs):
         group.add_argument('--sap_batch_size', type=int, default=32)
         group.add_argument(
             '--sap_oracle_reference', type=int, default=1, choices=[1],
-            help='Oracle-clean references at the first two task boundaries.',
+            help='Oracle-clean references at each task boundary.',
         )
         group.add_argument(
             '--sap_oracle_scale', type=float, default=300.0,
@@ -62,7 +62,7 @@ class AerSap(ErAceAerAbs):
         if args.sap_batch_size <= 0:
             raise ValueError('sap_batch_size must be positive')
         if args.sap_oracle_scale != 300.0:
-            raise ValueError('double-boundary SAP requires sap_oracle_scale=300')
+            raise ValueError('current-task SAP requires sap_oracle_scale=300')
         self.sap_history = []
         self._pending_task1_sap = False
 
@@ -322,10 +322,10 @@ class AerSap(ErAceAerAbs):
         return files
 
     def _run_taskwise_sap(self, dataset) -> None:
-        if int(self.current_task) not in (0, 1):
-            raise ValueError('task-wise SAP is expected only at boundaries 0 and 1')
+        if not 0 <= int(self.current_task) < int(dataset.N_TASKS):
+            raise ValueError('task-wise SAP requires a valid task boundary')
         if float(self.args.sap_oracle_scale) != 300.0:
-            raise ValueError('double-boundary SAP requires sap_oracle_scale=300')
+            raise ValueError('current-task SAP requires sap_oracle_scale=300')
         self._record_sap_event(status=TASKWISE_SAP_STARTED, sap_alpha=300.0)
         history_start = len(self.sap_history)
         network_before = copy.deepcopy(self.net.state_dict())
@@ -353,11 +353,10 @@ class AerSap(ErAceAerAbs):
             coverage = self._build_reference_coverage(
                 dataset, trusted_labels, trusted_task_ids, seen_tasks,
             )
-            if coverage['empty_tasks']:
-                for task_id in coverage['empty_tasks']:
-                    self._record_sap_event(status=TASK_REFERENCE_EMPTY,
-                                           reference_task_id=int(task_id))
-                raise ValueError(f"empty trusted task references: {coverage['empty_tasks']}")
+            if int(self.current_task) in coverage['empty_tasks']:
+                self._record_sap_event(status=TASK_REFERENCE_EMPTY,
+                                       reference_task_id=int(self.current_task))
+                raise ValueError(f'empty trusted current-task reference: {self.current_task}')
 
             stage = 'feature_collection'
             classifier = resolve_classifier_module(self.net)
@@ -368,7 +367,7 @@ class AerSap(ErAceAerAbs):
             # the unchanged reference builder promotes the mixed batch to float.
             # Restore the current slice to [0,1] before normalizing both slices.
             feature_images = images
-            if self.current_task == 1 and images.is_floating_point():
+            if self.current_task > 0 and images.is_floating_point():
                 feature_images = images.clone()
                 feature_images[:reference_stats['reference_new_count']].div_(255)
             def image_batches():
@@ -398,32 +397,32 @@ class AerSap(ErAceAerAbs):
                 'X_raw.pt': x_raw, 'X_l2.pt': x_l2,
                 'W_before.pt': weight_before, 'bias_before.pt': bias_before,
             }
-            for task_id in seen_tasks:
-                mask = trusted_task_ids.to(x_l2.device) == task_id
-                task_x_raw = x_raw[mask]
-                task_x = x_l2[mask]
-                gram = task_x.T @ task_x
-                matrix, energy, _, importance, eigenvectors, eigenvalues = (
-                    self._build_oracle_projection(gram, return_eigenvectors=True)
-                )
-                start_c, end_c = map(int, dataset.get_offsets(task_id))
-                task_weight, _ = project_linear_weight(
-                    weight_before[start_c:end_c, :], matrix,
-                )
-                weight_after[start_c:end_c, :] = task_weight
-                projected[start_c:end_c] = True
-                tensors.update({
-                    f'X_raw_task_{task_id}.pt': task_x_raw,
-                    f'X_l2_task_{task_id}.pt': task_x,
-                    f'G_task_{task_id}.pt': gram,
-                    f'eigenvalues_task_{task_id}.pt': eigenvalues,
-                    f'energy_task_{task_id}.pt': energy,
-                    f'eigenvectors_task_{task_id}.pt': eigenvectors,
-                    f'importance_task_{task_id}.pt': importance,
-                    f'M_task_{task_id}.pt': matrix,
-                })
+            task_id = int(self.current_task)
+            mask = trusted_task_ids.to(x_l2.device) == task_id
+            task_x_raw = x_raw[mask]
+            task_x = x_l2[mask]
+            gram = task_x.T @ task_x
+            matrix, energy, _, importance, eigenvectors, eigenvalues = (
+                self._build_oracle_projection(gram, return_eigenvectors=True)
+            )
+            start_c, end_c = map(int, dataset.get_offsets(task_id))
+            task_weight, _ = project_linear_weight(
+                weight_before[start_c:end_c, :], matrix,
+            )
+            weight_after[start_c:end_c, :] = task_weight
+            projected[start_c:end_c] = True
+            tensors.update({
+                f'X_raw_task_{task_id}.pt': task_x_raw,
+                f'X_l2_task_{task_id}.pt': task_x,
+                f'G_task_{task_id}.pt': gram,
+                f'eigenvalues_task_{task_id}.pt': eigenvalues,
+                f'energy_task_{task_id}.pt': energy,
+                f'eigenvectors_task_{task_id}.pt': eigenvectors,
+                f'importance_task_{task_id}.pt': importance,
+                f'M_task_{task_id}.pt': matrix,
+            })
             if not torch.equal(weight_after[~projected], weight_before[~projected]):
-                raise AssertionError('SAP changed unseen classifier rows')
+                raise AssertionError('SAP changed non-current classifier rows')
 
             stage = 'candidate_evaluation'
             accuracy, decisions = {}, {}
@@ -473,7 +472,7 @@ class AerSap(ErAceAerAbs):
                 raise AssertionError('AER checkpoint does not match post-SAP network')
             self._record_sap_event(
                 status=SAP_ORACLE_EXECUTED, sap_alpha=300.0,
-                seen_tasks=seen_tasks, projection_scope='taskwise_seen_tasks',
+                seen_tasks=seen_tasks, projection_scope='current_task_only',
                 total_reference_count=count, reference_stats=reference_stats,
                 feature_norm_stats=feature_norm_stats,
                 accuracy=accuracy, coverage=coverage,
@@ -483,7 +482,7 @@ class AerSap(ErAceAerAbs):
                 'experiment_name': 'double_boundary_taskwise_sap_v1',
                 'boundary_task_id': int(self.current_task),
                 'seen_tasks': seen_tasks, 'sap_alpha': 300.0,
-                'reference_count': count, 'projection_scope': 'taskwise_seen_tasks',
+                'reference_count': count, 'projection_scope': 'current_task_only',
                 'expected_sap': True, 'started': True, 'succeeded': True,
                 'artifact_complete': True, 'valid': True,
                 'pre_state': 'network_pre_sap.pt',
@@ -523,15 +522,12 @@ class AerSap(ErAceAerAbs):
 
     def end_task(self, dataset):
         start_from = getattr(self.args, 'start_from', None)
-        if (self.current_task in (0, 1) and start_from is not None
+        if (start_from is not None
                 and self.current_task < start_from
                 and getattr(self.args, 'loadcheck', None) is not None):
             self._record_sap_event(status=SAP_SKIPPED_CHECKPOINT_RECONSTRUCTION)
             return
         super().end_task(dataset)
-        if self.current_task not in (0, 1):
-            self._record_sap_event(status=SAP_SKIPPED_AFTER_SECOND_BOUNDARY)
-            return
         if self.current_task == 1 and getattr(self.args, 'savecheck', None):
             history = getattr(self, '_task1_pre_sap_results', None)
             if history is None or len(history) != 3 or len(history[0]) != 1 or len(history[1]) != 1:

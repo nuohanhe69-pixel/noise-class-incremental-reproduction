@@ -212,6 +212,12 @@ class AerSapTask1PreSapResumeTests(unittest.TestCase):
             direct_reference = live._build_oracle_reference_batches(
                 dataset, return_task_ids=True, return_evidence=True,
             )
+            self.assertEqual(direct_reference[3]['reference_old_count'],
+                             direct_reference[3]['reference_new_count'])
+            self.assertEqual(direct_reference[3]['reference_old_count'],
+                             direct_reference[4]['counts']['old_selected'])
+            self.assertEqual(direct_reference[3]['reference_new_count'],
+                             direct_reference[4]['counts']['new_selected'])
             logger = Logger(live.args, dataset.SETTING, dataset.NAME, live.NAME)
             logger.log((50.0, 50.0))
             logger.log_fullacc(([50.0], [50.0]))
@@ -290,6 +296,13 @@ class AerSapTask1PreSapResumeTests(unittest.TestCase):
             self.assertEqual(direct_manifest, resumed_manifest)
             self.assertTrue(direct_manifest['valid'] and direct_manifest['artifact_complete'])
             self.assertEqual(direct_manifest['seen_tasks'], [0, 1])
+            self.assertEqual(direct_manifest['projection_scope'], 'current_task_only')
+            self.assertNotIn('M_task_0.pt', direct_manifest['files'])
+            self.assertIn('M_task_1.pt', direct_manifest['files'])
+            weight_before = torch.load(direct_artifact / 'W_before.pt', weights_only=True)
+            weight_after = torch.load(direct_artifact / 'W_after.pt', weights_only=True)
+            self.assertTrue(torch.equal(weight_before[:10], weight_after[:10]))
+            self.assertTrue(torch.equal(weight_before[20:], weight_after[20:]))
             for filename in direct_manifest['files']:
                 direct_file = direct_artifact / filename
                 resumed_file = resumed_artifact / filename
