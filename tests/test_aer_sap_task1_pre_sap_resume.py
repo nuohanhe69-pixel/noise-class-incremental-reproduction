@@ -309,7 +309,9 @@ class AerSapTask1PreSapResumeTests(unittest.TestCase):
                 if filename.endswith('.json'):
                     self.assertEqual(json.loads(direct_file.read_text()),
                                      json.loads(resumed_file.read_text()), filename)
-                elif filename.startswith('eigenvectors_'):
+                elif filename.endswith(('.csv', '.md')):
+                    self.assertEqual(direct_file.read_text(), resumed_file.read_text(), filename)
+                elif 'eigenvectors_' in filename:
                     continue  # eigenspace signs are not part of the equivalence contract
                 else:
                     left = torch.load(direct_file, map_location='cpu', weights_only=False)

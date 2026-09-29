@@ -97,6 +97,7 @@ class AerSapBufferSampleIdTests(unittest.TestCase):
             self.assertEqual(int(observed), int(observed_labels[sample_id]))
             self.assertEqual(int(clean), int(true_labels[sample_id]))
 
+        torch.manual_seed(0)
         model = AerSap.__new__(AerSap)
         nn.Module.__init__(model)
         model.net = nn.Sequential(nn.Flatten(), nn.Linear(3 * 32 * 32, 100))
@@ -126,7 +127,6 @@ class AerSapBufferSampleIdTests(unittest.TestCase):
             return add_data(**kwargs)
 
         np.random.seed(0)
-        torch.manual_seed(0)
         with patch.object(model.buffer, 'add_data', side_effect=record_add_data):
             train_single_epoch(model, task0_loader, args, epoch=0,
                                pbar=_Progress(), system_tracker=lambda: None)

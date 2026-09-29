@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import copy
+import csv
+import io
 import json
 import logging
+import random
 import shutil
 import tempfile
 from argparse import ArgumentParser
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.nn import functional as F
 
@@ -370,6 +374,130 @@ class AerSap(ErAceAerAbs):
             files[filename] = {'type': 'json'}
         return files
 
+    def _analyze_task1_four_settings(
+        self, dataset, x_l2, trusted_task_ids, weight_before, weight_after,
+        bias_before, pre_sap_decisions,
+    ) -> tuple[dict, dict]:
+        """Evaluate Task1 counterfactual weights without changing the SAP commit."""
+        old_mask = trusted_task_ids.to(x_l2.device) == 0
+        old_x = x_l2[old_mask]
+        if not len(old_x):
+            raise ValueError('Task1 four-setting analysis requires Task0 references')
+        old_gram = old_x.T @ old_x
+        old_matrix, _, _, _, old_eigenvectors, old_eigenvalues = (
+            self._build_oracle_projection(old_gram, return_eigenvectors=True)
+        )
+        old_start, old_end = map(int, dataset.get_offsets(0))
+        old_weight, _ = project_linear_weight(
+            weight_before[old_start:old_end, :], old_matrix,
+        )
+        task0_only = weight_before.clone()
+        task0_only[old_start:old_end, :] = old_weight
+        both = weight_after.clone()
+        both[old_start:old_end, :] = old_weight
+        candidates = {
+            'none': weight_before.clone(),
+            'task0_only': task0_only,
+            'task1_only': weight_after.clone(),
+            'both': both,
+        }
+        classifier = resolve_classifier_module(self.net)
+        tensors = {
+            'counterfactual_G_task_0.pt': old_gram,
+            'counterfactual_M_task_0.pt': old_matrix,
+            'counterfactual_eigenvalues_task_0.pt': old_eigenvalues,
+            'counterfactual_eigenvectors_task_0.pt': old_eigenvectors,
+        }
+        rows = []
+        first_decisions = None
+        missing_flag = object()
+        original_flag = getattr(self.args, 'cosine_inference', missing_flag)
+        python_rng = random.getstate()
+        numpy_rng = np.random.get_state()
+        try:
+            self.args.cosine_inference = 1
+            with torch.random.fork_rng():
+                for name, weight in candidates.items():
+                    self._install_classifier_candidate(classifier, weight, bias_before)
+                    decisions = self._capture_seen_test_decisions(dataset)
+                    if first_decisions is None:
+                        first_decisions = decisions
+                    for key in ('sample_ids', 'labels', 'task_ids', 'raw_features'):
+                        if (not torch.equal(decisions[key], first_decisions[key])
+                                or not torch.equal(decisions[key], pre_sap_decisions[key])):
+                            raise ValueError(f'Task1 four-setting test {key} are not aligned')
+                    class_il = decisions['per_task_class_il']
+                    task_il = decisions['per_task_task_il']
+                    if len(class_il) != 2 or len(task_il) != 2:
+                        raise ValueError('Task1 four-setting analysis requires two test tasks')
+                    rows.append({
+                        'setting': name,
+                        'Task0 Class-IL': class_il[0],
+                        'Task1 Class-IL': class_il[1],
+                        'Overall Class-IL': sum(class_il) / 2,
+                        'Task0 Task-IL': task_il[0],
+                        'Task1 Task-IL': task_il[1],
+                        'Overall Task-IL': sum(task_il) / 2,
+                    })
+                    prefix = f'task1_four_settings_{name}'
+                    tensors[f'{prefix}_W.pt'] = weight
+                    for key, output_name in (
+                        ('sample_ids', 'sample_ids'),
+                        ('labels', 'true_labels'),
+                        ('task_ids', 'source_task_ids'),
+                        ('predictions', 'predictions'),
+                        ('task_predictions', 'task_predictions'),
+                        ('logits', 'logits'),
+                    ):
+                        tensors[f'{prefix}_{output_name}.pt'] = decisions[key]
+        finally:
+            self._install_classifier_candidate(classifier, weight_after, bias_before)
+            if original_flag is missing_flag:
+                delattr(self.args, 'cosine_inference')
+            else:
+                self.args.cosine_inference = original_flag
+            random.setstate(python_rng)
+            np.random.set_state(numpy_rng)
+        return {
+            'boundary_task_id': 1,
+            'inference': 'cosine',
+            'projection_scope': 'analysis_only',
+            'task0_projector_source': 'Task1 boundary historical Task0 reference',
+            'settings': rows,
+        }, tensors
+
+    @staticmethod
+    def _save_task1_four_settings_report(directory: Path, report: dict) -> dict:
+        columns = (
+            'setting', 'Task0 Class-IL', 'Task1 Class-IL', 'Overall Class-IL',
+            'Task0 Task-IL', 'Task1 Task-IL', 'Overall Task-IL',
+        )
+        (directory / 'task1_four_settings.json').write_text(
+            json.dumps(report, indent=2, sort_keys=True), encoding='utf-8',
+        )
+        csv_text = io.StringIO()
+        writer = csv.DictWriter(csv_text, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(report['settings'])
+        (directory / 'task1_four_settings.csv').write_text(
+            csv_text.getvalue(), encoding='utf-8',
+        )
+        markdown = ['| ' + ' | '.join(columns) + ' |',
+                    '| ' + ' | '.join(['---'] * len(columns)) + ' |']
+        for row in report['settings']:
+            markdown.append('| ' + ' | '.join(
+                row[column] if column == 'setting' else f'{row[column]:.2f}'
+                for column in columns
+            ) + ' |')
+        (directory / 'task1_four_settings.md').write_text(
+            '\n'.join(markdown) + '\n', encoding='utf-8',
+        )
+        return {filename: {'type': suffix} for filename, suffix in (
+            ('task1_four_settings.json', 'json'),
+            ('task1_four_settings.csv', 'csv'),
+            ('task1_four_settings.md', 'markdown'),
+        )}
+
     def _run_taskwise_sap(self, dataset) -> None:
         if not 0 <= int(self.current_task) < int(dataset.N_TASKS):
             raise ValueError('task-wise SAP requires a valid task boundary')
@@ -501,6 +629,18 @@ class AerSap(ErAceAerAbs):
                             'logits', 'predictions', 'task_predictions'):
                     tensors[f'test_{name}_{key}.pt'] = result[key]
 
+            four_settings_report = None
+            if task_id == 1:
+                stage = 'task1_four_settings_analysis'
+                four_settings_report, analysis_tensors = self._analyze_task1_four_settings(
+                    dataset, x_l2, trusted_task_ids, weight_before, weight_after,
+                    bias_before, decisions['pre_sap'],
+                )
+                tensors.update(analysis_tensors)
+                for key, value in network_after.items():
+                    if not torch.equal(self.net.state_dict()[key], value):
+                        raise AssertionError(f'Task1 analysis changed formal network state: {key}')
+
             stage = 'artifact_save'
             final_directory.parent.mkdir(parents=True, exist_ok=True)
             if final_directory.exists():
@@ -513,6 +653,10 @@ class AerSap(ErAceAerAbs):
                 stage_directory, tensors, evidence['counts'], coverage,
                 accuracy, decision_stats,
             )
+            if four_settings_report is not None:
+                files.update(self._save_task1_four_settings_report(
+                    stage_directory, four_settings_report,
+                ))
             stage = 'taskwise_commit'
             self._install_classifier_candidate(classifier, weight_after, bias_before)
             self.past_model_ckpt = copy.deepcopy(self.net.state_dict())
