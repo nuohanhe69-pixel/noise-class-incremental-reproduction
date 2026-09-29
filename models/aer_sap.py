@@ -53,6 +53,10 @@ class AerSap(ErAceAerAbs):
             help='Use bias-free cosine logits from seen classifier rows during evaluation.',
         )
         group.add_argument(
+            '--training_loss', type=str, default='ce', choices=['ce', 'normalized_cosine_ce'],
+            help='Cross-entropy logits for current and replay training samples.',
+        )
+        group.add_argument(
             '--sap_oracle_reference', type=int, default=1, choices=[1],
             help='Oracle-clean references at each task boundary.',
         )
@@ -99,6 +103,17 @@ class AerSap(ErAceAerAbs):
         weight_norm = F.normalize(weight, p=2, dim=1)
         features_norm = F.normalize(features, p=2, dim=1)
         return scale * torch.matmul(features_norm, weight_norm.T)
+
+    def _observe_training_logits(self, inputs: torch.Tensor) -> torch.Tensor:
+        if getattr(self.args, 'training_loss', 'ce') == 'ce':
+            return super()._observe_training_logits(inputs)
+        classifier = resolve_classifier_module(self.net)
+        features = self.net(inputs, returnt='features')
+        if features.ndim != 2 or features.shape[1] != classifier.in_features:
+            raise ValueError('cosine training requires 2-D classifier-input features')
+        features_norm = F.normalize(features, p=2, dim=1)
+        weight_norm = F.normalize(classifier.weight, p=2, dim=1)
+        return torch.matmul(features_norm, weight_norm.T)
 
     def _should_store_buffer_metadata(self) -> bool:
         # Oracle cleanliness at the task boundary requires the true label of
