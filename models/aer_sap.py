@@ -11,6 +11,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 import torch
+from torch.nn import functional as F
 
 from models.dgc_sap import (
     DgcSap,
@@ -48,6 +49,10 @@ class AerSap(ErAceAerAbs):
         group = parser.add_argument_group('Power-Normalized Linear Oracle SAP')
         group.add_argument('--sap_batch_size', type=int, default=32)
         group.add_argument(
+            '--cosine_inference', type=int, default=0, choices=[0, 1],
+            help='Use bias-free cosine logits from seen classifier rows during evaluation.',
+        )
+        group.add_argument(
             '--sap_oracle_reference', type=int, default=1, choices=[1],
             help='Oracle-clean references at each task boundary.',
         )
@@ -65,6 +70,35 @@ class AerSap(ErAceAerAbs):
             raise ValueError('current-task SAP requires sap_oracle_scale=300')
         self.sap_history = []
         self._pending_task1_sap = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not getattr(self.args, 'cosine_inference', 0) or self.net.training:
+            return self.net(x)
+
+        classifier = resolve_classifier_module(self.net)
+        captured = []
+
+        def capture_input(_module, args):
+            captured.append(args[0])
+
+        handle = classifier.register_forward_pre_hook(capture_input)
+        try:
+            self.net(x)
+        finally:
+            handle.remove()
+        if len(captured) != 1 or captured[0].ndim != 2:
+            raise ValueError('cosine inference requires one 2-D classifier input')
+        features = captured[0]
+        if features.shape[1] != classifier.in_features:
+            raise ValueError('cosine inference feature width differs from classifier')
+        n_seen_classes = int(self.n_seen_classes)
+        if not 0 < n_seen_classes <= classifier.out_features:
+            raise ValueError('cosine inference requires valid seen-class count')
+        weight = classifier.weight[:n_seen_classes]
+        scale = weight.norm(p=2, dim=1).mean()
+        weight_norm = F.normalize(weight, p=2, dim=1)
+        features_norm = F.normalize(features, p=2, dim=1)
+        return scale * torch.matmul(features_norm, weight_norm.T)
 
     def _should_store_buffer_metadata(self) -> bool:
         # Oracle cleanliness at the task boundary requires the true label of

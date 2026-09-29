@@ -126,6 +126,7 @@ class AerSapBufferSampleIdTests(unittest.TestCase):
             return add_data(**kwargs)
 
         np.random.seed(0)
+        torch.manual_seed(0)
         with patch.object(model.buffer, 'add_data', side_effect=record_add_data):
             train_single_epoch(model, task0_loader, args, epoch=0,
                                pbar=_Progress(), system_tracker=lambda: None)
