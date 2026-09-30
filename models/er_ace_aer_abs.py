@@ -226,6 +226,9 @@ class ErAceAerAbs(ContinualModel):
     def _observe_training_logits(self, inputs, *, present=None, replay=False):
         return self.net(inputs)
 
+    def _observe_scoring_logits(self, inputs, *, present=None, replay=False):
+        return self.net(inputs)
+
     def observe(self, inputs, labels, not_aug_inputs, epoch, true_labels=None, sample_ids=None, source_task_ids=None):
 
         present = labels.unique()
@@ -244,7 +247,9 @@ class ErAceAerAbs(ContinualModel):
         logits = logits.masked_fill(mask == 0, torch.finfo(logits.dtype).min)
 
         with torch.no_grad():
-            not_aug_logits = self.net(apply_transform(not_aug_inputs, self.normalization_transform))
+            not_aug_logits = self._observe_scoring_logits(
+                apply_transform(not_aug_inputs, self.normalization_transform), present=present,
+            )
             not_aug_logits = not_aug_logits.masked_fill(mask == 0, torch.finfo(not_aug_logits.dtype).min)
             loss_not_aug_ext = self.loss(not_aug_logits, labels, reduction='none')
 
@@ -266,7 +271,7 @@ class ErAceAerAbs(ContinualModel):
             if self.args.sample_selection_strategy != 'reservoir':
                 with torch.no_grad():
                     # update scores for existing samples with not augmented data for best logits
-                    not_aug_buf_logits = self.net(not_aug_buf_inputs)
+                    not_aug_buf_logits = self._observe_scoring_logits(not_aug_buf_inputs, replay=True)
                     loss_not_aug_re_ext = self.loss(not_aug_buf_logits, buf_labels, reduction='none')
                     self.buffer.sample_selection_fn.update(buf_indexes, loss_not_aug_re_ext)
 

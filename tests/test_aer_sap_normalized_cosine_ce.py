@@ -1,4 +1,4 @@
-"""Normalized cosine CE applies only to observe's current and replay losses."""
+"""Normalized cosine CE and sample scores share the active-class geometry."""
 
 import argparse
 import copy
@@ -57,6 +57,11 @@ class _Buffer:
 
     def add_data(self, **kwargs):
         self.inserted = kwargs
+
+
+class _Shift(nn.Module):
+    def forward(self, inputs):
+        return inputs + torch.tensor([2., 0., 0., 0.])
 
 
 def _cosine_logits(net, inputs):
@@ -154,26 +159,58 @@ class AerSapNormalizedCosineCETests(unittest.TestCase):
                       true_labels=torch.tensor([2]), sample_ids=torch.tensor([20]))
         linear_current = reference_net(current)
         linear_current[:, :2] = torch.finfo(linear_current.dtype).min
+        torch.testing.assert_close(calls[0][0], linear_current, rtol=0, atol=0)
         torch.testing.assert_close(calls[1][0], linear_current, rtol=0, atol=0)
+        torch.testing.assert_close(calls[2][0], reference_net(memory), rtol=0, atol=0)
         torch.testing.assert_close(calls[3][0], reference_net(memory), rtol=0, atol=0)
+        expected_score = F.cross_entropy(reference_net(memory), torch.tensor([0]),
+                                         reduction='none')
+        torch.testing.assert_close(model.buffer.updated_scores[1], expected_score,
+                                   rtol=0, atol=0)
 
-    def test_task0_current_loss_uses_cosine_but_insertion_score_uses_linear_ce(self):
+    def test_task0_current_scoring_and_insertion_use_present_only_cosine(self):
         model, calls = _model('normalized_cosine_ce')
-        inputs = torch.tensor([[1., 2., 3., 4.], [2., 1., 4., 3.]])
-        not_aug = torch.tensor([[1., 1., 3., 4.], [2., 2., 4., 3.]])
-        labels = torch.tensor([0, 1])
+        model.args.alpha_sample_insertion = 0.75
+        inputs = torch.tensor([[1., 2., 3., 4.], [2., 1., 4., 3.],
+                               [3., 2., 1., 4.], [1., 4., 2., 3.]])
+        not_aug = torch.tensor([[1., 1., 3., 4.], [2., 2., 4., 3.],
+                                [4., 1., 2., 3.], [2., 3., 1., 4.]])
+        labels = torch.tensor([0, 1, 0, 1])
+        sample_ids = torch.tensor([10, 11, 12, 13])
         model.observe(inputs, labels, not_aug, epoch=0, true_labels=labels,
-                      sample_ids=torch.tensor([10, 11]))
+                      sample_ids=sample_ids)
         self.assertEqual(len(calls), 2)
-        torch.testing.assert_close(calls[0][0], model.net(not_aug), rtol=0, atol=0)
+        scoring_cosine = _cosine_logits(model.net, not_aug)
+        scoring_cosine[:, 2:] = torch.finfo(scoring_cosine.dtype).min
+        torch.testing.assert_close(calls[0][0], scoring_cosine, rtol=0, atol=0)
         current_cosine = _cosine_logits(model.net, inputs)
         current_cosine[:, 2:] = torch.finfo(current_cosine.dtype).min
         torch.testing.assert_close(calls[1][0], current_cosine, rtol=0, atol=0)
         self.assertEqual([call[2] for call in calls], ['none', 'mean'])
-        scores = F.cross_entropy(model.net(not_aug), labels, reduction='none')
+        scores = F.cross_entropy(scoring_cosine, labels, reduction='none')
+        selected = torch.topk(scores, 1, largest=False).indices
         torch.testing.assert_close(model.buffer.inserted['sample_selection_scores'],
-                                   scores, rtol=0, atol=0)
+                                   scores[selected], rtol=0, atol=0)
+        torch.testing.assert_close(model.buffer.inserted['examples'], not_aug[selected],
+                                   rtol=0, atol=0)
+        self.assertTrue(torch.equal(model.buffer.inserted['labels'], labels[selected]))
+        self.assertTrue(torch.equal(model.buffer.inserted['sample_ids'], sample_ids[selected]))
         self.assertIsNone(model.net.classifier.bias.grad)
+
+    def test_scoring_ignores_bias_and_normalizes_not_aug_inputs(self):
+        model, calls = _model('normalized_cosine_ce')
+        model.normalization_transform = _Shift()
+        with torch.no_grad():
+            model.net.classifier.bias.fill_(float('nan'))
+        inputs = torch.tensor([[1., 2., 3., 4.], [2., 1., 4., 3.]])
+        not_aug = torch.tensor([[1., 1., 3., 4.], [2., 2., 4., 3.]])
+        labels = torch.tensor([0, 1])
+        model.observe(inputs, labels, not_aug, epoch=0)
+        expected = _cosine_logits(model.net, not_aug + torch.tensor([2., 0., 0., 0.]))
+        expected[:, 2:] = torch.finfo(expected.dtype).min
+        torch.testing.assert_close(calls[0][0], expected, rtol=0, atol=0)
+        self.assertTrue(torch.isfinite(calls[0][0]).all())
+        self.assertTrue(torch.isfinite(model.buffer.inserted['sample_selection_scores']).all())
 
     def test_current_present_only_and_replay_seen_only_gradients(self):
         model, _ = _model('normalized_cosine_ce', task=1, num_classes=6)
@@ -210,7 +247,7 @@ class AerSapNormalizedCosineCETests(unittest.TestCase):
         self.assertGreater(replay_grad[:4].abs().sum().item(), 0)
         self.assertTrue(torch.equal(replay_grad[4:], torch.zeros_like(replay_grad[4:])))
 
-    def test_task1_current_and_replay_backprop_cosine_with_original_scoring_and_mask(self):
+    def test_task1_current_and_replay_scores_match_training_geometry(self):
         current = torch.tensor([[1., 2., 3., 4.], [2., 1., 4., 3.]])
         not_aug_current = torch.tensor([[1., 1., 3., 4.], [2., 2., 4., 3.]])
         memory = torch.tensor([[4., 3., 2., 1.]])
@@ -220,25 +257,26 @@ class AerSapNormalizedCosineCETests(unittest.TestCase):
         model, calls = _model('normalized_cosine_ce', task=1, replay=replay,
                               num_classes=6)
         reference_net = copy.deepcopy(model.net)
+        with torch.no_grad():
+            model.net.classifier.bias.fill_(float('nan'))
         weight_before = model.net.classifier.weight.detach().clone()
         current_labels = torch.tensor([2, 3])
         loss = model.observe(current, current_labels, not_aug_current, epoch=1,
                              true_labels=current_labels, sample_ids=torch.tensor([20, 21]))
         self.assertEqual(len(calls), 4)
         current_cosine = _cosine_logits(reference_net, current)
-        scoring_mask = torch.zeros_like(current_cosine)
-        scoring_mask[:, 2:] = 1
         masked_cosine = current_cosine.clone()
         masked_cosine[:, :2] = torch.finfo(current_cosine.dtype).min
         masked_cosine[:, 4:] = torch.finfo(current_cosine.dtype).min
-        current_linear = reference_net(not_aug_current).masked_fill(
-            scoring_mask == 0, torch.finfo(current_cosine.dtype).min,
-        )
-        memory_linear = reference_net(not_aug_memory)
+        current_scoring = _cosine_logits(reference_net, not_aug_current)
+        current_scoring[:, :2] = torch.finfo(current_scoring.dtype).min
+        current_scoring[:, 4:] = torch.finfo(current_scoring.dtype).min
+        memory_scoring = _cosine_logits(reference_net, not_aug_memory)
+        memory_scoring[:, 4:] = torch.finfo(memory_scoring.dtype).min
         memory_cosine = _cosine_logits(reference_net, memory)
         memory_cosine[:, 4:] = torch.finfo(memory_cosine.dtype).min
         for actual, expected in zip(calls, (
-            current_linear, masked_cosine, memory_linear, memory_cosine,
+            current_scoring, masked_cosine, memory_scoring, memory_cosine,
         )):
             torch.testing.assert_close(actual[0], expected, rtol=0, atol=0)
         self.assertEqual([call[2] for call in calls], ['none', 'mean', 'none', 'mean'])
@@ -249,7 +287,7 @@ class AerSapNormalizedCosineCETests(unittest.TestCase):
                                     torch.full_like(calls[1][0][:, 4:],
                                                     torch.finfo(current_cosine.dtype).min)))
         torch.testing.assert_close(calls[3][0], memory_cosine, rtol=0, atol=0)
-        expected_score = F.cross_entropy(memory_linear, torch.tensor([0]),
+        expected_score = F.cross_entropy(memory_scoring, torch.tensor([0]),
                                          reduction='none')
         self.assertTrue(torch.equal(model.buffer.updated_scores[0], memory_indexes))
         torch.testing.assert_close(model.buffer.updated_scores[1], expected_score,

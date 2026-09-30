@@ -129,6 +129,13 @@ class AerSap(ErAceAerAbs):
             return logits.masked_fill(~active, torch.finfo(logits.dtype).min)
         return logits
 
+    def _observe_scoring_logits(
+        self, inputs: torch.Tensor, *, present=None, replay=False,
+    ) -> torch.Tensor:
+        if getattr(self.args, 'training_loss', 'ce') == 'ce':
+            return super()._observe_scoring_logits(inputs)
+        return self._observe_training_logits(inputs, present=present, replay=replay)
+
     def _should_store_buffer_metadata(self) -> bool:
         # Oracle cleanliness at the task boundary requires the true label of
         # every retained buffer item; this does not affect AER sampling/training.
