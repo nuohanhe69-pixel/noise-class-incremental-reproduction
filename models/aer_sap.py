@@ -57,8 +57,13 @@ class AerSap(ErAceAerAbs):
             help='Use bias-free cosine logits from seen classifier rows during evaluation.',
         )
         group.add_argument(
-            '--training_loss', type=str, default='ce', choices=['ce', 'normalized_cosine_ce'],
+            '--training_loss', type=str, default='ce',
+            choices=['ce', 'normalized_cosine_ce', 'scale_cosine_ce'],
             help='Cross-entropy logits for current and replay training samples.',
+        )
+        group.add_argument(
+            '--scale_cosine_scoring_scale', type=int, default=1, choices=[1, 64],
+            help='ABS scoring scale for scale_cosine_ce (training always uses scale 64).',
         )
         group.add_argument(
             '--sap_oracle_reference', type=int, default=1, choices=[1],
@@ -111,8 +116,15 @@ class AerSap(ErAceAerAbs):
     def _observe_training_logits(
         self, inputs: torch.Tensor, *, present=None, replay=False,
     ) -> torch.Tensor:
-        if getattr(self.args, 'training_loss', 'ce') == 'ce':
+        training_loss = getattr(self.args, 'training_loss', 'ce')
+        if training_loss == 'ce':
             return super()._observe_training_logits(inputs)
+        scale = 64 if training_loss == 'scale_cosine_ce' else 1
+        return self._observe_cosine_logits(inputs, scale=scale, present=present, replay=replay)
+
+    def _observe_cosine_logits(
+        self, inputs: torch.Tensor, *, scale: int, present=None, replay=False,
+    ) -> torch.Tensor:
         classifier = resolve_classifier_module(self.net)
         features = self.net(inputs, returnt='features')
         if features.ndim != 2 or features.shape[1] != classifier.in_features:
@@ -120,6 +132,8 @@ class AerSap(ErAceAerAbs):
         features_norm = F.normalize(features, p=2, dim=1)
         weight_norm = F.normalize(classifier.weight, p=2, dim=1)
         logits = torch.matmul(features_norm, weight_norm.T)
+        if scale != 1:
+            logits = logits * scale
         if present is not None:
             active = torch.zeros(logits.shape[1], dtype=torch.bool, device=logits.device)
             active[present] = True
@@ -132,8 +146,14 @@ class AerSap(ErAceAerAbs):
     def _observe_scoring_logits(
         self, inputs: torch.Tensor, *, present=None, replay=False,
     ) -> torch.Tensor:
-        if getattr(self.args, 'training_loss', 'ce') == 'ce':
+        training_loss = getattr(self.args, 'training_loss', 'ce')
+        if training_loss == 'ce':
             return super()._observe_scoring_logits(inputs)
+        if training_loss == 'scale_cosine_ce':
+            return self._observe_cosine_logits(
+                inputs, scale=self.args.scale_cosine_scoring_scale,
+                present=present, replay=replay,
+            )
         return self._observe_training_logits(inputs, present=present, replay=replay)
 
     def _should_store_buffer_metadata(self) -> bool:

@@ -2,6 +2,8 @@
 
 import argparse
 import copy
+import contextlib
+import io
 import unittest
 from types import SimpleNamespace
 
@@ -71,12 +73,22 @@ def _cosine_logits(net, inputs):
     ).T
 
 
-def _model(training_loss, *, task=0, replay=None, num_classes=4):
+def _scoped_cosine_logits(net, inputs, scale, active_classes):
+    logits = _cosine_logits(net, inputs)
+    if scale != 1:
+        logits = logits * scale
+    inactive = torch.ones(logits.shape[1], dtype=torch.bool)
+    inactive[active_classes] = False
+    return logits.masked_fill(inactive, torch.finfo(logits.dtype).min)
+
+
+def _model(training_loss, *, task=0, replay=None, num_classes=4, scoring_scale=1):
     model = AerSap.__new__(AerSap)
     nn.Module.__init__(model)
     model.net = _FeatureNet(num_classes)
     model.args = SimpleNamespace(
         training_loss=training_loss, cosine_inference=0,
+        scale_cosine_scoring_scale=scoring_scale,
         use_aer=1, n_epochs=3, minibatch_size=1,
         sample_selection_strategy='abs', alpha_sample_insertion=0.0,
     )
@@ -128,6 +140,7 @@ class AerSapNormalizedCosineCETests(unittest.TestCase):
     def test_cli_default_and_original_training_logits(self):
         parser = AerSap.get_parser(argparse.ArgumentParser(add_help=False))
         self.assertEqual(parser.parse_args(['--buffer_size', '4']).training_loss, 'ce')
+        self.assertEqual(parser.parse_args(['--buffer_size', '4']).scale_cosine_scoring_scale, 1)
         self.assertEqual(parser.parse_args([
             '--buffer_size', '4', '--training_loss', 'normalized_cosine_ce',
         ]).training_loss, 'normalized_cosine_ce')
@@ -306,6 +319,162 @@ class AerSapNormalizedCosineCETests(unittest.TestCase):
         self.assertIsNone(model.net.classifier.bias.grad)
         self.assertTrue(torch.equal(model.net.classifier.weight, weight_before))
         self.assertIsNone(model.buffer.inserted)
+
+    def test_scale_cosine_parser_accepts_only_scoring_scale_1_or_64(self):
+        parser = AerSap.get_parser(argparse.ArgumentParser(add_help=False))
+        for scoring_scale in (1, 64):
+            parsed = parser.parse_args([
+                '--buffer_size', '4', '--training_loss', 'scale_cosine_ce',
+                '--scale_cosine_scoring_scale', str(scoring_scale),
+            ])
+            self.assertEqual(parsed.scale_cosine_scoring_scale, scoring_scale)
+        with contextlib.redirect_stderr(io.StringIO()):
+            for invalid in ('0', '16', '32', '128'):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args([
+                        '--buffer_size', '4', '--scale_cosine_scoring_scale', invalid,
+                    ])
+
+    def test_scale_cosine_training_scope_and_future_row_gradients(self):
+        model, _ = _model('scale_cosine_ce', task=1, num_classes=6)
+        inputs = torch.tensor([[1., 2., 3., 4.], [2., 1., 4., 3.]])
+        labels = torch.tensor([2, 3])
+        original_weight = model.net.classifier.weight.detach().clone()
+        with torch.no_grad():
+            model.net.classifier.bias.fill_(float('nan'))
+
+        current = model._observe_training_logits(inputs, present=labels.unique())
+        expected_current = _scoped_cosine_logits(model.net, inputs, 64, labels.unique())
+        torch.testing.assert_close(current, expected_current, rtol=0, atol=0)
+        F.cross_entropy(current, labels).backward()
+        current_grad = model.net.classifier.weight.grad.clone()
+        self.assertTrue(torch.equal(current_grad[:2], torch.zeros_like(current_grad[:2])))
+        self.assertGreater(current_grad[2:4].abs().sum().item(), 0)
+        self.assertTrue(torch.equal(current_grad[4:], torch.zeros_like(current_grad[4:])))
+
+        model.net.zero_grad(set_to_none=True)
+        replay = model._observe_training_logits(inputs, replay=True)
+        expected_replay = _scoped_cosine_logits(model.net, inputs, 64, slice(0, 4))
+        torch.testing.assert_close(replay, expected_replay, rtol=0, atol=0)
+        F.cross_entropy(replay, torch.tensor([0, 2])).backward()
+        replay_grad = model.net.classifier.weight.grad
+        self.assertGreater(replay_grad[:4].abs().sum().item(), 0)
+        self.assertTrue(torch.equal(replay_grad[4:], torch.zeros_like(replay_grad[4:])))
+        self.assertIsNone(model.net.classifier.bias.grad)
+        self.assertTrue(torch.equal(model.net.classifier.weight, original_weight))
+
+    def test_scale_cosine_e1_e2_share_training_loss_and_gradients(self):
+        current = torch.tensor([[1., 2., 3., 4.], [2., 1., 4., 3.]])
+        not_aug_current = torch.tensor([[1., 1., 3., 4.], [2., 2., 4., 3.]])
+        memory = torch.tensor([[4., 3., 2., 1.]])
+        not_aug_memory = torch.tensor([[3., 3., 1., 2.]])
+        replay = (torch.tensor([7]), not_aug_memory, memory, torch.tensor([0]))
+        labels = torch.tensor([2, 3])
+        outputs = []
+        for scoring_scale in (1, 64):
+            model, calls = _model('scale_cosine_ce', task=1, replay=replay,
+                                  num_classes=6, scoring_scale=scoring_scale)
+            weight_before = model.net.classifier.weight.detach().clone()
+            with torch.no_grad():
+                model.net.classifier.bias.fill_(float('nan'))
+            loss = model.observe(current, labels, not_aug_current, epoch=1)
+            expected_current_scoring = _scoped_cosine_logits(
+                model.net, not_aug_current, scoring_scale, labels.unique(),
+            )
+            expected_replay_scoring = _scoped_cosine_logits(
+                model.net, not_aug_memory, scoring_scale, slice(0, 4),
+            )
+            expected_current_training = _scoped_cosine_logits(
+                model.net, current, 64, labels.unique(),
+            )
+            expected_replay_training = _scoped_cosine_logits(
+                model.net, memory, 64, slice(0, 4),
+            )
+            for actual, expected in zip(calls, (
+                expected_current_scoring, expected_current_training,
+                expected_replay_scoring, expected_replay_training,
+            )):
+                torch.testing.assert_close(actual[0], expected, rtol=0, atol=0)
+            self.assertEqual([call[2] for call in calls], ['none', 'mean', 'none', 'mean'])
+            expected_score = F.cross_entropy(expected_replay_scoring, replay[3],
+                                             reduction='none')
+            self.assertTrue(torch.equal(model.buffer.updated_scores[0], replay[0]))
+            torch.testing.assert_close(model.buffer.updated_scores[1], expected_score,
+                                       rtol=0, atol=0)
+            self.assertIsNone(model.buffer.inserted)
+            self.assertIsNone(model.net.classifier.bias.grad)
+            self.assertTrue(torch.equal(model.net.classifier.weight, weight_before))
+            outputs.append((model, calls, loss))
+
+        e1_model, e1_calls, e1_loss = outputs[0]
+        e2_model, e2_calls, e2_loss = outputs[1]
+        self.assertEqual(e1_loss, e2_loss)
+        for index in (1, 3):
+            self.assertTrue(torch.equal(e1_calls[index][0], e2_calls[index][0]))
+        for parameter_name in ('backbone.weight', 'classifier.weight'):
+            e1_parameter = dict(e1_model.net.named_parameters())[parameter_name]
+            e2_parameter = dict(e2_model.net.named_parameters())[parameter_name]
+            self.assertTrue(torch.equal(e1_parameter.grad, e2_parameter.grad))
+            self.assertTrue(torch.equal(e1_parameter, e2_parameter))
+        self.assertFalse(torch.equal(e1_model.buffer.updated_scores[1],
+                                     e2_model.buffer.updated_scores[1]))
+
+    def test_scale_cosine_insertion_scores_follow_selected_scoring_scale(self):
+        inputs = torch.tensor([[1., 2., 3., 4.], [2., 1., 4., 3.],
+                               [3., 2., 1., 4.], [1., 4., 2., 3.]])
+        not_aug = torch.tensor([[1., 1., 3., 4.], [2., 2., 4., 3.],
+                                [4., 1., 2., 3.], [2., 3., 1., 4.]])
+        labels = torch.tensor([0, 1, 0, 1])
+        sample_ids = torch.tensor([10, 11, 12, 13])
+        for scoring_scale in (1, 64):
+            with self.subTest(scoring_scale=scoring_scale):
+                model, calls = _model('scale_cosine_ce', scoring_scale=scoring_scale)
+                model.args.alpha_sample_insertion = 0.75
+                model.observe(inputs, labels, not_aug, epoch=0,
+                              true_labels=labels, sample_ids=sample_ids)
+                scoring_logits = _scoped_cosine_logits(
+                    model.net, not_aug, scoring_scale, labels.unique(),
+                )
+                training_logits = _scoped_cosine_logits(
+                    model.net, inputs, 64, labels.unique(),
+                )
+                torch.testing.assert_close(calls[0][0], scoring_logits, rtol=0, atol=0)
+                torch.testing.assert_close(calls[1][0], training_logits, rtol=0, atol=0)
+                scores = F.cross_entropy(scoring_logits, labels, reduction='none')
+                selected = torch.topk(scores, 1, largest=False).indices
+                inserted = model.buffer.inserted
+                self.assertEqual(len(inserted['examples']), 1)
+                torch.testing.assert_close(inserted['sample_selection_scores'],
+                                           scores[selected], rtol=0, atol=0)
+                self.assertTrue(torch.equal(inserted['sample_ids'], sample_ids[selected]))
+                self.assertTrue(torch.equal(inserted['labels'], labels[selected]))
+                torch.testing.assert_close(inserted['examples'], not_aug[selected],
+                                           rtol=0, atol=0)
+
+    def test_existing_modes_ignore_scale_cosine_scoring_option(self):
+        inputs = torch.tensor([[1., 2., 3., 4.], [2., 1., 4., 3.]])
+        for training_loss in ('ce', 'normalized_cosine_ce'):
+            models = [_model(training_loss, task=1, num_classes=6,
+                             scoring_scale=scale)[0] for scale in (1, 64)]
+            for replay, present in ((False, torch.tensor([2, 3])), (True, None)):
+                training = [model._observe_training_logits(
+                    inputs, present=present, replay=replay,
+                ) for model in models]
+                scoring = [model._observe_scoring_logits(
+                    inputs, present=present, replay=replay,
+                ) for model in models]
+                self.assertTrue(torch.equal(training[0], training[1]))
+                self.assertTrue(torch.equal(scoring[0], scoring[1]))
+                if training_loss == 'ce':
+                    self.assertTrue(torch.equal(training[0], models[0].net(inputs)))
+                    self.assertTrue(torch.equal(scoring[0], models[0].net(inputs)))
+                else:
+                    expected = _scoped_cosine_logits(
+                        models[0].net, inputs, 1,
+                        present if present is not None else slice(0, 4),
+                    )
+                    torch.testing.assert_close(training[0], expected, rtol=0, atol=0)
+                    torch.testing.assert_close(scoring[0], expected, rtol=0, atol=0)
 
 
 if __name__ == '__main__':
