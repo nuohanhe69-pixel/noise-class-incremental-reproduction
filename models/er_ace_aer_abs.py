@@ -223,7 +223,7 @@ class ErAceAerAbs(ContinualModel):
             # the epoch was a buffer fitting epoch, save the model checkpoint
             self.save_model_checkpoint()
 
-    def _observe_training_logits(self, inputs):
+    def _observe_training_logits(self, inputs, *, present=None, replay=False):
         return self.net(inputs)
 
     def observe(self, inputs, labels, not_aug_inputs, epoch, true_labels=None, sample_ids=None, source_task_ids=None):
@@ -232,7 +232,7 @@ class ErAceAerAbs(ContinualModel):
 
         self.seen_so_far = torch.cat([self.seen_so_far, present]).unique()
 
-        logits = self._observe_training_logits(inputs)
+        logits = self._observe_training_logits(inputs, present=present)
 
         mask = torch.zeros_like(logits)
         mask[:, present] = 1
@@ -272,7 +272,7 @@ class ErAceAerAbs(ContinualModel):
 
             # replay if AER is disabled or if epoch is odd (or last)
             # if not self.args.use_aer or self.is_aer_fitting_epoch(epoch):
-            buf_logits = self._observe_training_logits(buf_inputs)
+            buf_logits = self._observe_training_logits(buf_inputs, replay=True)
             loss_re = self.loss(buf_logits, buf_labels)
 
             if self.args.use_aer and epoch % 2 == 0:

@@ -108,7 +108,9 @@ class AerSap(ErAceAerAbs):
         features_norm = F.normalize(features, p=2, dim=1)
         return scale * torch.matmul(features_norm, weight_norm.T)
 
-    def _observe_training_logits(self, inputs: torch.Tensor) -> torch.Tensor:
+    def _observe_training_logits(
+        self, inputs: torch.Tensor, *, present=None, replay=False,
+    ) -> torch.Tensor:
         if getattr(self.args, 'training_loss', 'ce') == 'ce':
             return super()._observe_training_logits(inputs)
         classifier = resolve_classifier_module(self.net)
@@ -117,7 +119,15 @@ class AerSap(ErAceAerAbs):
             raise ValueError('cosine training requires 2-D classifier-input features')
         features_norm = F.normalize(features, p=2, dim=1)
         weight_norm = F.normalize(classifier.weight, p=2, dim=1)
-        return torch.matmul(features_norm, weight_norm.T)
+        logits = torch.matmul(features_norm, weight_norm.T)
+        if present is not None:
+            active = torch.zeros(logits.shape[1], dtype=torch.bool, device=logits.device)
+            active[present] = True
+            return logits.masked_fill(~active, torch.finfo(logits.dtype).min)
+        if replay:
+            active = torch.arange(logits.shape[1], device=logits.device) < self.n_seen_classes
+            return logits.masked_fill(~active, torch.finfo(logits.dtype).min)
+        return logits
 
     def _should_store_buffer_metadata(self) -> bool:
         # Oracle cleanliness at the task boundary requires the true label of
