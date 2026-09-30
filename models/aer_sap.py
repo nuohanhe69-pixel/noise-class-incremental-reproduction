@@ -10,7 +10,7 @@ import logging
 import random
 import shutil
 import tempfile
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +38,16 @@ from utils.sap import (
 SAP_SKIPPED_AFTER_SECOND_BOUNDARY = 'SAP_SKIPPED_AFTER_SECOND_BOUNDARY'
 TASKWISE_SAP_STARTED = 'TASKWISE_SAP_STARTED'
 TASK_REFERENCE_EMPTY = 'TASK_REFERENCE_EMPTY'
+
+
+def _sap_incremental_beta(value: str) -> float:
+    try:
+        beta = float(value)
+    except ValueError as error:
+        raise ArgumentTypeError('sap_incremental_beta must be in (0, 1]') from error
+    if not 0.0 < beta <= 1.0:
+        raise ArgumentTypeError('sap_incremental_beta must be in (0, 1]')
+    return beta
 
 
 def normalized_cross_entropy(logits: torch.Tensor, labels: torch.Tensor,
@@ -96,6 +106,10 @@ class AerSap(ErAceAerAbs):
         group.add_argument(
             '--sap_oracle_scale', type=float, default=300.0,
             help='SAP scale coefficient for the final Linear projection.',
+        )
+        group.add_argument(
+            '--sap_incremental_beta', type=_sap_incremental_beta, default=1.0,
+            help='Task1+ current-task SAP strength; Task0 always uses full SAP.',
         )
         return parser
 
@@ -448,7 +462,7 @@ class AerSap(ErAceAerAbs):
 
     def _analyze_task1_four_settings(
         self, dataset, x_l2, trusted_task_ids, weight_before, weight_after,
-        bias_before, pre_sap_decisions,
+        bias_before, pre_sap_decisions, formal_weight_after=None,
     ) -> tuple[dict, dict]:
         """Evaluate Task1 counterfactual weights without changing the SAP commit."""
         old_mask = trusted_task_ids.to(x_l2.device) == 0
@@ -523,7 +537,11 @@ class AerSap(ErAceAerAbs):
                     ):
                         tensors[f'{prefix}_{output_name}.pt'] = decisions[key]
         finally:
-            self._install_classifier_candidate(classifier, weight_after, bias_before)
+            self._install_classifier_candidate(
+                classifier,
+                weight_after if formal_weight_after is None else formal_weight_after,
+                bias_before,
+            )
             if original_flag is missing_flag:
                 delattr(self.args, 'cosine_inference')
             else:
@@ -575,7 +593,15 @@ class AerSap(ErAceAerAbs):
             raise ValueError('task-wise SAP requires a valid task boundary')
         if float(self.args.sap_oracle_scale) != 300.0:
             raise ValueError('current-task SAP requires sap_oracle_scale=300')
-        self._record_sap_event(status=TASKWISE_SAP_STARTED, sap_alpha=300.0)
+        task_id = int(self.current_task)
+        incremental_beta = float(getattr(self.args, 'sap_incremental_beta', 1.0))
+        if not 0.0 < incremental_beta <= 1.0:
+            raise ValueError('sap_incremental_beta must be in (0, 1]')
+        effective_beta = 1.0 if task_id == 0 else incremental_beta
+        self._record_sap_event(
+            status=TASKWISE_SAP_STARTED, sap_alpha=300.0,
+            effective_beta=effective_beta, sap_incremental_beta=incremental_beta,
+        )
         history_start = len(self.sap_history)
         network_before = copy.deepcopy(self.net.state_dict())
         had_past = hasattr(self, 'past_model_ckpt')
@@ -646,7 +672,6 @@ class AerSap(ErAceAerAbs):
                 'X_raw.pt': x_raw, 'X_l2.pt': x_l2,
                 'W_before.pt': weight_before, 'bias_before.pt': bias_before,
             }
-            task_id = int(self.current_task)
             mask = trusted_task_ids.to(x_l2.device) == task_id
             task_x_raw = x_raw[mask]
             task_x = x_l2[mask]
@@ -658,7 +683,18 @@ class AerSap(ErAceAerAbs):
             task_weight, _ = project_linear_weight(
                 weight_before[start_c:end_c, :], matrix,
             )
-            weight_after[start_c:end_c, :] = task_weight
+            weight_full_sap = weight_before.clone()
+            weight_full_sap[start_c:end_c, :] = task_weight
+            if effective_beta == 1.0:
+                effective_matrix = matrix
+                weight_after[start_c:end_c, :] = task_weight
+            else:
+                identity = torch.eye(matrix.shape[0], dtype=matrix.dtype, device=matrix.device)
+                effective_matrix = identity + effective_beta * (matrix - identity)
+                weight_after[start_c:end_c, :] = (
+                    weight_before[start_c:end_c, :]
+                    + effective_beta * (task_weight - weight_before[start_c:end_c, :])
+                )
             projected[start_c:end_c] = True
             tensors.update({
                 f'X_raw_task_{task_id}.pt': task_x_raw,
@@ -669,6 +705,8 @@ class AerSap(ErAceAerAbs):
                 f'eigenvectors_task_{task_id}.pt': eigenvectors,
                 f'importance_task_{task_id}.pt': importance,
                 f'M_task_{task_id}.pt': matrix,
+                f'M_effective_task_{task_id}.pt': effective_matrix,
+                'W_full_sap.pt': weight_full_sap,
             })
             if not torch.equal(weight_after[~projected], weight_before[~projected]):
                 raise AssertionError('SAP changed non-current classifier rows')
@@ -704,9 +742,10 @@ class AerSap(ErAceAerAbs):
             four_settings_report = None
             if task_id == 1:
                 stage = 'task1_four_settings_analysis'
+                # Keep full-SAP counterfactuals separate from the formal partial state.
                 four_settings_report, analysis_tensors = self._analyze_task1_four_settings(
-                    dataset, x_l2, trusted_task_ids, weight_before, weight_after,
-                    bias_before, decisions['pre_sap'],
+                    dataset, x_l2, trusted_task_ids, weight_before, weight_full_sap,
+                    bias_before, decisions['pre_sap'], formal_weight_after=weight_after,
                 )
                 tensors.update(analysis_tensors)
                 for key, value in network_after.items():
@@ -738,6 +777,7 @@ class AerSap(ErAceAerAbs):
             self._record_sap_event(
                 status=SAP_ORACLE_EXECUTED, sap_alpha=300.0,
                 seen_tasks=seen_tasks, projection_scope='current_task_only',
+                effective_beta=effective_beta, sap_incremental_beta=incremental_beta,
                 total_reference_count=count, reference_stats=reference_stats,
                 feature_norm_stats=feature_norm_stats,
                 accuracy=accuracy, coverage=coverage,
@@ -747,6 +787,8 @@ class AerSap(ErAceAerAbs):
                 'experiment_name': 'double_boundary_taskwise_sap_v1',
                 'boundary_task_id': int(self.current_task),
                 'seen_tasks': seen_tasks, 'sap_alpha': 300.0,
+                'effective_beta': effective_beta,
+                'sap_incremental_beta': incremental_beta,
                 'reference_count': count, 'projection_scope': 'current_task_only',
                 'expected_sap': True, 'started': True, 'succeeded': True,
                 'artifact_complete': True, 'valid': True,
