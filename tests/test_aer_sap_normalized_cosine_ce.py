@@ -1,4 +1,4 @@
-"""Normalized cosine CE and sample scores share the active-class geometry."""
+"""AER-SAP training losses, class scopes, and ABS scoring controls."""
 
 import argparse
 import copy
@@ -12,7 +12,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from backbone.ResNetBlock import resnet18
-from models.aer_sap import AerSap
+from models.aer_sap import AerSap, normalized_cross_entropy
 
 
 class _FeatureNet(nn.Module):
@@ -82,13 +82,15 @@ def _scoped_cosine_logits(net, inputs, scale, active_classes):
     return logits.masked_fill(inactive, torch.finfo(logits.dtype).min)
 
 
-def _model(training_loss, *, task=0, replay=None, num_classes=4, scoring_scale=1):
+def _model(training_loss, *, task=0, replay=None, num_classes=4, scoring_scale=1,
+           nce_ace_scope='baseline'):
     model = AerSap.__new__(AerSap)
     nn.Module.__init__(model)
     model.net = _FeatureNet(num_classes)
     model.args = SimpleNamespace(
         training_loss=training_loss, cosine_inference=0,
         scale_cosine_scoring_scale=scoring_scale,
+        nce_ace_scope=nce_ace_scope,
         use_aer=1, n_epochs=3, minibatch_size=1,
         sample_selection_strategy='abs', alpha_sample_insertion=0.0,
     )
@@ -475,6 +477,182 @@ class AerSapNormalizedCosineCETests(unittest.TestCase):
                     )
                     torch.testing.assert_close(training[0], expected, rtol=0, atol=0)
                     torch.testing.assert_close(scoring[0], expected, rtol=0, atol=0)
+
+
+def _capture_training_calls(model):
+    calls = []
+    original = model._compute_training_loss
+
+    def capture(logits, labels, reduction='mean'):
+        calls.append((logits.detach().clone(), labels.detach().clone(), reduction))
+        return original(logits, labels, reduction=reduction)
+
+    model._compute_training_loss = capture
+    return calls
+
+
+class AerSapNCETests(unittest.TestCase):
+    def test_nce_parser_defaults_and_choices(self):
+        parser = AerSap.get_parser(argparse.ArgumentParser(add_help=False))
+        default = parser.parse_args(['--buffer_size', '4'])
+        self.assertEqual(default.training_loss, 'ce')
+        self.assertEqual(default.nce_ace_scope, 'baseline')
+        for scope in ('baseline', 'aligned'):
+            parsed = parser.parse_args([
+                '--buffer_size', '4', '--training_loss', 'nce', '--nce_ace_scope', scope,
+            ])
+            self.assertEqual((parsed.training_loss, parsed.nce_ace_scope), ('nce', scope))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(['--buffer_size', '4', '--nce_ace_scope', 'other'])
+
+    def test_nce_math_reductions_and_masked_denominator(self):
+        logits = torch.tensor([[2., 0., -1.], [-0.5, 1., 0.5]], requires_grad=True)
+        labels = torch.tensor([0, 2])
+        negative_log_probs = -F.log_softmax(logits, dim=1)
+        expected = negative_log_probs.gather(1, labels[:, None]).squeeze(1) / (
+            negative_log_probs.sum(dim=1)
+        )
+        actual = normalized_cross_entropy(logits, labels, reduction='none')
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(normalized_cross_entropy(logits, labels), expected.mean(),
+                                   rtol=0, atol=0)
+
+        masked = torch.tensor([[2., 0., torch.finfo(torch.float32).min,
+                                torch.finfo(torch.float32).min]], requires_grad=True)
+        pair_ce = -F.log_softmax(masked[:, :2], dim=1)
+        expected_masked = pair_ce[0, 0] / pair_ce.sum()
+        actual_masked = normalized_cross_entropy(masked, torch.tensor([0]))
+        torch.testing.assert_close(actual_masked, expected_masked, rtol=0, atol=0)
+        self.assertTrue(torch.isfinite(actual_masked))
+        actual_masked.backward()
+        self.assertTrue(torch.isfinite(masked.grad).all())
+        self.assertTrue(torch.equal(masked.grad[:, 2:], torch.zeros_like(masked.grad[:, 2:])))
+        with self.assertRaisesRegex(ValueError, 'target class must be active'):
+            normalized_cross_entropy(masked.detach(), torch.tensor([2]))
+        single_active = torch.tensor([[2., torch.finfo(torch.float32).min]])
+        self.assertEqual(normalized_cross_entropy(single_active, torch.tensor([0])).item(), 0.)
+
+    def test_nce_linear_training_scopes_and_linear_ce_abs_scores(self):
+        current = torch.tensor([[1., 2., 3., 4.], [2., 1., 4., 3.]])
+        not_aug_current = torch.tensor([[1., 1., 3., 4.], [2., 2., 4., 3.]])
+        labels = torch.tensor([2, 3])
+        memory = torch.tensor([[4., 3., 2., 1.]])
+        not_aug_memory = torch.tensor([[3., 3., 1., 2.]])
+        replay = (torch.tensor([7]), not_aug_memory, memory, torch.tensor([0]))
+        results = {}
+        for scope in ('baseline', 'aligned'):
+            model, ce_calls = _model('nce', task=1, replay=replay, num_classes=6,
+                                     nce_ace_scope=scope)
+            reference_net = copy.deepcopy(model.net)
+            training_calls = _capture_training_calls(model)
+            loss = model.observe(current, labels, not_aug_current, epoch=1)
+            self.assertTrue(torch.isfinite(torch.tensor(loss)))
+            self.assertEqual(len(training_calls), 2)
+            self.assertEqual(len(ce_calls), 2)
+            self.assertEqual([call[2] for call in ce_calls], ['none', 'none'])
+
+            expected_current = reference_net(current)
+            expected_current[:, :2] = torch.finfo(expected_current.dtype).min
+            if scope == 'aligned':
+                expected_current[:, 4:] = torch.finfo(expected_current.dtype).min
+            expected_replay = reference_net(memory)
+            if scope == 'aligned':
+                expected_replay[:, 4:] = torch.finfo(expected_replay.dtype).min
+            torch.testing.assert_close(training_calls[0][0], expected_current, rtol=0, atol=0)
+            torch.testing.assert_close(training_calls[1][0], expected_replay, rtol=0, atol=0)
+            self.assertFalse(torch.equal(training_calls[0][0],
+                                         _cosine_logits(reference_net, current)))
+            current_nll = -F.log_softmax(
+                expected_current[:, 2:6 if scope == 'baseline' else 4], dim=1,
+            )
+            replay_nll = -F.log_softmax(
+                expected_replay[:, :6 if scope == 'baseline' else 4], dim=1,
+            )
+            expected_loss = (
+                (current_nll.gather(1, (labels - 2)[:, None]).squeeze(1)
+                 / current_nll.sum(dim=1)).mean()
+                + (replay_nll.gather(1, replay[3][:, None]).squeeze(1)
+                   / replay_nll.sum(dim=1)).mean()
+            )
+            self.assertAlmostEqual(loss, expected_loss.item(), places=6)
+
+            expected_current_scoring = reference_net(not_aug_current)
+            expected_current_scoring[:, :2] = torch.finfo(expected_current_scoring.dtype).min
+            expected_replay_scoring = reference_net(not_aug_memory)
+            torch.testing.assert_close(ce_calls[0][0], expected_current_scoring,
+                                       rtol=0, atol=0)
+            torch.testing.assert_close(ce_calls[1][0], expected_replay_scoring,
+                                       rtol=0, atol=0)
+            replay_ce = F.cross_entropy(expected_replay_scoring, replay[3], reduction='none')
+            torch.testing.assert_close(model.buffer.updated_scores[1], replay_ce,
+                                       rtol=0, atol=0)
+            self.assertIsNone(model.buffer.inserted)
+            results[scope] = (training_calls, ce_calls, model.buffer.updated_scores[1])
+
+        baseline_training, baseline_scores, baseline_update = results['baseline']
+        aligned_training, aligned_scores, aligned_update = results['aligned']
+        self.assertFalse(torch.equal(baseline_training[0][0], aligned_training[0][0]))
+        self.assertFalse(torch.equal(baseline_training[1][0], aligned_training[1][0]))
+        for baseline_call, aligned_call in zip(baseline_scores, aligned_scores):
+            self.assertTrue(torch.equal(baseline_call[0], aligned_call[0]))
+        self.assertTrue(torch.equal(baseline_update, aligned_update))
+
+        ce_model, ce_calls = _model('ce', task=1, replay=replay, num_classes=6)
+        ce_model.observe(current, labels, not_aug_current, epoch=1)
+        self.assertTrue(torch.equal(baseline_training[0][0], ce_calls[1][0]))
+        self.assertTrue(torch.equal(baseline_training[1][0], ce_calls[3][0]))
+        self.assertTrue(torch.equal(baseline_scores[0][0], ce_calls[0][0]))
+        self.assertTrue(torch.equal(baseline_scores[1][0], ce_calls[2][0]))
+
+    def test_nce_abs_current_insertion_uses_linear_ce_for_both_scopes(self):
+        inputs = torch.tensor([[1., 2., 3., 4.], [2., 1., 4., 3.],
+                               [3., 2., 1., 4.], [1., 4., 2., 3.]])
+        not_aug = torch.tensor([[1., 1., 3., 4.], [2., 2., 4., 3.],
+                                [4., 1., 2., 3.], [2., 3., 1., 4.]])
+        labels = torch.tensor([0, 1, 0, 1])
+        sample_ids = torch.tensor([10, 11, 12, 13])
+        selections = []
+        for scope in ('baseline', 'aligned'):
+            model, ce_calls = _model('nce', nce_ace_scope=scope)
+            model.args.alpha_sample_insertion = 0.75
+            model.observe(inputs, labels, not_aug, epoch=0,
+                          true_labels=labels, sample_ids=sample_ids)
+            self.assertEqual(len(ce_calls), 1)
+            expected_logits = model.net(not_aug)
+            torch.testing.assert_close(ce_calls[0][0], expected_logits, rtol=0, atol=0)
+            expected_scores = F.cross_entropy(expected_logits, labels, reduction='none')
+            selected = torch.topk(expected_scores, 1, largest=False).indices
+            inserted = model.buffer.inserted
+            torch.testing.assert_close(inserted['sample_selection_scores'],
+                                       expected_scores[selected], rtol=0, atol=0)
+            self.assertTrue(torch.equal(inserted['sample_ids'], sample_ids[selected]))
+            self.assertTrue(torch.equal(inserted['labels'], labels[selected]))
+            selections.append(inserted['sample_selection_scores'])
+        self.assertTrue(torch.equal(selections[0], selections[1]))
+
+    def test_nce_task0_two_batch_training_smoke_both_scopes(self):
+        inputs = torch.tensor([[1., 2., 3., 4.], [2., 1., 4., 3.],
+                               [3., 2., 1., 4.], [1., 4., 2., 3.]])
+        labels = torch.tensor([0, 1, 0, 1])
+        for scope in ('baseline', 'aligned'):
+            with self.subTest(scope=scope):
+                model, _ = _model('nce', nce_ace_scope=scope)
+                model.opt = torch.optim.SGD(model.net.parameters(), lr=0.05)
+                weight_before = model.net.classifier.weight.detach().clone()
+                for epoch in (0, 1):
+                    loss = model.observe(inputs, labels, inputs, epoch=epoch,
+                                         true_labels=labels, sample_ids=torch.arange(4))
+                    self.assertTrue(torch.isfinite(torch.tensor(loss)))
+                    for parameter in model.net.parameters():
+                        if parameter.grad is not None:
+                            self.assertTrue(torch.isfinite(parameter.grad).all())
+                self.assertFalse(torch.equal(model.net.classifier.weight, weight_before))
+                model.eval()
+                with torch.no_grad():
+                    logits = model.forward(inputs)
+                torch.testing.assert_close(logits, model.net(inputs), rtol=0, atol=0)
+                self.assertTrue(torch.isfinite(logits).all())
 
 
 if __name__ == '__main__':

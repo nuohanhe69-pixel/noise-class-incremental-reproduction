@@ -229,6 +229,9 @@ class ErAceAerAbs(ContinualModel):
     def _observe_scoring_logits(self, inputs, *, present=None, replay=False):
         return self.net(inputs)
 
+    def _compute_training_loss(self, logits, labels, reduction='mean'):
+        return self.loss(logits, labels, reduction=reduction)
+
     def observe(self, inputs, labels, not_aug_inputs, epoch, true_labels=None, sample_ids=None, source_task_ids=None):
 
         present = labels.unique()
@@ -253,7 +256,7 @@ class ErAceAerAbs(ContinualModel):
             not_aug_logits = not_aug_logits.masked_fill(mask == 0, torch.finfo(not_aug_logits.dtype).min)
             loss_not_aug_ext = self.loss(not_aug_logits, labels, reduction='none')
 
-        loss = self.loss(logits, labels)
+        loss = self._compute_training_loss(logits, labels)
 
         loss_re = torch.tensor(0.)
 
@@ -278,7 +281,7 @@ class ErAceAerAbs(ContinualModel):
             # replay if AER is disabled or if epoch is odd (or last)
             # if not self.args.use_aer or self.is_aer_fitting_epoch(epoch):
             buf_logits = self._observe_training_logits(buf_inputs, replay=True)
-            loss_re = self.loss(buf_logits, buf_labels)
+            loss_re = self._compute_training_loss(buf_logits, buf_labels)
 
             if self.args.use_aer and epoch % 2 == 0:
                 loss_re = torch.tensor(0.)

@@ -40,6 +40,26 @@ TASKWISE_SAP_STARTED = 'TASKWISE_SAP_STARTED'
 TASK_REFERENCE_EMPTY = 'TASK_REFERENCE_EMPTY'
 
 
+def normalized_cross_entropy(logits: torch.Tensor, labels: torch.Tensor,
+                             reduction: str = 'mean') -> torch.Tensor:
+    active = logits != torch.finfo(logits.dtype).min
+    if not torch.all(active.gather(1, labels.unsqueeze(1))):
+        raise ValueError('NCE target class must be active')
+    working_logits = logits.float() if logits.dtype in (torch.float16, torch.bfloat16) else logits
+    log_probs = F.log_softmax(working_logits.masked_fill(~active, -torch.inf), dim=1)
+    negative_log_probs = -log_probs.masked_fill(~active, 0)
+    numerator = negative_log_probs.gather(1, labels.unsqueeze(1)).squeeze(1)
+    denominator = negative_log_probs.sum(dim=1).clamp_min(torch.finfo(working_logits.dtype).eps)
+    losses = numerator / denominator
+    if reduction == 'none':
+        return losses
+    if reduction == 'mean':
+        return losses.mean()
+    if reduction == 'sum':
+        return losses.sum()
+    raise ValueError(f'unsupported NCE reduction: {reduction}')
+
+
 class AerSap(ErAceAerAbs):
     """AER/ABS + Oracle Linear SAP, without DGC/OGC."""
 
@@ -58,8 +78,12 @@ class AerSap(ErAceAerAbs):
         )
         group.add_argument(
             '--training_loss', type=str, default='ce',
-            choices=['ce', 'normalized_cosine_ce', 'scale_cosine_ce'],
-            help='Cross-entropy logits for current and replay training samples.',
+            choices=['ce', 'normalized_cosine_ce', 'scale_cosine_ce', 'nce'],
+            help='Training loss for current and replay samples.',
+        )
+        group.add_argument(
+            '--nce_ace_scope', type=str, default='baseline', choices=['baseline', 'aligned'],
+            help='Active-class scope for NCE training only.',
         )
         group.add_argument(
             '--scale_cosine_scoring_scale', type=int, default=1, choices=[1, 64],
@@ -117,8 +141,11 @@ class AerSap(ErAceAerAbs):
         self, inputs: torch.Tensor, *, present=None, replay=False,
     ) -> torch.Tensor:
         training_loss = getattr(self.args, 'training_loss', 'ce')
-        if training_loss == 'ce':
-            return super()._observe_training_logits(inputs)
+        if training_loss in ('ce', 'nce'):
+            logits = super()._observe_training_logits(inputs)
+            if training_loss == 'nce' and self.args.nce_ace_scope == 'aligned':
+                return self._mask_observe_logits(logits, present=present, replay=replay)
+            return logits
         scale = 64 if training_loss == 'scale_cosine_ce' else 1
         return self._observe_cosine_logits(inputs, scale=scale, present=present, replay=replay)
 
@@ -134,6 +161,9 @@ class AerSap(ErAceAerAbs):
         logits = torch.matmul(features_norm, weight_norm.T)
         if scale != 1:
             logits = logits * scale
+        return self._mask_observe_logits(logits, present=present, replay=replay)
+
+    def _mask_observe_logits(self, logits: torch.Tensor, *, present=None, replay=False) -> torch.Tensor:
         if present is not None:
             active = torch.zeros(logits.shape[1], dtype=torch.bool, device=logits.device)
             active[present] = True
@@ -147,7 +177,7 @@ class AerSap(ErAceAerAbs):
         self, inputs: torch.Tensor, *, present=None, replay=False,
     ) -> torch.Tensor:
         training_loss = getattr(self.args, 'training_loss', 'ce')
-        if training_loss == 'ce':
+        if training_loss in ('ce', 'nce'):
             return super()._observe_scoring_logits(inputs)
         if training_loss == 'scale_cosine_ce':
             return self._observe_cosine_logits(
@@ -155,6 +185,11 @@ class AerSap(ErAceAerAbs):
                 present=present, replay=replay,
             )
         return self._observe_training_logits(inputs, present=present, replay=replay)
+
+    def _compute_training_loss(self, logits, labels, reduction='mean'):
+        if getattr(self.args, 'training_loss', 'ce') == 'nce':
+            return normalized_cross_entropy(logits, labels, reduction=reduction)
+        return super()._compute_training_loss(logits, labels, reduction=reduction)
 
     def _should_store_buffer_metadata(self) -> bool:
         # Oracle cleanliness at the task boundary requires the true label of
