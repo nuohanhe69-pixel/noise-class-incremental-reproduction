@@ -296,13 +296,24 @@ class AerSapTask1PreSapResumeTests(unittest.TestCase):
             self.assertEqual(direct_manifest, resumed_manifest)
             self.assertTrue(direct_manifest['valid'] and direct_manifest['artifact_complete'])
             self.assertEqual(direct_manifest['seen_tasks'], [0, 1])
-            self.assertEqual(direct_manifest['projection_scope'], 'current_task_only')
-            self.assertNotIn('M_task_0.pt', direct_manifest['files'])
+            self.assertEqual(direct_manifest['projection_scope'],
+                             'taskwise_seen_tasks_direction_only')
+            self.assertIn('M_task_0.pt', direct_manifest['files'])
             self.assertIn('M_task_1.pt', direct_manifest['files'])
             weight_before = torch.load(direct_artifact / 'W_before.pt', weights_only=True)
+            weight_full = torch.load(direct_artifact / 'W_full_sap.pt', weights_only=True)
             weight_after = torch.load(direct_artifact / 'W_after.pt', weights_only=True)
-            self.assertTrue(torch.equal(weight_before[:10], weight_after[:10]))
             self.assertTrue(torch.equal(weight_before[20:], weight_after[20:]))
+            for task_id in (0, 1):
+                start, end = dataset.get_offsets(task_id)
+                matrix = torch.load(direct_artifact / f'M_task_{task_id}.pt', weights_only=True)
+                torch.testing.assert_close(
+                    weight_full[start:end], weight_before[start:end] @ matrix.T,
+                )
+                torch.testing.assert_close(
+                    weight_after[start:end].norm(dim=1),
+                    weight_before[start:end].norm(dim=1),
+                )
             for filename in direct_manifest['files']:
                 direct_file = direct_artifact / filename
                 resumed_file = resumed_artifact / filename
