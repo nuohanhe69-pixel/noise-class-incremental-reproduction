@@ -76,28 +76,47 @@ class _Dataset:
 
 
 def _reference(task_id):
-    if task_id == 0:
-        images = torch.tensor([[2., 0., 0., 0.], [0., 2., 0., 0.]])
-        labels = torch.tensor([0, 1])
-        ids = torch.tensor([0, 1])
-        tasks = torch.zeros(2, dtype=torch.long)
-        new_count = 2
-    else:
-        images = torch.tensor([
-            [0., 0., 255., 0.], [0., 0., 0., 255.],
+    current_images = torch.tensor([
+        [255., 0., 0., 0.], [0., 255., 0., 0.],
+    ]) if task_id > 0 else torch.tensor([
+        [2., 0., 0., 0.], [0., 2., 0., 0.],
+    ])
+    current_labels = torch.tensor([task_id * 10, task_id * 10 + 1])
+    current_ids = torch.tensor([task_id * 100, task_id * 100 + 1])
+    current_tasks = torch.full((2,), task_id, dtype=torch.long)
+
+    historical_images, historical_labels, historical_ids, historical_tasks = [], [], [], []
+    for historical_task in range(task_id):
+        historical_images.append(torch.tensor([
             [2., 0., 0., 0.], [0., 2., 0., 0.],
-        ])
-        labels = torch.tensor([task_id * 10, task_id * 10 + 1, 0, 1])
-        ids = torch.tensor([task_id * 10, task_id * 10 + 1, 0, 1])
-        tasks = torch.tensor([task_id, task_id, 0, 0])
-        new_count = 2
+        ]))
+        historical_labels.append(torch.tensor([
+            historical_task * 10, historical_task * 10 + 1,
+        ]))
+        historical_ids.append(torch.tensor([
+            historical_task * 100, historical_task * 100 + 1,
+        ]))
+        historical_tasks.append(torch.full((2,), historical_task, dtype=torch.long))
+
+    if historical_images:
+        images = torch.cat([current_images] + historical_images)
+        labels = torch.cat([current_labels] + historical_labels)
+        ids = torch.cat([current_ids] + historical_ids)
+        tasks = torch.cat([current_tasks] + historical_tasks)
+    else:
+        images, labels, ids, tasks = current_images, current_labels, current_ids, current_tasks
+
+    new_count = len(current_labels)
+    old_count = len(labels) - new_count
     counts = {
-        'current_candidate': 2, 'current_eligible': 2, 'current_selected': 2,
-        'old_candidate': 0 if task_id == 0 else 2,
-        'old_eligible': 0 if task_id == 0 else 2,
-        'old_selected': 0 if task_id == 0 else 2, 'new_candidate': 2,
-        'new_eligible': 2, 'new_selected': 2,
-        'selected_per_class': {int(label): 1 for label in labels},
+        'current_candidate': new_count, 'current_eligible': new_count,
+        'current_selected': new_count, 'old_candidate': old_count,
+        'old_eligible': old_count, 'old_selected': old_count,
+        'new_candidate': new_count, 'new_eligible': new_count,
+        'new_selected': new_count,
+        'selected_per_class': {
+            int(label): int((labels == label).sum()) for label in labels.unique()
+        },
         'sampling_seed': task_id,
     }
     evidence = {
@@ -106,8 +125,10 @@ def _reference(task_id):
         'is_old': torch.arange(len(labels)) >= new_count,
         'reference_order': torch.arange(len(labels)), 'counts': counts,
     }
-    return images, labels, tasks, {'reference_new_count': 2,
-                                    'reference_old_count': 0 if task_id == 0 else 2}, evidence
+    return images, labels, tasks, {
+        'reference_new_count': new_count,
+        'reference_old_count': old_count,
+    }, evidence
 
 
 def _model(results_path):
@@ -180,19 +201,19 @@ class AerSapContractTests(unittest.TestCase):
             self.assertEqual(manifest['reference_count'], 4)
             self.assertEqual(set(manifest['files']),
                              {path.name for path in second.iterdir()} - {'manifest.json'})
-            self.assertFalse((second / 'M_task_0.pt').exists())
+            self.assertTrue((second / 'M_task_0.pt').exists())
             self.assertTrue((second / 'M_task_1.pt').exists())
             self.assertEqual(first_matrix.shape,
                              torch.load(second / 'M_task_1.pt', weights_only=True).shape)
 
             before = torch.load(second / 'W_before.pt', weights_only=True)
+            full = torch.load(second / 'W_full_sap.pt', weights_only=True)
             after = torch.load(second / 'W_after.pt', weights_only=True)
             x_raw = torch.load(second / 'X_raw.pt', weights_only=True)
-            expected_new = torch.eye(4)[2:4] @ pre_state['backbone.weight'].T
+            expected_new = torch.eye(4)[:2] @ pre_state['backbone.weight'].T
             torch.testing.assert_close(x_raw[:2], expected_new)
-            self.assertTrue(torch.equal(before[:10], after[:10]))
             self.assertTrue(torch.equal(before[20:], after[20:]))
-            for task_id in (1,):
+            for task_id in (0, 1):
                 x = torch.load(second / f'X_l2_task_{task_id}.pt', weights_only=True)
                 gram = torch.load(second / f'G_task_{task_id}.pt', weights_only=True)
                 matrix = torch.load(second / f'M_task_{task_id}.pt', weights_only=True)
@@ -204,7 +225,16 @@ class AerSapContractTests(unittest.TestCase):
                 torch.testing.assert_close(matrix, (eigenvectors * importance) @ eigenvectors.T)
                 self.assertEqual(eigenvalues.shape, (4,))
                 start, end = dataset.get_offsets(task_id)
-                torch.testing.assert_close(after[start:end], before[start:end] @ matrix.T)
+                torch.testing.assert_close(
+                    full[start:end], before[start:end] @ matrix.T,
+                )
+                torch.testing.assert_close(
+                    after[start:end].norm(dim=1), before[start:end].norm(dim=1),
+                )
+                torch.testing.assert_close(
+                    torch.nn.functional.normalize(after[start:end], dim=1),
+                    torch.nn.functional.normalize(full[start:end], dim=1),
+                )
             self.assertTrue(torch.equal(
                 torch.load(second / 'bias_before.pt', weights_only=True),
                 torch.load(second / 'bias_after.pt', weights_only=True),
@@ -238,57 +268,89 @@ class AerSapContractTests(unittest.TestCase):
             self.assertEqual([event['sap_alpha'] for event in model.sap_history
                               if event['status'] == SAP_ORACLE_EXECUTED], [300.0, 300.0])
 
-    def test_each_boundary_projects_only_current_reference_and_classifier_rows(self):
+    def test_each_boundary_projects_all_seen_tasks_and_restores_row_norms(self):
         for task_id in range(10):
             with self.subTest(task_id=task_id), tempfile.TemporaryDirectory() as tmp:
                 model = _model(tmp)
                 dataset = _Dataset()
                 model._current_task = task_id
                 model._n_seen_classes = (task_id + 1) * 10
-                before = copy.deepcopy(model.net.state_dict())
+                before_state = copy.deepcopy(model.net.state_dict())
                 model._run_taskwise_sap(dataset)
                 artifact = model._taskwise_artifact_directory(dataset)
                 manifest = json.loads((artifact / 'manifest.json').read_text())
                 self.assertEqual(manifest['boundary_task_id'], task_id)
-                self.assertEqual(manifest['projection_scope'], 'current_task_only')
+                self.assertEqual(manifest['projection_scope'], 'all_seen_tasks')
+                self.assertEqual(
+                    manifest['weight_commit_mode'],
+                    'direction_only_restore_row_norm',
+                )
                 self.assertEqual(manifest['sap_alpha'], 300.0)
                 self.assertTrue(manifest['valid'] and manifest['artifact_complete'])
                 self.assertEqual(set(manifest['files']),
                                  {path.name for path in artifact.iterdir()} - {'manifest.json'})
-                for historical_task in range(task_id):
-                    self.assertFalse((artifact / f'G_task_{historical_task}.pt').exists())
-                    self.assertFalse((artifact / f'M_task_{historical_task}.pt').exists())
+
                 x = torch.load(artifact / 'X_l2.pt', weights_only=True)
-                x_raw = torch.load(artifact / 'X_raw.pt', weights_only=True)
-                source_tasks = torch.load(artifact / 'reference_source_task_ids.pt',
-                                          weights_only=True)
-                is_old = torch.load(artifact / 'reference_is_old.pt', weights_only=True)
-                self.assertTrue(torch.equal(source_tasks == task_id, ~is_old))
-                if task_id:
-                    torch.testing.assert_close(
-                        x_raw[:2], torch.eye(4)[2:4] @ before['backbone.weight'].T,
-                    )
-                current_x = x[source_tasks == task_id]
-                torch.testing.assert_close(
-                    torch.load(artifact / f'X_l2_task_{task_id}.pt', weights_only=True),
-                    current_x,
+                source_tasks = torch.load(
+                    artifact / 'reference_source_task_ids.pt', weights_only=True,
                 )
-                gram = torch.load(artifact / f'G_task_{task_id}.pt', weights_only=True)
-                matrix = torch.load(artifact / f'M_task_{task_id}.pt', weights_only=True)
-                torch.testing.assert_close(gram, current_x.T @ current_x)
-                if task_id:
-                    self.assertFalse(torch.equal(gram, x.T @ x))
-                weight_before = torch.load(artifact / 'W_before.pt', weights_only=True)
-                weight_after = torch.load(artifact / 'W_after.pt', weights_only=True)
-                start, end = dataset.get_offsets(task_id)
-                torch.testing.assert_close(weight_after[start:end],
-                                           weight_before[start:end] @ matrix.T)
-                self.assertTrue(torch.equal(weight_after[:start], weight_before[:start]))
-                self.assertTrue(torch.equal(weight_after[end:], weight_before[end:]))
-                self.assertTrue(torch.equal(model.net.classifier.bias,
-                                            before['classifier.bias']))
-                self.assertTrue(torch.equal(model.net.backbone.weight,
-                                            before['backbone.weight']))
+                before = torch.load(artifact / 'W_before.pt', weights_only=True)
+                full = torch.load(artifact / 'W_full_sap.pt', weights_only=True)
+                after = torch.load(artifact / 'W_after.pt', weights_only=True)
+
+                seen_end = dataset.get_offsets(task_id)[1]
+                self.assertTrue(torch.equal(full[seen_end:], before[seen_end:]))
+                self.assertTrue(torch.equal(after[seen_end:], before[seen_end:]))
+
+                for seen_task in range(task_id + 1):
+                    self.assertTrue((artifact / f'G_task_{seen_task}.pt').exists())
+                    self.assertTrue((artifact / f'M_task_{seen_task}.pt').exists())
+                    task_x = x[source_tasks == seen_task]
+                    torch.testing.assert_close(
+                        torch.load(
+                            artifact / f'X_l2_task_{seen_task}.pt',
+                            weights_only=True,
+                        ),
+                        task_x,
+                    )
+                    gram = torch.load(
+                        artifact / f'G_task_{seen_task}.pt', weights_only=True,
+                    )
+                    matrix = torch.load(
+                        artifact / f'M_task_{seen_task}.pt', weights_only=True,
+                    )
+                    torch.testing.assert_close(gram, task_x.T @ task_x)
+                    start, end = dataset.get_offsets(seen_task)
+                    torch.testing.assert_close(
+                        full[start:end], before[start:end] @ matrix.T,
+                    )
+                    torch.testing.assert_close(
+                        after[start:end].norm(dim=1),
+                        before[start:end].norm(dim=1),
+                    )
+                    torch.testing.assert_close(
+                        torch.nn.functional.normalize(after[start:end], dim=1),
+                        torch.nn.functional.normalize(full[start:end], dim=1),
+                    )
+
+                for unseen_task in range(task_id + 1, dataset.N_TASKS):
+                    self.assertFalse((artifact / f'G_task_{unseen_task}.pt').exists())
+                    self.assertFalse((artifact / f'M_task_{unseen_task}.pt').exists())
+
+                self.assertTrue(torch.equal(
+                    model.net.classifier.bias, before_state['classifier.bias'],
+                ))
+                self.assertTrue(torch.equal(
+                    model.net.backbone.weight, before_state['backbone.weight'],
+                ))
+                post_state = torch.load(
+                    artifact / 'network_post_sap.pt', weights_only=True,
+                )
+                torch.testing.assert_close(
+                    post_state['classifier.weight'], after,
+                )
+                for key, value in model.net.state_dict().items():
+                    self.assertTrue(torch.equal(model.past_model_ckpt[key], value))
                 self.assertEqual(model.sap_history[-1]['status'], SAP_ORACLE_EXECUTED)
                 self.assertEqual(model.sap_history[-1]['sap_alpha'], 300.0)
 
