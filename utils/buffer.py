@@ -193,22 +193,8 @@ class LARSSampling(BaseSampleSelection):
 
     def normalize_scores(self, values: torch.Tensor):
         if values.shape[0] > 0:
-            # Safe checkpoints historically did not serialize the selector's
-            # importance scores.  On resume, unvisited slots therefore still
-            # contain ``-inf`` while the first replay batch has finite values.
-            # Mixing both in min/max normalization produces NaNs and makes
-            # ``numpy.random.choice`` fail.  Give missing slots a neutral
-            # finite score; model-specific loaders may subsequently rebuild
-            # all scores from the restored model and buffer.
-            finite = torch.isfinite(values)
-            if not finite.any():
-                return torch.ones_like(values)
-            if not finite.all():
-                values = values.clone()
-                values[~finite] = values[finite].mean()
-            value_range = values.max() - values.min()
-            if value_range != 0:
-                values = (values - values.min()) / (value_range + 1e-9)
+            if values.max() - values.min() != 0:
+                values = (values - values.min()) / ((values.max() - values.min()) + 1e-9)
             return values
         else:
             return None
@@ -284,7 +270,7 @@ class ABSSampling(LARSSampling):
         current_scores, past_scores = None, None
         if past_importance is not None:
             past_importance = 1 - past_importance
-            past_scores = past_importance / (past_importance.sum() + 1e-9)
+            past_scores = past_importance / past_importance.sum()
         if current_importance is not None:
             if current_importance.sum() == 0:
                 current_importance += 1e-9
