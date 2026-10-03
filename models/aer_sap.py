@@ -7,6 +7,7 @@ import csv
 import io
 import json
 import logging
+import math
 import random
 import shutil
 import tempfile
@@ -38,6 +39,31 @@ from utils.sap import (
 SAP_SKIPPED_AFTER_SECOND_BOUNDARY = 'SAP_SKIPPED_AFTER_SECOND_BOUNDARY'
 TASKWISE_SAP_STARTED = 'TASKWISE_SAP_STARTED'
 TASK_REFERENCE_EMPTY = 'TASK_REFERENCE_EMPTY'
+
+
+def arcface_training_logits(cosine: torch.Tensor, labels: torch.Tensor,
+                            margin: float = 0.5) -> torch.Tensor:
+    """Apply a target-only monotonic angular margin, then fixed scale 64."""
+    if not 0.0 <= margin < math.pi:
+        raise ValueError('arcface_margin must be in [0, pi)')
+    active = cosine != torch.finfo(cosine.dtype).min
+    if not torch.all(active.gather(1, labels.unsqueeze(1))):
+        raise ValueError('ArcFace target class must be active')
+    adjusted = cosine
+    if margin != 0.0:
+        target = cosine.gather(1, labels.unsqueeze(1)).squeeze(1)
+        epsilon = torch.finfo(cosine.dtype).eps
+        target = target.clamp(-1.0 + epsilon, 1.0 - epsilon)
+        sine = (1.0 - target.square()).clamp_min(epsilon).sqrt()
+        angular_target = target * math.cos(margin) - sine * math.sin(margin)
+        # Beyond pi-m, the linear branch preserves the target's monotonic order.
+        transformed = torch.where(
+            target > math.cos(math.pi - margin), angular_target,
+            target - math.sin(math.pi - margin) * margin,
+        )
+        adjusted = cosine.scatter(1, labels.unsqueeze(1), transformed.unsqueeze(1))
+    scaled = adjusted.masked_fill(~active, 0) * 64
+    return scaled.masked_fill(~active, torch.finfo(cosine.dtype).min)
 
 
 def normalized_cross_entropy(logits: torch.Tensor, labels: torch.Tensor,
@@ -78,8 +104,12 @@ class AerSap(ErAceAerAbs):
         )
         group.add_argument(
             '--training_loss', type=str, default='ce',
-            choices=['ce', 'normalized_cosine_ce', 'scale_cosine_ce', 'nce'],
+            choices=['ce', 'normalized_cosine_ce', 'scale_cosine_ce', 'nce', 'arcface_ce'],
             help='Training loss for current and replay samples.',
+        )
+        group.add_argument(
+            '--arcface_margin', type=float, default=0.5,
+            help='Target angular margin for arcface_ce (training scale is fixed at 64).',
         )
         group.add_argument(
             '--nce_ace_scope', type=str, default='baseline', choices=['baseline', 'aligned'],
@@ -146,6 +176,8 @@ class AerSap(ErAceAerAbs):
             if training_loss == 'nce' and self.args.nce_ace_scope == 'aligned':
                 return self._mask_observe_logits(logits, present=present, replay=replay)
             return logits
+        if training_loss == 'arcface_ce':
+            return self._observe_cosine_logits(inputs, scale=1, present=present, replay=replay)
         scale = 64 if training_loss == 'scale_cosine_ce' else 1
         return self._observe_cosine_logits(inputs, scale=scale, present=present, replay=replay)
 
@@ -179,6 +211,8 @@ class AerSap(ErAceAerAbs):
         training_loss = getattr(self.args, 'training_loss', 'ce')
         if training_loss in ('ce', 'nce'):
             return super()._observe_scoring_logits(inputs)
+        if training_loss == 'arcface_ce':
+            return self._observe_cosine_logits(inputs, scale=1, present=present, replay=replay)
         if training_loss == 'scale_cosine_ce':
             return self._observe_cosine_logits(
                 inputs, scale=self.args.scale_cosine_scoring_scale,
@@ -187,6 +221,9 @@ class AerSap(ErAceAerAbs):
         return self._observe_training_logits(inputs, present=present, replay=replay)
 
     def _compute_training_loss(self, logits, labels, reduction='mean'):
+        if getattr(self.args, 'training_loss', 'ce') == 'arcface_ce':
+            logits = arcface_training_logits(logits, labels, margin=self.args.arcface_margin)
+            return super()._compute_training_loss(logits, labels, reduction=reduction)
         if getattr(self.args, 'training_loss', 'ce') == 'nce':
             return normalized_cross_entropy(logits, labels, reduction=reduction)
         return super()._compute_training_loss(logits, labels, reduction=reduction)
