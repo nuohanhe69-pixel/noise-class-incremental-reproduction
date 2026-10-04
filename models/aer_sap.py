@@ -66,6 +66,22 @@ def arcface_training_logits(cosine: torch.Tensor, labels: torch.Tensor,
     return scaled.masked_fill(~active, torch.finfo(cosine.dtype).min)
 
 
+def cosface_training_logits(cosine: torch.Tensor, labels: torch.Tensor,
+                            margin: float = 0.35) -> torch.Tensor:
+    """Subtract a target-only cosine margin, then apply fixed scale 64."""
+    if not math.isfinite(margin) or margin < 0.0:
+        raise ValueError('cosface_margin must be finite and nonnegative')
+    active = cosine != torch.finfo(cosine.dtype).min
+    if not torch.all(active.gather(1, labels.unsqueeze(1))):
+        raise ValueError('CosFace target class must be active')
+    adjusted = cosine
+    if margin != 0.0:
+        target = cosine.gather(1, labels.unsqueeze(1)) - margin
+        adjusted = cosine.scatter(1, labels.unsqueeze(1), target)
+    scaled = adjusted.masked_fill(~active, 0) * 64
+    return scaled.masked_fill(~active, torch.finfo(cosine.dtype).min)
+
+
 def normalized_cross_entropy(logits: torch.Tensor, labels: torch.Tensor,
                              reduction: str = 'mean') -> torch.Tensor:
     active = logits != torch.finfo(logits.dtype).min
@@ -104,12 +120,16 @@ class AerSap(ErAceAerAbs):
         )
         group.add_argument(
             '--training_loss', type=str, default='ce',
-            choices=['ce', 'normalized_cosine_ce', 'scale_cosine_ce', 'nce', 'arcface_ce'],
+            choices=['ce', 'normalized_cosine_ce', 'scale_cosine_ce', 'nce', 'arcface_ce', 'cosface_ce'],
             help='Training loss for current and replay samples.',
         )
         group.add_argument(
             '--arcface_margin', type=float, default=0.5,
             help='Target angular margin for arcface_ce (training scale is fixed at 64).',
+        )
+        group.add_argument(
+            '--cosface_margin', type=float, default=0.35,
+            help='Target cosine margin for cosface_ce (training scale is fixed at 64).',
         )
         group.add_argument(
             '--nce_ace_scope', type=str, default='baseline', choices=['baseline', 'aligned'],
@@ -178,6 +198,8 @@ class AerSap(ErAceAerAbs):
             return logits
         if training_loss == 'arcface_ce':
             return self._observe_cosine_logits(inputs, scale=1, present=present, replay=replay)
+        if training_loss == 'cosface_ce':
+            return self._observe_cosine_logits(inputs, scale=1, present=present, replay=replay)
         scale = 64 if training_loss == 'scale_cosine_ce' else 1
         return self._observe_cosine_logits(inputs, scale=scale, present=present, replay=replay)
 
@@ -213,6 +235,8 @@ class AerSap(ErAceAerAbs):
             return super()._observe_scoring_logits(inputs)
         if training_loss == 'arcface_ce':
             return self._observe_cosine_logits(inputs, scale=1, present=present, replay=replay)
+        if training_loss == 'cosface_ce':
+            return self._observe_cosine_logits(inputs, scale=1, present=present, replay=replay)
         if training_loss == 'scale_cosine_ce':
             return self._observe_cosine_logits(
                 inputs, scale=self.args.scale_cosine_scoring_scale,
@@ -223,6 +247,9 @@ class AerSap(ErAceAerAbs):
     def _compute_training_loss(self, logits, labels, reduction='mean'):
         if getattr(self.args, 'training_loss', 'ce') == 'arcface_ce':
             logits = arcface_training_logits(logits, labels, margin=self.args.arcface_margin)
+            return super()._compute_training_loss(logits, labels, reduction=reduction)
+        if getattr(self.args, 'training_loss', 'ce') == 'cosface_ce':
+            logits = cosface_training_logits(logits, labels, margin=self.args.cosface_margin)
             return super()._compute_training_loss(logits, labels, reduction=reduction)
         if getattr(self.args, 'training_loss', 'ce') == 'nce':
             return normalized_cross_entropy(logits, labels, reduction=reduction)
