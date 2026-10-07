@@ -115,6 +115,11 @@ class AerSap(ErAceAerAbs):
         group = parser.add_argument_group('Power-Normalized Linear Oracle SAP')
         group.add_argument('--sap_batch_size', type=int, default=32)
         group.add_argument(
+            '--sap_weight_commit', type=str, default='full',
+            choices=['full', 'direction_only'],
+            help='Commit full SAP weights or restore each current-task row norm.',
+        )
+        group.add_argument(
             '--cosine_inference', type=int, default=0, choices=[0, 1],
             help='Use bias-free cosine logits from seen classifier rows during evaluation.',
         )
@@ -639,7 +644,9 @@ class AerSap(ErAceAerAbs):
             raise ValueError('task-wise SAP requires a valid task boundary')
         if float(self.args.sap_oracle_scale) != 300.0:
             raise ValueError('current-task SAP requires sap_oracle_scale=300')
-        self._record_sap_event(status=TASKWISE_SAP_STARTED, sap_alpha=300.0)
+        sap_weight_commit = getattr(self.args, 'sap_weight_commit', 'full')
+        self._record_sap_event(status=TASKWISE_SAP_STARTED, sap_alpha=300.0,
+                               sap_weight_commit=sap_weight_commit)
         history_start = len(self.sap_history)
         network_before = copy.deepcopy(self.net.state_dict())
         had_past = hasattr(self, 'past_model_ckpt')
@@ -668,6 +675,7 @@ class AerSap(ErAceAerAbs):
             )
             if int(self.current_task) in coverage['empty_tasks']:
                 self._record_sap_event(status=TASK_REFERENCE_EMPTY,
+                                       sap_weight_commit=sap_weight_commit,
                                        reference_task_id=int(self.current_task))
                 raise ValueError(f'empty trusted current-task reference: {self.current_task}')
 
@@ -719,9 +727,17 @@ class AerSap(ErAceAerAbs):
                 self._build_oracle_projection(gram, return_eigenvectors=True)
             )
             start_c, end_c = map(int, dataset.get_offsets(task_id))
-            task_weight, _ = project_linear_weight(
-                weight_before[start_c:end_c, :], matrix,
-            )
+            task_before = weight_before[start_c:end_c, :]
+            task_full, _ = project_linear_weight(task_before, matrix)
+            task_weight = task_full
+            if sap_weight_commit == 'direction_only':
+                weight_full = weight_before.clone()
+                weight_full[start_c:end_c, :] = task_full
+                tensors['W_full_sap.pt'] = weight_full
+                task_weight = (
+                    F.normalize(task_full, p=2, dim=1)
+                    * task_before.norm(p=2, dim=1, keepdim=True)
+                )
             weight_after[start_c:end_c, :] = task_weight
             projected[start_c:end_c] = True
             tensors.update({
@@ -801,6 +817,7 @@ class AerSap(ErAceAerAbs):
                 raise AssertionError('AER checkpoint does not match post-SAP network')
             self._record_sap_event(
                 status=SAP_ORACLE_EXECUTED, sap_alpha=300.0,
+                sap_weight_commit=sap_weight_commit,
                 seen_tasks=seen_tasks, projection_scope='current_task_only',
                 total_reference_count=count, reference_stats=reference_stats,
                 feature_norm_stats=feature_norm_stats,
@@ -811,6 +828,7 @@ class AerSap(ErAceAerAbs):
                 'experiment_name': 'double_boundary_taskwise_sap_v1',
                 'boundary_task_id': int(self.current_task),
                 'seen_tasks': seen_tasks, 'sap_alpha': 300.0,
+                'sap_weight_commit': sap_weight_commit,
                 'reference_count': count, 'projection_scope': 'current_task_only',
                 'expected_sap': True, 'started': True, 'succeeded': True,
                 'artifact_complete': True, 'valid': True,
@@ -834,6 +852,7 @@ class AerSap(ErAceAerAbs):
             del self.sap_history[history_start:]
             self._record_sap_event(
                 status=SAP_FAILED, oracle_stage=stage,
+                sap_weight_commit=sap_weight_commit,
                 error_type=type(error).__name__, error_message=str(error),
             )
             raise
